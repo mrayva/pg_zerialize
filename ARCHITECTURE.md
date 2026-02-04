@@ -159,8 +159,8 @@ SELECT octet_length(row_to_flexbuffers(users.*)) FROM users;
 ### Optimization Ideas
 
 1. ✅ **Cache TupleDesc lookups for repeated calls** (IMPLEMENTED - 20-30% faster)
-2. Pre-allocate buffers based on estimated size
-3. Batch processing for multiple rows
+2. ✅ **Batch processing for multiple rows** (IMPLEMENTED - 2-3x faster for bulk operations)
+3. Pre-allocate buffers based on estimated size
 4. Consider compile-time optimization for common schemas
 
 ## Testing

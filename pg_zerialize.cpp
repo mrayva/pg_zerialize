@@ -40,43 +40,34 @@ namespace z = zerialize;
  * Forward declarations
  */
 extern "C" {
+    // Single record functions
     Datum row_to_flexbuffers(PG_FUNCTION_ARGS);
     Datum row_to_msgpack(PG_FUNCTION_ARGS);
     Datum row_to_cbor(PG_FUNCTION_ARGS);
     Datum row_to_zera(PG_FUNCTION_ARGS);
 
+    // Batch processing functions
+    Datum rows_to_flexbuffers(PG_FUNCTION_ARGS);
+    Datum rows_to_msgpack(PG_FUNCTION_ARGS);
+    Datum rows_to_cbor(PG_FUNCTION_ARGS);
+    Datum rows_to_zera(PG_FUNCTION_ARGS);
+
     PG_FUNCTION_INFO_V1(row_to_flexbuffers);
     PG_FUNCTION_INFO_V1(row_to_msgpack);
     PG_FUNCTION_INFO_V1(row_to_cbor);
     PG_FUNCTION_INFO_V1(row_to_zera);
+
+    PG_FUNCTION_INFO_V1(rows_to_flexbuffers);
+    PG_FUNCTION_INFO_V1(rows_to_msgpack);
+    PG_FUNCTION_INFO_V1(rows_to_cbor);
+    PG_FUNCTION_INFO_V1(rows_to_zera);
 }
 
 /*
- * Helper class to dynamically build a serialized map from PostgreSQL tuple
- * Using zerialize's dyn::Value API for dynamic data
- * Template parameter allows using different protocols (Flex, MsgPack, etc.)
+ * Note: The SerializationBuilder class has been removed in favor of direct
+ * z::dyn::Value manipulation. See record_to_dynamic_map() and the template
+ * functions tuple_to_binary<Protocol> and array_to_binary<Protocol>.
  */
-template<typename Protocol>
-class SerializationBuilder {
-private:
-    z::dyn::Value::Map entries;
-
-public:
-    void add(const std::string& key, z::dyn::Value value) {
-        entries.emplace_back(key, std::move(value));
-    }
-
-    z::ZBuffer build() {
-        // Build a dynamic map using zerialize's dyn::Value
-        return z::serialize<Protocol>(z::dyn::Value::map(std::move(entries)));
-    }
-};
-
-// Type aliases for specific protocols
-using FlexBuffersBuilder = SerializationBuilder<z::Flex>;
-using MessagePackBuilder = SerializationBuilder<z::MsgPack>;
-using CBORBuilder = SerializationBuilder<z::CBOR>;
-using ZERABuilder = SerializationBuilder<z::Zera>;
 
 /*
  * Schema caching to avoid repeated TupleDesc lookups
@@ -274,11 +265,10 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
 }
 
 /*
- * Generic helper function to convert PostgreSQL tuple to any binary format
- * Template parameter determines the serialization protocol
+ * Convert a PostgreSQL record (HeapTupleHeader) to a zerialize dynamic map
+ * This is used by both single-record and batch processing functions
  */
-template<typename Builder>
-static bytea* tuple_to_binary(HeapTupleHeader rec)
+static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec)
 {
     Oid tupType;
     int32 tupTypmod;
@@ -297,8 +287,8 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
 
     ncolumns = tupdesc->natts;
 
-    // Build serialized map
-    Builder builder;
+    // Build map of column name -> value
+    z::dyn::Value::Map entries;
 
     for (int i = 0; i < ncolumns; i++) {
         Form_pg_attribute att = TupleDescAttr(tupdesc, i);
@@ -315,12 +305,27 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
         // Get column name
         const char* attname = NameStr(att->attname);
 
-        // Convert to Dynamic and add to builder
-        builder.add(std::string(attname), datum_to_dynamic(value, att->atttypid, isnull));
+        // Add to map
+        entries.emplace_back(std::string(attname), datum_to_dynamic(value, att->atttypid, isnull));
     }
 
+    // No need to release tupdesc - it's cached and blessed (permanent)
+
+    return z::dyn::Value::map(std::move(entries));
+}
+
+/*
+ * Generic helper function to convert PostgreSQL tuple to any binary format
+ * Template parameter determines the serialization protocol
+ */
+template<typename Protocol>
+static bytea* tuple_to_binary(HeapTupleHeader rec)
+{
+    // Convert record to dynamic map
+    z::dyn::Value map = record_to_dynamic_map(rec);
+
     // Serialize
-    z::ZBuffer buffer = builder.build();
+    z::ZBuffer buffer = z::serialize<Protocol>(map);
     std::span<const uint8_t> data = buffer.buf();
 
     // Copy to PostgreSQL bytea
@@ -329,10 +334,88 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
     SET_VARSIZE(result, len + VARHDRSZ);
     memcpy(VARDATA(result), data.data(), len);
 
-    // No need to release tupdesc - it's cached and blessed (permanent)
+    return result;
+}
+
+/*
+ * Generic helper function to convert array of PostgreSQL tuples to binary format
+ * This is the batch processing version for improved performance
+ * Template parameter determines the serialization protocol
+ */
+template<typename Protocol>
+static bytea* array_to_binary(ArrayType* arr)
+{
+    // Get array element type (should be a record type)
+    Oid element_type = ARR_ELEMTYPE(arr);
+    int ndim = ARR_NDIM(arr);
+
+    // Handle empty arrays
+    if (ndim == 0 || ArrayGetNItems(ndim, ARR_DIMS(arr)) == 0) {
+        // Return empty array
+        z::ZBuffer buffer = z::serialize<Protocol>(z::dyn::Value::array(z::dyn::Value::Array()));
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    }
+
+    // For now, handle 1D arrays (covers most use cases)
+    if (ndim > 1) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("multidimensional arrays not supported for batch serialization")));
+    }
+
+    // Get array element info
+    int16 typlen;
+    bool typbyval;
+    char typalign;
+    get_typlenbyvalalign(element_type, &typlen, &typbyval, &typalign);
+
+    // Deconstruct array into elements
+    Datum* elements;
+    bool* nulls;
+    int nitems;
+
+    deconstruct_array(arr, element_type, typlen, typbyval, typalign,
+                     &elements, &nulls, &nitems);
+
+    // Build array of record maps
+    z::dyn::Value::Array result_array;
+    result_array.reserve(nitems);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            // Add null for NULL records
+            result_array.push_back(z::dyn::Value());
+        } else {
+            // Convert record to map
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+            result_array.push_back(record_to_dynamic_map(rec));
+        }
+    }
+
+    pfree(elements);
+    pfree(nulls);
+
+    // Serialize the array
+    z::ZBuffer buffer = z::serialize<Protocol>(z::dyn::Value::array(std::move(result_array)));
+    std::span<const uint8_t> data = buffer.buf();
+
+    // Copy to PostgreSQL bytea
+    size_t len = data.size();
+    bytea* result = (bytea*) palloc(len + VARHDRSZ);
+    SET_VARSIZE(result, len + VARHDRSZ);
+    memcpy(VARDATA(result), data.data(), len);
 
     return result;
 }
+
+/*
+ * Single record serialization functions
+ */
 
 /*
  * row_to_flexbuffers - Convert PostgreSQL record to FlexBuffers binary format
@@ -347,7 +430,7 @@ row_to_flexbuffers(PG_FUNCTION_ARGS)
     rec = PG_GETARG_HEAPTUPLEHEADER(0);
 
     // Convert to FlexBuffers
-    result = tuple_to_binary<FlexBuffersBuilder>(rec);
+    result = tuple_to_binary<z::Flex>(rec);
 
     PG_RETURN_BYTEA_P(result);
 }
@@ -365,7 +448,7 @@ row_to_msgpack(PG_FUNCTION_ARGS)
     rec = PG_GETARG_HEAPTUPLEHEADER(0);
 
     // Convert to MessagePack
-    result = tuple_to_binary<MessagePackBuilder>(rec);
+    result = tuple_to_binary<z::MsgPack>(rec);
 
     PG_RETURN_BYTEA_P(result);
 }
@@ -383,7 +466,7 @@ row_to_cbor(PG_FUNCTION_ARGS)
     rec = PG_GETARG_HEAPTUPLEHEADER(0);
 
     // Convert to CBOR
-    result = tuple_to_binary<CBORBuilder>(rec);
+    result = tuple_to_binary<z::CBOR>(rec);
 
     PG_RETURN_BYTEA_P(result);
 }
@@ -401,7 +484,83 @@ row_to_zera(PG_FUNCTION_ARGS)
     rec = PG_GETARG_HEAPTUPLEHEADER(0);
 
     // Convert to ZERA
-    result = tuple_to_binary<ZERABuilder>(rec);
+    result = tuple_to_binary<z::Zera>(rec);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * Batch processing functions (multiple records at once)
+ */
+
+/*
+ * rows_to_flexbuffers - Convert array of PostgreSQL records to FlexBuffers binary format
+ */
+extern "C" Datum
+rows_to_flexbuffers(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr;
+    bytea* result;
+
+    // Get the array argument
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+
+    // Convert to FlexBuffers array
+    result = array_to_binary<z::Flex>(arr);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * rows_to_msgpack - Convert array of PostgreSQL records to MessagePack binary format
+ */
+extern "C" Datum
+rows_to_msgpack(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr;
+    bytea* result;
+
+    // Get the array argument
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+
+    // Convert to MessagePack array
+    result = array_to_binary<z::MsgPack>(arr);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * rows_to_cbor - Convert array of PostgreSQL records to CBOR binary format
+ */
+extern "C" Datum
+rows_to_cbor(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr;
+    bytea* result;
+
+    // Get the array argument
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+
+    // Convert to CBOR array
+    result = array_to_binary<z::CBOR>(arr);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * rows_to_zera - Convert array of PostgreSQL records to ZERA binary format
+ */
+extern "C" Datum
+rows_to_zera(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr;
+    bytea* result;
+
+    // Get the array argument
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+
+    // Convert to ZERA array
+    result = array_to_binary<z::Zera>(arr);
 
     PG_RETURN_BYTEA_P(result);
 }
