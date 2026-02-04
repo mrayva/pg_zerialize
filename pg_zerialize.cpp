@@ -26,6 +26,7 @@ PG_MODULE_MAGIC;
 #include <vector>
 #include <string>
 #include <cstring>
+#include <unordered_map>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/msgpack.hpp>
@@ -76,6 +77,58 @@ using FlexBuffersBuilder = SerializationBuilder<z::Flex>;
 using MessagePackBuilder = SerializationBuilder<z::MsgPack>;
 using CBORBuilder = SerializationBuilder<z::CBOR>;
 using ZERABuilder = SerializationBuilder<z::Zera>;
+
+/*
+ * Schema caching to avoid repeated TupleDesc lookups
+ */
+struct TypeCacheKey {
+    Oid tupType;
+    int32 tupTypmod;
+
+    bool operator==(const TypeCacheKey& other) const {
+        return tupType == other.tupType && tupTypmod == other.tupTypmod;
+    }
+};
+
+// Hash function for cache key
+namespace std {
+    template<>
+    struct hash<TypeCacheKey> {
+        size_t operator()(const TypeCacheKey& k) const {
+            return hash<Oid>()(k.tupType) ^ (hash<int32>()(k.tupTypmod) << 1);
+        }
+    };
+}
+
+// Global cache for TupleDesc lookups
+static std::unordered_map<TypeCacheKey, TupleDesc> tupdesc_cache;
+
+/*
+ * Get TupleDesc with caching to avoid repeated system catalog queries
+ */
+static TupleDesc get_cached_tupdesc(Oid tupType, int32 tupTypmod)
+{
+    TypeCacheKey key{tupType, tupTypmod};
+
+    auto it = tupdesc_cache.find(key);
+    if (it != tupdesc_cache.end()) {
+        return it->second;
+    }
+
+    // Not in cache, look it up
+    TupleDesc tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+    // Make it permanent so we can cache it (no need to release later)
+    TupleDesc blessed = BlessTupleDesc(tupdesc);
+
+    // Cache the blessed descriptor
+    tupdesc_cache[key] = blessed;
+
+    // Release the original (we're keeping the blessed one)
+    ReleaseTupleDesc(tupdesc);
+
+    return blessed;
+}
 
 /*
  * Forward declaration for recursive array handling
@@ -236,7 +289,7 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
     // Extract type info from the record
     tupType = HeapTupleHeaderGetTypeId(rec);
     tupTypmod = HeapTupleHeaderGetTypMod(rec);
-    tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+    tupdesc = get_cached_tupdesc(tupType, tupTypmod);
 
     // Build a temporary HeapTuple for attribute access
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
@@ -276,7 +329,7 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
     SET_VARSIZE(result, len + VARHDRSZ);
     memcpy(VARDATA(result), data.data(), len);
 
-    ReleaseTupleDesc(tupdesc);
+    // No need to release tupdesc - it's cached and blessed (permanent)
 
     return result;
 }
