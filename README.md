@@ -1,6 +1,12 @@
 # pg_zerialize
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12%2B-blue.svg)](https://www.postgresql.org/)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+
 PostgreSQL extension for converting rows to efficient binary formats using the [zerialize](https://github.com/colinator/zerialize) library.
+
+**21% smaller than JSON** with MessagePack/CBOR formats.
 
 ## Status: All Formats Complete! 🎉
 
