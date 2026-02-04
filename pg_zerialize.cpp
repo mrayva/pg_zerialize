@@ -11,6 +11,8 @@ extern "C" {
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
+#include "utils/array.h"
 #include "access/tupdesc.h"
 #include "executor/spi.h"
 #include "utils/syscache.h"
@@ -76,12 +78,86 @@ using CBORBuilder = SerializationBuilder<z::CBOR>;
 using ZERABuilder = SerializationBuilder<z::Zera>;
 
 /*
+ * Forward declaration for recursive array handling
+ */
+static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull);
+
+/*
+ * Convert a PostgreSQL array to a zerialize dyn::Value array
+ */
+static z::dyn::Value array_to_dynamic(Datum value, Oid typid)
+{
+    ArrayType* arr = DatumGetArrayTypeP(value);
+    int ndim = ARR_NDIM(arr);
+
+    // Handle empty arrays
+    if (ndim == 0 || ArrayGetNItems(ndim, ARR_DIMS(arr)) == 0) {
+        return z::dyn::Value::array(z::dyn::Value::Array());
+    }
+
+    // For now, handle 1D arrays (covers 90% of use cases)
+    // Multi-dimensional arrays could be added later
+    if (ndim > 1) {
+        // Fall back to text representation for multi-dimensional arrays
+        Oid typoutput;
+        bool typIsVarlena;
+        char* str;
+
+        getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
+        str = OidOutputFunctionCall(typoutput, value);
+        std::string strval(str);
+        pfree(str);
+        return z::dyn::Value(strval);
+    }
+
+    // Get array element type and info
+    Oid element_type = ARR_ELEMTYPE(arr);
+    int16 typlen;
+    bool typbyval;
+    char typalign;
+    get_typlenbyvalalign(element_type, &typlen, &typbyval, &typalign);
+
+    // Deconstruct array into elements
+    Datum* elements;
+    bool* nulls;
+    int nitems;
+
+    deconstruct_array(arr, element_type, typlen, typbyval, typalign,
+                     &elements, &nulls, &nitems);
+
+    // Build dyn::Value::Array
+    z::dyn::Value::Array result_array;
+    result_array.reserve(nitems);
+
+    for (int i = 0; i < nitems; i++) {
+        result_array.push_back(datum_to_dynamic(elements[i], element_type, nulls[i]));
+    }
+
+    pfree(elements);
+    pfree(nulls);
+
+    return z::dyn::Value::array(std::move(result_array));
+}
+
+/*
  * Convert a PostgreSQL Datum to a zerialize dyn::Value
  */
 static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
 {
     if (isnull) {
         return z::dyn::Value();  // null value
+    }
+
+    // Check if this is an array type
+    char typtype = get_typtype(typid);
+    if (typtype == TYPTYPE_BASE || typtype == TYPTYPE_RANGE ||
+        typtype == TYPTYPE_ENUM || typtype == TYPTYPE_COMPOSITE) {
+        // Check if the type name ends with [] or is marked as an array
+        Oid array_element_type = get_element_type(typid);
+        if (OidIsValid(array_element_type)) {
+            // This is an array type
+            return array_to_dynamic(value, typid);
+        }
     }
 
     switch (typid) {
@@ -114,11 +190,18 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
             return z::dyn::Value(strval);
         }
 
+        case NUMERICOID:
+        {
+            // Convert NUMERIC to double (float8)
+            // This works for most use cases (prices, percentages, measurements)
+            // Note: May lose precision for very large or very precise decimals
+            Datum float_val = DirectFunctionCall1(numeric_float8, value);
+            return z::dyn::Value(DatumGetFloat8(float_val));
+        }
+
         // TODO: Add support for more types:
-        // - NUMERICOID (decimal numbers)
         // - DATEOID, TIMESTAMPOID (dates/timestamps)
         // - JSONOID, JSONBOID (nested JSON)
-        // - Arrays
         // - Composite types (nested records)
 
         default:
