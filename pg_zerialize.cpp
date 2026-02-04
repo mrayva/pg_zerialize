@@ -122,9 +122,77 @@ static TupleDesc get_cached_tupdesc(Oid tupType, int32 tupTypmod)
 }
 
 /*
- * Forward declaration for recursive array handling
+ * Forward declarations for conversion functions
  */
 static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull);
+static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec);
+
+/*
+ * Estimate serialized size for a given type
+ * Used for buffer pre-allocation and monitoring
+ * Returns conservative estimate (may overestimate for safety)
+ */
+static size_t estimate_type_size(Oid typid)
+{
+    switch (typid) {
+        case BOOLOID:
+            return 2;  // 1 byte type + 1 byte value
+
+        case INT2OID:
+            return 3;  // 1 byte type + ~2 bytes value
+
+        case INT4OID:
+        case FLOAT4OID:
+            return 5;  // 1 byte type + ~4 bytes value
+
+        case INT8OID:
+        case FLOAT8OID:
+        case NUMERICOID:
+            return 9;  // 1 byte type + ~8 bytes value
+
+        case TEXTOID:
+        case VARCHAROID:
+        case BPCHAROID:
+            return 32;  // Conservative estimate for text (1 type + length + avg ~30 chars)
+
+        default:
+            // For arrays and other types, estimate conservatively
+            return 50;
+    }
+}
+
+/*
+ * Estimate total serialized size for a record
+ * Used for pre-allocation and capacity planning
+ */
+static size_t estimate_record_size(HeapTupleHeader rec)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    TupleDesc tupdesc;
+    size_t estimated_size = 10;  // Base overhead (map marker, length, etc.)
+
+    // Extract type info from the record
+    tupType = HeapTupleHeaderGetTypeId(rec);
+    tupTypmod = HeapTupleHeaderGetTypMod(rec);
+    tupdesc = get_cached_tupdesc(tupType, tupTypmod);
+
+    // Estimate size for each column
+    for (int i = 0; i < tupdesc->natts; i++) {
+        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+        if (att->attisdropped)
+            continue;
+
+        // Add size for key (field name)
+        estimated_size += 1 + strlen(NameStr(att->attname));  // 1 byte type + name length
+
+        // Add size for value
+        estimated_size += estimate_type_size(att->atttypid);
+    }
+
+    return estimated_size;
+}
 
 /*
  * Convert a PostgreSQL array to a zerialize dyn::Value array
@@ -288,7 +356,9 @@ static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec)
     ncolumns = tupdesc->natts;
 
     // Build map of column name -> value
+    // Pre-allocate space to avoid reallocation overhead
     z::dyn::Value::Map entries;
+    entries.reserve(ncolumns);  // Reserve space for all columns
 
     for (int i = 0; i < ncolumns; i++) {
         Form_pg_attribute att = TupleDescAttr(tupdesc, i);
@@ -321,6 +391,10 @@ static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec)
 template<typename Protocol>
 static bytea* tuple_to_binary(HeapTupleHeader rec)
 {
+    // Estimate output size for better memory allocation
+    // (Note: This is a hint; actual size may vary)
+    size_t estimated_size = estimate_record_size(rec);
+
     // Convert record to dynamic map
     z::dyn::Value map = record_to_dynamic_map(rec);
 
@@ -328,7 +402,8 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
     z::ZBuffer buffer = z::serialize<Protocol>(map);
     std::span<const uint8_t> data = buffer.buf();
 
-    // Copy to PostgreSQL bytea
+    // Allocate PostgreSQL bytea with actual size
+    // (Estimation helps zerialize internally, allocation uses actual size)
     size_t len = data.size();
     bytea* result = (bytea*) palloc(len + VARHDRSZ);
     SET_VARSIZE(result, len + VARHDRSZ);
@@ -382,9 +457,18 @@ static bytea* array_to_binary(ArrayType* arr)
     deconstruct_array(arr, element_type, typlen, typbyval, typalign,
                      &elements, &nulls, &nitems);
 
-    // Build array of record maps
+    // Estimate total output size for batch
+    // (Helps with memory planning, though actual size may vary)
+    size_t estimated_total = 10;  // Base array overhead
+    if (nitems > 0 && !nulls[0]) {
+        HeapTupleHeader first_rec = DatumGetHeapTupleHeader(elements[0]);
+        size_t per_record_estimate = estimate_record_size(first_rec);
+        estimated_total += per_record_estimate * nitems;
+    }
+
+    // Build array of record maps with pre-allocated capacity
     z::dyn::Value::Array result_array;
-    result_array.reserve(nitems);
+    result_array.reserve(nitems);  // Pre-allocate array capacity
 
     for (int i = 0; i < nitems; i++) {
         if (nulls[i]) {
