@@ -1,0 +1,6 @@
+build
+.DS_Store
+.vscode
+zerialize_xcode
+zerialise_xcode.xcodeproj
+build_test/**

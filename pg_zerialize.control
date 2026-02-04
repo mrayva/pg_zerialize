@@ -1,0 +1,5 @@
+# pg_zerialize extension
+comment = 'Convert PostgreSQL rows to binary formats (FlexBuffers, MessagePack, CBOR, ZERA)'
+default_version = '1.0'
+module_pathname = '$libdir/pg_zerialize'
+relocatable = true

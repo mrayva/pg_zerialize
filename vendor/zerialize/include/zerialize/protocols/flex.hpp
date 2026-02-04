@@ -1,0 +1,534 @@
+#pragma once
+
+#include <flatbuffers/flexbuffers.h>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <span>
+#include <stdexcept>
+#include <iostream>
+#include <zerialize/zbuffer.hpp>
+#include <zerialize/errors.hpp>
+
+namespace zerialize {
+namespace flex {
+
+// ========================== Writer (Serializer) ===============================
+
+struct RootSerializer {
+    ::flexbuffers::Builder fbb;
+    bool finished_  = false;
+    bool wrote_root_ = false;
+
+    // track container "starts" for EndMap/EndVector
+    struct Ctx {
+        enum K { Arr, Obj } k;
+        std::size_t start;
+    };
+    std::vector<Ctx> st;
+
+    RootSerializer() = default;
+
+    ZBuffer finish() {
+        if (!finished_) {
+            if (!wrote_root_) fbb.Null();  // ensure we wrote a root
+            fbb.Finish();
+            finished_ = true;
+        }
+        // FlexBuffers returns a const ref; we “steal” it
+        const std::vector<uint8_t>& buf = fbb.GetBuffer();
+        auto& hack = const_cast<std::vector<uint8_t>&>(buf);
+        return ZBuffer(std::move(hack));
+    }
+};
+
+struct Serializer {
+    RootSerializer* r;
+
+    explicit Serializer(RootSerializer& rs) : r(&rs) {}
+
+    // ---- primitives ----
+    void null()                  { r->fbb.Null();  r->wrote_root_ = true; }
+    void boolean(bool v)         { r->fbb.Bool(v); r->wrote_root_ = true; }
+    void int64(std::int64_t v)   { r->fbb.Int(v);  r->wrote_root_ = true; }
+    void uint64(std::uint64_t v) { r->fbb.UInt(v); r->wrote_root_ = true; }
+    void double_(double v)       { r->fbb.Double(v); r->wrote_root_ = true; }
+    void string(std::string_view sv) {
+        r->fbb.String(sv.data(), sv.size()); r->wrote_root_ = true;
+    }
+    void binary(std::span<const std::byte> b) {
+        auto ptr = reinterpret_cast<const std::uint8_t*>(b.data());
+        r->fbb.Blob(ptr, b.size()); r->wrote_root_ = true;
+    }
+
+    // ---- structures ----
+    void begin_array(std::size_t /*reserve*/) {
+        std::size_t start = r->fbb.StartVector();
+        r->st.push_back({RootSerializer::Ctx::Arr, start});
+        r->wrote_root_ = true;
+    }
+    void end_array() {
+        ensure_in(RootSerializer::Ctx::Arr, "end_array");
+        auto start = r->st.back().start;
+        r->st.pop_back();
+        // typed=false, fixed=false (generic JSON-like array)
+        (void)r->fbb.EndVector(start, /*typed=*/false, /*fixed=*/false);
+    }
+
+    void begin_map(std::size_t /*reserve*/) {
+        std::size_t start = r->fbb.StartMap();
+        r->st.push_back({RootSerializer::Ctx::Obj, start});
+        r->wrote_root_ = true;
+    }
+    void end_map() {
+        ensure_in(RootSerializer::Ctx::Obj, "end_map");
+        auto start = r->st.back().start;
+        r->st.pop_back();
+        (void)r->fbb.EndMap(start);
+    }
+
+    void key(std::string_view k) {
+        // FlexBuffers requires a key immediately before its value
+        r->fbb.Key(k.data(), k.size());
+    }
+
+private:
+    void ensure_in(RootSerializer::Ctx::K want, const char* fn) const {
+        if (r->st.empty() || r->st.back().k != want)
+            throw std::logic_error(std::string(fn) + " called outside correct container");
+    }
+};
+
+// ========================== Reader (Deserializer) =============================
+
+// Forward declare FlexValue so FlexViewBase can return it.
+class FlexValue;
+
+// Shared non-virtual base implementing the Reader surface on top of a
+// flexbuffers::Reference. Both FlexDeserializer (root) and FlexValue (subviews)
+// derive from this to avoid code duplication.
+class FlexViewBase {
+protected:
+    ::flexbuffers::Reference ref_{};
+    FlexViewBase() = default;
+    explicit FlexViewBase(::flexbuffers::Reference r) : ref_(r) {}
+
+    void require(bool cond, const char* msg) const {
+        if (!cond) throw DeserializationError(msg);
+    }
+
+    static std::string json_escape(std::string_view s) {
+        std::string out;
+        out.reserve(s.size() + 4);
+        for (unsigned char ch : s) {
+            switch (ch) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b";  break;
+                case '\f': out += "\\f";  break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (ch < 0x20) {
+                        char buf[7];
+                        std::snprintf(buf, sizeof(buf), "\\u%04x", ch);
+                        out += buf;
+                    } else {
+                        out.push_back(static_cast<char>(ch));
+                    }
+            }
+        }
+        return out;
+    }
+
+    static void indent(std::ostringstream& os, int n) {
+        for (int i = 0; i < n; ++i) os.put(' ');
+    }
+
+    static const char* type_code(const ::flexbuffers::Reference& r) {
+        if (r.IsNull())   return "null";
+        if (r.IsBool())   return "bool";
+        if (r.IsInt())    return "int";
+        if (r.IsUInt())   return "uint";
+        if (r.IsFloat())  return "float";
+        if (r.IsString()) return "str";
+        if (r.IsBlob())   return "blob";
+        if (r.IsMap())    return "map";
+        if (r.IsAnyVector()) return "arr";
+        return "any";
+    }
+
+    static void dump_rec(std::ostringstream& os, const ::flexbuffers::Reference& r, int pad) {
+        auto t = type_code(r);
+        if (r.IsNull()) {
+            os << t << "|null";
+        } else if (r.IsBool()) {
+            os << t << "| " << (r.AsBool() ? "true" : "false");
+        } else if (r.IsInt()) {
+            os << t << "|" << r.AsInt64();
+        } else if (r.IsUInt()) {
+            os << t << "|" << r.AsUInt64();
+        } else if (r.IsFloat()) {
+            os << t << "|" << r.AsDouble();
+        } else if (r.IsString()) {
+            auto sv = r.AsString();
+            os << t << "|\"" << json_escape(std::string_view(sv.c_str(), sv.size())) << '"';
+        } else if (r.IsBlob()) {
+            auto b = r.AsBlob();
+            os << t << "[size=" << b.size() << "]";
+        } else if (r.IsMap()) {
+            os << t << " {\n";
+            auto m = r.AsMap();
+            auto keys = m.Keys();
+            auto vals = m.Values();
+            for (size_t i = 0; i < keys.size(); ++i) {
+                indent(os, pad + 2);
+                auto ks = keys[i].AsString();
+                os << '"' << json_escape(std::string_view(ks.c_str(), ks.size())) << "\": ";
+                dump_rec(os, vals[i], pad + 2);
+                if (i + 1 < keys.size()) os << ',';
+                os << '\n';
+            }
+            indent(os, pad);
+            os << '}';
+        } else if (r.IsAnyVector()) {
+            os << t << " [\n";
+            auto v = r.AsVector();
+            for (size_t i = 0; i < v.size(); ++i) {
+                indent(os, pad + 2);
+                dump_rec(os, v[i], pad + 2);
+                if (i + 1 < v.size()) os << ',';
+                os << '\n';
+            }
+            indent(os, pad);
+            os << ']';
+        } else {
+            os << t; // fallback
+        }
+    }
+
+public:
+    // Predicates
+    bool isNull()   const { return ref_.IsNull(); }
+    bool isBool()   const { return ref_.IsBool(); }
+    bool isInt()    const { return ref_.IsInt(); }
+    bool isUInt()   const { return ref_.IsUInt(); }
+    bool isFloat()  const { return ref_.IsFloat(); }
+    bool isString() const { return ref_.IsString(); }
+    bool isBlob()   const { return ref_.IsBlob(); }
+    bool isMap()    const { return ref_.IsMap(); }
+    bool isArray()  const { return ref_.IsAnyVector() && !ref_.IsMap(); }
+
+    // Scalars
+    int8_t   asInt8()   const { require(isInt(), "value is not a signed integer"); return ref_.AsInt8(); }
+    int16_t  asInt16()  const { require(isInt(), "value is not a signed integer"); return ref_.AsInt16(); }
+    int32_t  asInt32()  const { require(isInt(), "value is not a signed integer"); return ref_.AsInt32(); }
+    int64_t  asInt64()  const { require(isInt(), "value is not a signed integer"); return ref_.AsInt64(); }
+
+    uint8_t  asUInt8()  const { require(isUInt(), "value is not an unsigned integer"); return static_cast<uint8_t>(ref_.AsUInt8()); }
+    uint16_t asUInt16() const { require(isUInt(), "value is not an unsigned integer"); return static_cast<uint16_t>(ref_.AsUInt16()); }
+    uint32_t asUInt32() const { require(isUInt(), "value is not an unsigned integer"); return static_cast<uint32_t>(ref_.AsUInt32()); }
+    uint64_t asUInt64() const { require(isUInt(), "value is not an unsigned integer"); return static_cast<uint64_t>(ref_.AsUInt64()); }
+
+    float    asFloat()  const { require(isFloat(), "value is not a float"); return static_cast<float>(ref_.AsFloat()); }
+    double   asDouble() const { require(isFloat(), "value is not a float"); return ref_.AsDouble(); }
+    bool     asBool()   const { require(isBool(), "value is not a bool"); return ref_.AsBool(); }
+
+    std::string      asString()     const { require(isString(), "value is not a string"); auto s = ref_.AsString(); return s.str(); }
+    std::string_view asStringView() const { require(isString(), "value is not a string"); auto s = ref_.AsString(); return {s.c_str(), s.size()}; }
+
+    std::span<const std::byte> asBlob() const {
+        require(isBlob(), "value is not a blob");
+        auto b = ref_.AsBlob();
+        auto* p = reinterpret_cast<const std::byte*>(b.data());
+        return {p, b.size()};
+    }
+
+    // Zero-alloc forward range of keys (StringViewRange-compatible)
+    struct KeysView {
+        ::flexbuffers::TypedVector keys;
+        struct iterator {
+            const ::flexbuffers::TypedVector* keys = nullptr;
+            std::size_t i = 0;
+            using iterator_category = std::forward_iterator_tag;
+            using iterator_concept  = std::forward_iterator_tag;
+            using value_type        = std::string_view;
+            using difference_type   = std::ptrdiff_t;
+            using reference         = std::string_view;
+            iterator() = default;
+            iterator(const ::flexbuffers::TypedVector* ks, std::size_t idx) : keys(ks), i(idx) {}
+            reference operator*() const {
+                auto s = (*keys)[i].AsString();
+                return std::string_view(s.c_str(), s.size());
+            }
+            iterator& operator++() { ++i; return *this; }
+            iterator operator++(int) { iterator tmp = *this; ++(*this); return tmp; }
+            friend bool operator==(const iterator& a, const iterator& b) { return a.keys==b.keys && a.i==b.i; }
+        };
+        iterator begin() const { return iterator{&keys, 0}; }
+        iterator end()   const { return iterator{&keys, keys.size()}; }
+    };
+
+    inline KeysView mapKeys() const {
+        require(isMap(), "not a map");
+        return KeysView{ ref_.AsMap().Keys() };
+    }
+
+    bool contains(std::string_view key) const {
+        if (!isMap()) return false;
+        auto m = ref_.AsMap();
+        auto keys = m.Keys();
+        std::size_t lo = 0, hi = keys.size();
+        while (lo < hi) {
+            std::size_t mid = (lo + hi) / 2;
+            auto s = keys[mid].AsString();
+            std::string_view sv{s.c_str(), s.size()};
+            const std::size_t n = sv.size() < key.size() ? sv.size() : key.size();
+            int cmp = std::char_traits<char>::compare(sv.data(), key.data(), n);
+            if (cmp < 0) { lo = mid + 1; }
+            else if (cmp > 0) { hi = mid; }
+            else {
+                if (sv.size() < key.size()) { lo = mid + 1; }
+                else if (sv.size() > key.size()) { hi = mid; }
+                else { return true; }
+            }
+        }
+        return false;
+    }
+
+    std::size_t arraySize() const {
+        require(isArray(), "not an array");
+        return ref_.AsVector().size();
+    }
+
+    // Declarations (defined after FlexValue is declared)
+    FlexValue operator[](std::string_view key) const;
+    FlexValue operator[](std::size_t idx) const;
+
+    std::string to_string() const {
+        std::ostringstream os;
+        os << "Flex ";
+        dump_rec(os, ref_, 0);
+        return os.str();
+    }
+};
+
+// Subview that just carries the reference; inherits full Reader surface.
+class FlexValue final : public FlexViewBase {
+public:
+    explicit FlexValue(::flexbuffers::Reference r) : FlexViewBase(r) {}
+};
+
+// Define FlexViewBase subscriptors now that FlexValue is complete.
+inline FlexValue FlexViewBase::operator[](std::string_view key) const {
+    require(isMap(), "not a map");
+    auto m = ref_.AsMap();
+    auto keys = m.Keys();
+    auto vals = m.Values();
+    std::size_t lo = 0, hi = keys.size();
+    while (lo < hi) {
+        std::size_t mid = (lo + hi) / 2;
+        auto s = keys[mid].AsString();
+        std::string_view sv{s.c_str(), s.size()};
+        const std::size_t n = sv.size() < key.size() ? sv.size() : key.size();
+        int cmp = std::char_traits<char>::compare(sv.data(), key.data(), n);
+        if (cmp < 0) { lo = mid + 1; }
+        else if (cmp > 0) { hi = mid; }
+        else {
+            if (sv.size() < key.size()) { lo = mid + 1; }
+            else if (sv.size() > key.size()) { hi = mid; }
+            else { return FlexValue(vals[mid]); }
+        }
+    }
+    throw DeserializationError("key not found: " + std::string(key));
+}
+
+inline FlexValue FlexViewBase::operator[](std::size_t idx) const {
+    require(isArray(), "not an array");
+    auto v = ref_.AsVector();
+    require(idx < v.size(), "index out of bounds");
+    return FlexValue(v[idx]);
+}
+
+class FlexDeserializer : public FlexViewBase {
+protected:
+    // If we construct from a vector, we own the bytes here.
+    std::vector<uint8_t> owned_;
+    // If we construct as a non-owning view, we keep a span here.
+    std::span<const uint8_t> view_;
+    // Reference into whichever storage is active.
+    // ref_ is inherited from FlexViewBase
+
+    // No duplicate helpers here; FlexViewBase handles formatting/debug.
+
+public:
+    // -------- constructors (owning) --------
+    explicit FlexDeserializer(const std::vector<uint8_t>& buf)
+      : FlexViewBase(), owned_(buf) {
+        ref_ = owned_.empty() ? ::flexbuffers::Reference{} : ::flexbuffers::GetRoot(owned_);
+      }
+
+    explicit FlexDeserializer(std::vector<uint8_t>&& buf)
+      : FlexViewBase(), owned_(std::move(buf)) {
+        ref_ = owned_.empty() ? ::flexbuffers::Reference{} : ::flexbuffers::GetRoot(owned_);
+      }
+
+    // -------- constructors (non-owning / zero-copy) --------
+    explicit FlexDeserializer(std::span<const uint8_t> bytes)
+      : FlexViewBase(), view_(bytes) {
+        ref_ = view_.empty() ? ::flexbuffers::Reference{} : ::flexbuffers::GetRoot(view_.data(), view_.size());
+      }
+
+    explicit FlexDeserializer(const uint8_t* data, std::size_t n)
+      : FlexViewBase(), view_(data, n) {
+        ref_ = (n == 0) ? ::flexbuffers::Reference{} : ::flexbuffers::GetRoot(data, n);
+      }
+
+    explicit FlexDeserializer(const std::byte* data, std::size_t n)
+      : FlexDeserializer(reinterpret_cast<const uint8_t*>(data), n) {}
+
+    // -------- view ctor from Reference (nested access) --------
+    explicit FlexDeserializer(::flexbuffers::Reference r) : FlexViewBase(r) {}
+
+    // FlexViewBase provides Reader methods, including subscripts.
+    using FlexViewBase::isNull;
+    using FlexViewBase::isBool;
+    using FlexViewBase::isInt;
+    using FlexViewBase::isUInt;
+    using FlexViewBase::isFloat;
+    using FlexViewBase::isString;
+    using FlexViewBase::isBlob;
+    using FlexViewBase::isMap;
+    using FlexViewBase::isArray;
+    using FlexViewBase::asInt8;
+    using FlexViewBase::asInt16;
+    using FlexViewBase::asInt32;
+    using FlexViewBase::asInt64;
+    using FlexViewBase::asUInt8;
+    using FlexViewBase::asUInt16;
+    using FlexViewBase::asUInt32;
+    using FlexViewBase::asUInt64;
+    using FlexViewBase::asFloat;
+    using FlexViewBase::asDouble;
+    using FlexViewBase::asBool;
+    using FlexViewBase::asString;
+    using FlexViewBase::asStringView;
+    using FlexViewBase::asBlob;
+    using FlexViewBase::mapKeys;
+    using FlexViewBase::contains;
+    using FlexViewBase::arraySize;
+    using FlexViewBase::operator[];
+    using FlexViewBase::to_string;
+};
+
+} // namespace flex
+
+struct Flex {
+    static inline constexpr const char* Name = "Flex";
+    using Deserializer   = flex::FlexDeserializer;
+    using RootSerializer = flex::RootSerializer;
+    using Serializer     = flex::Serializer;
+};
+
+} // namespace zerialize
+
+
+namespace zerialize {
+namespace flex {
+namespace debugging {
+
+    static void print_ref(flexbuffers::Reference r, int indent = 0);
+
+    static void print_indent(int n) { while (n--) std::cout << ' '; }
+
+    static void print_map(flexbuffers::Map m, int indent) {
+        auto keys = m.Keys();
+        auto vals = m.Values();
+        std::cout << "{\n";
+        for (size_t i = 0; i < m.size(); ++i) {
+            print_indent(indent + 2);
+            std::string k = keys[i].AsString().str();
+            std::cout << std::quoted(k) << ": ";
+            print_ref(vals[i], indent + 2);
+            if (i + 1 < m.size()) std::cout << ",";
+            std::cout << "\n";
+        }
+        print_indent(indent);
+        std::cout << "}";
+    }
+
+    static void print_vector(flexbuffers::Vector v, int indent) {
+        std::cout << "[\n";
+        for (size_t i = 0; i < v.size(); ++i) {
+            print_indent(indent + 2);
+            print_ref(v[i], indent + 2);
+            if (i + 1 < v.size()) std::cout << ",";
+            std::cout << "\n";
+        }
+        print_indent(indent);
+        std::cout << "]";
+    }
+
+    static void print_blob(flexbuffers::Blob b) {
+        std::cout << "<blob:" << b.size() << " bytes>";
+    }
+
+    static void print_ref(flexbuffers::Reference r, int indent) {
+        using T = flexbuffers::Type;
+        switch (r.GetType()) {
+            case T::FBT_NULL:   std::cout << "null"; break;
+            case T::FBT_BOOL:   std::cout << (r.AsBool() ? "true" : "false"); break;
+            case T::FBT_INT:    std::cout << r.AsInt64(); break;
+            case T::FBT_UINT:   std::cout << r.AsUInt64(); break;
+            case T::FBT_FLOAT:  std::cout << r.AsDouble(); break;
+
+            // String may return a char* via .str(); wrap it so quoted works everywhere
+            case T::FBT_STRING:
+                std::cout << std::quoted(std::string(r.AsString().str()));
+                break;
+
+            // Key often is just const char*; wrap it too
+            case T::FBT_KEY:
+                std::cout << std::quoted(std::string(r.AsKey()));
+                break;
+
+            case T::FBT_BLOB:
+                print_blob(r.AsBlob());
+                break;
+
+            case T::FBT_VECTOR:
+            case T::FBT_VECTOR_INT:
+            case T::FBT_VECTOR_UINT:
+            case T::FBT_VECTOR_FLOAT:
+            case T::FBT_VECTOR_BOOL:
+            case T::FBT_VECTOR_KEY:
+                print_vector(r.AsVector(), indent);
+                break;
+
+            case T::FBT_MAP:
+                print_map(r.AsMap(), indent);
+                break;
+
+            default:
+                std::cout << "<unknown>";
+                break;
+        }
+    }
+
+    // Original pointer-based overload
+    static void dump_flex(const uint8_t* data, size_t size) {
+        auto root = flexbuffers::GetRoot(data, size);
+        print_ref(root);
+        std::cout << "\n";
+    }
+
+    // Convenience overload for span (so you can pass k.buf() directly)
+    static void dump_flex(std::span<const uint8_t> bytes) {
+        dump_flex(bytes.data(), bytes.size());
+    }
+
+} // namespace debugging
+} // namespace flex
+} // namespace zerialize
