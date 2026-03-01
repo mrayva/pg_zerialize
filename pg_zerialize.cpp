@@ -26,9 +26,11 @@ PG_MODULE_MAGIC;
 
 #include <vector>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <exception>
 #include <unordered_map>
+#include <type_traits>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/msgpack.hpp>
@@ -119,7 +121,10 @@ struct CachedColumn {
 struct CachedSchema {
     TupleDesc tupdesc;
     std::vector<CachedColumn> columns;
+    bool msgpack_fast_supported;
 };
+
+static bool is_msgpack_fast_kind(ConverterKind kind);
 
 // Global cache for per-schema metadata and TupleDesc lookups.
 static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
@@ -209,6 +214,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 
     CachedSchema schema;
     schema.tupdesc = blessed;
+    schema.msgpack_fast_supported = true;
     schema.columns.reserve(blessed->natts);
 
     for (int i = 0; i < blessed->natts; i++) {
@@ -223,6 +229,9 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         col.typid = att->atttypid;
         col.kind = classify_type(col.typid);
         col.typoutput = InvalidOid;
+        if (!is_msgpack_fast_kind(col.kind)) {
+            schema.msgpack_fast_supported = false;
+        }
 
         if (col.kind == ConverterKind::Fallback) {
             bool typIsVarlena;
@@ -242,6 +251,8 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
  */
 static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull);
 static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec);
+static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec);
+static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int nitems);
 
 /*
  * Convert a PostgreSQL array to a zerialize dyn::Value array
@@ -423,6 +434,195 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
     return z::dyn::Value();
 }
 
+static bool is_msgpack_fast_kind(ConverterKind kind)
+{
+    switch (kind) {
+        case ConverterKind::Int2:
+        case ConverterKind::Int4:
+        case ConverterKind::Int8:
+        case ConverterKind::Float4:
+        case ConverterKind::Float8:
+        case ConverterKind::Bool:
+        case ConverterKind::Text:
+        case ConverterKind::Numeric:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline void msgpack_write_text(z::MsgPackSerializer& writer, Datum value)
+{
+    text* txt = DatumGetTextPP(value);
+    const char* ptr = VARDATA_ANY(txt);
+    int len = VARSIZE_ANY_EXHDR(txt);
+    writer.string(std::string_view(ptr, static_cast<size_t>(len)));
+}
+
+static inline void msgpack_write_scalar(
+    z::MsgPackSerializer& writer,
+    const CachedColumn& col,
+    Datum value,
+    bool isnull)
+{
+    if (isnull) {
+        writer.null();
+        return;
+    }
+
+    switch (col.kind) {
+        case ConverterKind::Int2:
+            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
+            return;
+        case ConverterKind::Int4:
+            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
+            return;
+        case ConverterKind::Int8:
+            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
+            return;
+        case ConverterKind::Float4:
+            writer.double_(static_cast<double>(DatumGetFloat4(value)));
+            return;
+        case ConverterKind::Float8:
+            writer.double_(DatumGetFloat8(value));
+            return;
+        case ConverterKind::Bool:
+            writer.boolean(DatumGetBool(value));
+            return;
+        case ConverterKind::Text:
+            msgpack_write_text(writer, value);
+            return;
+        case ConverterKind::Numeric:
+        {
+            Datum float_val = DirectFunctionCall1(numeric_float8, value);
+            writer.double_(DatumGetFloat8(float_val));
+            return;
+        }
+        default:
+            break;
+    }
+
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("unsupported type for fast MessagePack path"),
+             errdetail("column type OID %u", col.typid)));
+}
+
+static inline void msgpack_write_record_map(
+    z::MsgPackSerializer& writer,
+    HeapTupleHeader rec,
+    const CachedSchema& schema)
+{
+    HeapTupleData tuple;
+    tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+    tuple.t_data = rec;
+
+    writer.begin_map(schema.columns.size());
+    for (const CachedColumn& col : schema.columns) {
+        Datum value;
+        bool isnull;
+
+        value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
+        writer.key(col.name);
+        msgpack_write_scalar(writer, col, value, isnull);
+    }
+    writer.end_map();
+}
+
+static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
+{
+    Oid tupType = HeapTupleHeaderGetTypeId(rec);
+    int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+    if (!schema.msgpack_fast_supported) {
+        return nullptr;
+    }
+
+    try {
+        z::MsgPackRootSerializer rs;
+        z::MsgPackSerializer writer(rs);
+        msgpack_write_record_map(writer, rec, schema);
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast MessagePack row serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast MessagePack row serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
+static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int nitems)
+{
+    std::vector<const CachedSchema*> schemas;
+    schemas.reserve(nitems);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            schemas.push_back(nullptr);
+            continue;
+        }
+
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        Oid tupType = HeapTupleHeaderGetTypeId(rec);
+        int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+        const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+        if (!schema.msgpack_fast_supported) {
+            return nullptr;
+        }
+        schemas.push_back(&schema);
+    }
+
+    try {
+        z::MsgPackRootSerializer rs;
+        z::MsgPackSerializer writer(rs);
+
+        writer.begin_array(static_cast<size_t>(nitems));
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+                msgpack_write_record_map(writer, rec, *schemas[i]);
+            }
+        }
+        writer.end_array();
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast MessagePack batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast MessagePack batch serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
 /*
  * Convert a PostgreSQL record (HeapTupleHeader) to a zerialize dynamic map
  * This is used by both single-record and batch processing functions
@@ -470,6 +670,12 @@ template<typename Protocol>
 static bytea* tuple_to_binary(HeapTupleHeader rec)
 {
     try {
+        if constexpr (std::is_same_v<Protocol, z::MsgPack>) {
+            if (bytea* fast = try_serialize_msgpack_row_fast(rec)) {
+                return fast;
+            }
+        }
+
         // Convert record to dynamic map
         z::dyn::Value map = record_to_dynamic_map(rec);
 
@@ -551,6 +757,14 @@ static bytea* array_to_binary(ArrayType* arr)
 
     deconstruct_array(arr, element_type, typlen, typbyval, typalign,
                      &elements, &nulls, &nitems);
+
+    if constexpr (std::is_same_v<Protocol, z::MsgPack>) {
+        if (bytea* fast = try_serialize_msgpack_array_fast(elements, nulls, nitems)) {
+            pfree(elements);
+            pfree(nulls);
+            return fast;
+        }
+    }
 
     // Build array of record maps with pre-allocated capacity
     z::dyn::Value::Array result_array;
