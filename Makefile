@@ -25,3 +25,11 @@ include $(PGXS)
 # Override the implicit rule to use C++ compiler
 %.o: %.cpp
 	$(CXX) $(PG_CPPFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+.PHONY: bench bench-quick
+
+bench:
+	./bench/run_microbench.sh
+
+bench-quick:
+	RUNS=3 WARMUP=1 ./bench/run_microbench.sh

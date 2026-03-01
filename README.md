@@ -39,6 +39,24 @@ make installcheck
 psql -d postgres -f test_pg_zerialize.sql
 ```
 
+## Microbenchmark
+
+Run the repeatable in-repo microbenchmark harness:
+
+```bash
+make bench
+```
+
+Quick/short run:
+
+```bash
+make bench-quick
+```
+
+Benchmark docs and output format:
+- `bench/README.md`
+- output logs in `results/microbench_*.out`
+
 ## Usage
 
 ### Single Record Serialization
