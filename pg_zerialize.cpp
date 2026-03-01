@@ -116,6 +116,11 @@ struct CachedColumn {
     Oid typid;
     Oid typoutput;
     ConverterKind kind;
+    Oid array_element_typid;
+    ConverterKind array_element_kind;
+    int16 array_typlen;
+    bool array_typbyval;
+    char array_typalign;
 };
 
 struct CachedSchema {
@@ -125,6 +130,8 @@ struct CachedSchema {
 };
 
 static bool is_msgpack_fast_kind(ConverterKind kind);
+static bool is_msgpack_fast_array_element_kind(ConverterKind kind);
+static bool is_msgpack_fast_column(const CachedColumn& col);
 
 // Global cache for per-schema metadata and TupleDesc lookups.
 static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
@@ -229,11 +236,28 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         col.typid = att->atttypid;
         col.kind = classify_type(col.typid);
         col.typoutput = InvalidOid;
-        if (!is_msgpack_fast_kind(col.kind)) {
+        col.array_element_typid = InvalidOid;
+        col.array_element_kind = ConverterKind::Fallback;
+        col.array_typlen = 0;
+        col.array_typbyval = false;
+        col.array_typalign = 'i';
+
+        if (col.kind == ConverterKind::Array) {
+            col.array_element_typid = get_element_type(col.typid);
+            if (OidIsValid(col.array_element_typid)) {
+                col.array_element_kind = classify_type(col.array_element_typid);
+                get_typlenbyvalalign(col.array_element_typid,
+                                    &col.array_typlen,
+                                    &col.array_typbyval,
+                                    &col.array_typalign);
+            }
+        }
+
+        if (!is_msgpack_fast_column(col)) {
             schema.msgpack_fast_supported = false;
         }
 
-        if (col.kind == ConverterKind::Fallback) {
+        if (col.kind == ConverterKind::Fallback || col.kind == ConverterKind::Array) {
             bool typIsVarlena;
             getTypeOutputInfo(col.typid, &col.typoutput, &typIsVarlena);
         }
@@ -451,12 +475,130 @@ static bool is_msgpack_fast_kind(ConverterKind kind)
     }
 }
 
+static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
+{
+    switch (kind) {
+        case ConverterKind::Int2:
+        case ConverterKind::Int4:
+        case ConverterKind::Int8:
+        case ConverterKind::Float4:
+        case ConverterKind::Float8:
+        case ConverterKind::Bool:
+        case ConverterKind::Text:
+        case ConverterKind::Numeric:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool is_msgpack_fast_column(const CachedColumn& col)
+{
+    if (col.kind != ConverterKind::Array) {
+        return is_msgpack_fast_kind(col.kind);
+    }
+    return OidIsValid(col.array_element_typid) &&
+           is_msgpack_fast_array_element_kind(col.array_element_kind);
+}
+
 static inline void msgpack_write_text(z::MsgPackSerializer& writer, Datum value)
 {
     text* txt = DatumGetTextPP(value);
     const char* ptr = VARDATA_ANY(txt);
     int len = VARSIZE_ANY_EXHDR(txt);
     writer.string(std::string_view(ptr, static_cast<size_t>(len)));
+}
+
+static inline void msgpack_write_array_element(
+    z::MsgPackSerializer& writer,
+    ConverterKind elem_kind,
+    Datum value,
+    bool isnull)
+{
+    if (isnull) {
+        writer.null();
+        return;
+    }
+
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
+            return;
+        case ConverterKind::Int4:
+            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
+            return;
+        case ConverterKind::Int8:
+            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
+            return;
+        case ConverterKind::Float4:
+            writer.double_(static_cast<double>(DatumGetFloat4(value)));
+            return;
+        case ConverterKind::Float8:
+            writer.double_(DatumGetFloat8(value));
+            return;
+        case ConverterKind::Bool:
+            writer.boolean(DatumGetBool(value));
+            return;
+        case ConverterKind::Text:
+            msgpack_write_text(writer, value);
+            return;
+        case ConverterKind::Numeric:
+        {
+            Datum float_val = DirectFunctionCall1(numeric_float8, value);
+            writer.double_(DatumGetFloat8(float_val));
+            return;
+        }
+        default:
+            break;
+    }
+
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("unsupported array element type for fast MessagePack path")));
+}
+
+static inline void msgpack_write_array(
+    z::MsgPackSerializer& writer,
+    const CachedColumn& col,
+    Datum value)
+{
+    ArrayType* arr = DatumGetArrayTypeP(value);
+    int ndim = ARR_NDIM(arr);
+
+    if (ndim == 0) {
+        writer.begin_array(0);
+        writer.end_array();
+        return;
+    }
+
+    if (ndim != 1) {
+        // Preserve existing behavior: multidimensional arrays fall back to text.
+        char* str = OidOutputFunctionCall(col.typoutput, value);
+        writer.string(std::string_view(str));
+        pfree(str);
+        return;
+    }
+
+    Datum* elements;
+    bool* nulls;
+    int nitems;
+    deconstruct_array(arr,
+                      col.array_element_typid,
+                      col.array_typlen,
+                      col.array_typbyval,
+                      col.array_typalign,
+                      &elements,
+                      &nulls,
+                      &nitems);
+
+    writer.begin_array(static_cast<size_t>(nitems));
+    for (int i = 0; i < nitems; i++) {
+        msgpack_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
+    }
+    writer.end_array();
+
+    pfree(elements);
+    pfree(nulls);
 }
 
 static inline void msgpack_write_scalar(
@@ -498,6 +640,9 @@ static inline void msgpack_write_scalar(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Array:
+            msgpack_write_array(writer, col, value);
+            return;
         default:
             break;
     }
