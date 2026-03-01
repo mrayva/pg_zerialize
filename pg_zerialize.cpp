@@ -127,6 +127,7 @@ struct CachedSchema {
     TupleDesc tupdesc;
     std::vector<CachedColumn> columns;
     bool msgpack_fast_supported;
+    bool cbor_fast_supported;
 };
 
 static bool is_msgpack_fast_kind(ConverterKind kind);
@@ -222,6 +223,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
     CachedSchema schema;
     schema.tupdesc = blessed;
     schema.msgpack_fast_supported = true;
+    schema.cbor_fast_supported = true;
     schema.columns.reserve(blessed->natts);
 
     for (int i = 0; i < blessed->natts; i++) {
@@ -255,6 +257,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 
         if (!is_msgpack_fast_column(col)) {
             schema.msgpack_fast_supported = false;
+            schema.cbor_fast_supported = false;
         }
 
         if (col.kind == ConverterKind::Fallback || col.kind == ConverterKind::Array) {
@@ -277,6 +280,8 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull);
 static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec);
 static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec);
 static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int nitems);
+static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec);
+static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int nitems);
 
 /*
  * Convert a PostgreSQL array to a zerialize dyn::Value array
@@ -768,6 +773,273 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
     return nullptr;
 }
 
+static inline void cbor_write_text(z::cborjc::Serializer& writer, Datum value)
+{
+    text* txt = DatumGetTextPP(value);
+    const char* ptr = VARDATA_ANY(txt);
+    int len = VARSIZE_ANY_EXHDR(txt);
+    writer.string(std::string_view(ptr, static_cast<size_t>(len)));
+}
+
+static inline void cbor_write_array_element(
+    z::cborjc::Serializer& writer,
+    ConverterKind elem_kind,
+    Datum value,
+    bool isnull)
+{
+    if (isnull) {
+        writer.null();
+        return;
+    }
+
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
+            return;
+        case ConverterKind::Int4:
+            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
+            return;
+        case ConverterKind::Int8:
+            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
+            return;
+        case ConverterKind::Float4:
+            writer.double_(static_cast<double>(DatumGetFloat4(value)));
+            return;
+        case ConverterKind::Float8:
+            writer.double_(DatumGetFloat8(value));
+            return;
+        case ConverterKind::Bool:
+            writer.boolean(DatumGetBool(value));
+            return;
+        case ConverterKind::Text:
+            cbor_write_text(writer, value);
+            return;
+        case ConverterKind::Numeric:
+        {
+            Datum float_val = DirectFunctionCall1(numeric_float8, value);
+            writer.double_(DatumGetFloat8(float_val));
+            return;
+        }
+        default:
+            break;
+    }
+
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("unsupported array element type for fast CBOR path")));
+}
+
+static inline void cbor_write_array(
+    z::cborjc::Serializer& writer,
+    const CachedColumn& col,
+    Datum value)
+{
+    ArrayType* arr = DatumGetArrayTypeP(value);
+    int ndim = ARR_NDIM(arr);
+
+    if (ndim == 0) {
+        writer.begin_array(0);
+        writer.end_array();
+        return;
+    }
+
+    if (ndim != 1) {
+        // Preserve existing behavior: multidimensional arrays fall back to text.
+        char* str = OidOutputFunctionCall(col.typoutput, value);
+        writer.string(std::string_view(str));
+        pfree(str);
+        return;
+    }
+
+    Datum* elements;
+    bool* nulls;
+    int nitems;
+    deconstruct_array(arr,
+                      col.array_element_typid,
+                      col.array_typlen,
+                      col.array_typbyval,
+                      col.array_typalign,
+                      &elements,
+                      &nulls,
+                      &nitems);
+
+    writer.begin_array(static_cast<size_t>(nitems));
+    for (int i = 0; i < nitems; i++) {
+        cbor_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
+    }
+    writer.end_array();
+
+    pfree(elements);
+    pfree(nulls);
+}
+
+static inline void cbor_write_scalar(
+    z::cborjc::Serializer& writer,
+    const CachedColumn& col,
+    Datum value,
+    bool isnull)
+{
+    if (isnull) {
+        writer.null();
+        return;
+    }
+
+    switch (col.kind) {
+        case ConverterKind::Int2:
+            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
+            return;
+        case ConverterKind::Int4:
+            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
+            return;
+        case ConverterKind::Int8:
+            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
+            return;
+        case ConverterKind::Float4:
+            writer.double_(static_cast<double>(DatumGetFloat4(value)));
+            return;
+        case ConverterKind::Float8:
+            writer.double_(DatumGetFloat8(value));
+            return;
+        case ConverterKind::Bool:
+            writer.boolean(DatumGetBool(value));
+            return;
+        case ConverterKind::Text:
+            cbor_write_text(writer, value);
+            return;
+        case ConverterKind::Numeric:
+        {
+            Datum float_val = DirectFunctionCall1(numeric_float8, value);
+            writer.double_(DatumGetFloat8(float_val));
+            return;
+        }
+        case ConverterKind::Array:
+            cbor_write_array(writer, col, value);
+            return;
+        default:
+            break;
+    }
+
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("unsupported type for fast CBOR path"),
+             errdetail("column type OID %u", col.typid)));
+}
+
+static inline void cbor_write_record_map(
+    z::cborjc::Serializer& writer,
+    HeapTupleHeader rec,
+    const CachedSchema& schema)
+{
+    HeapTupleData tuple;
+    tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+    tuple.t_data = rec;
+
+    writer.begin_map(schema.columns.size());
+    for (const CachedColumn& col : schema.columns) {
+        Datum value;
+        bool isnull;
+
+        value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
+        writer.key(col.name);
+        cbor_write_scalar(writer, col, value, isnull);
+    }
+    writer.end_map();
+}
+
+static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec)
+{
+    Oid tupType = HeapTupleHeaderGetTypeId(rec);
+    int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+    if (!schema.cbor_fast_supported) {
+        return nullptr;
+    }
+
+    try {
+        z::cborjc::RootSerializer rs;
+        z::cborjc::Serializer writer(rs);
+        cbor_write_record_map(writer, rec, schema);
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast CBOR row serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast CBOR row serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
+static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int nitems)
+{
+    std::vector<const CachedSchema*> schemas;
+    schemas.reserve(nitems);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            schemas.push_back(nullptr);
+            continue;
+        }
+
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        Oid tupType = HeapTupleHeaderGetTypeId(rec);
+        int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+        const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+        if (!schema.cbor_fast_supported) {
+            return nullptr;
+        }
+        schemas.push_back(&schema);
+    }
+
+    try {
+        z::cborjc::RootSerializer rs;
+        z::cborjc::Serializer writer(rs);
+
+        writer.begin_array(static_cast<size_t>(nitems));
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+                cbor_write_record_map(writer, rec, *schemas[i]);
+            }
+        }
+        writer.end_array();
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast CBOR batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast CBOR batch serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
 /*
  * Convert a PostgreSQL record (HeapTupleHeader) to a zerialize dynamic map
  * This is used by both single-record and batch processing functions
@@ -817,6 +1089,10 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
     try {
         if constexpr (std::is_same_v<Protocol, z::MsgPack>) {
             if (bytea* fast = try_serialize_msgpack_row_fast(rec)) {
+                return fast;
+            }
+        } else if constexpr (std::is_same_v<Protocol, z::CBOR>) {
+            if (bytea* fast = try_serialize_cbor_row_fast(rec)) {
                 return fast;
             }
         }
@@ -905,6 +1181,12 @@ static bytea* array_to_binary(ArrayType* arr)
 
     if constexpr (std::is_same_v<Protocol, z::MsgPack>) {
         if (bytea* fast = try_serialize_msgpack_array_fast(elements, nulls, nitems)) {
+            pfree(elements);
+            pfree(nulls);
+            return fast;
+        }
+    } else if constexpr (std::is_same_v<Protocol, z::CBOR>) {
+        if (bytea* fast = try_serialize_cbor_array_fast(elements, nulls, nitems)) {
             pfree(elements);
             pfree(nulls);
             return fast;
