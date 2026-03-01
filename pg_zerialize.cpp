@@ -1049,6 +1049,24 @@ static inline void msgpack_write_record_map(
     writer.end_map();
 }
 
+static inline z::MsgPackRootSerializer& msgpack_reusable_root()
+{
+    static z::MsgPackRootSerializer rs;
+    return rs;
+}
+
+static inline bytea* msgpack_result_from_reusable_root(z::MsgPackRootSerializer& rs)
+{
+    size_t len = rs.sbuf.size;
+    bytea* result = (bytea*) palloc(len + VARHDRSZ);
+    SET_VARSIZE(result, len + VARHDRSZ);
+    if (len > 0) {
+        memcpy(VARDATA(result), rs.sbuf.data, len);
+    }
+    msgpack_sbuffer_clear(&rs.sbuf);
+    return result;
+}
+
 static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
 {
     Oid tupType = HeapTupleHeaderGetTypeId(rec);
@@ -1059,8 +1077,10 @@ static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
         return nullptr;
     }
 
+    z::MsgPackRootSerializer& rs = msgpack_reusable_root();
+    msgpack_sbuffer_clear(&rs.sbuf);
+
     try {
-        z::MsgPackRootSerializer rs;
         z::MsgPackSerializer writer(rs);
         if (!schema.use_deform_access) {
             msgpack_write_record_map(writer, rec, schema, nullptr);
@@ -1069,19 +1089,15 @@ static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
             msgpack_write_record_map(writer, rec, schema, &scratch);
         }
 
-        z::ZBuffer buffer = rs.finish();
-        std::span<const uint8_t> data = buffer.buf();
-        size_t len = data.size();
-        bytea* result = (bytea*) palloc(len + VARHDRSZ);
-        SET_VARSIZE(result, len + VARHDRSZ);
-        memcpy(VARDATA(result), data.data(), len);
-        return result;
+        return msgpack_result_from_reusable_root(rs);
     } catch (const std::exception& ex) {
+        msgpack_sbuffer_clear(&rs.sbuf);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("fast MessagePack row serialization failed"),
                  errdetail("%s", ex.what())));
     } catch (...) {
+        msgpack_sbuffer_clear(&rs.sbuf);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("fast MessagePack row serialization failed with unknown exception")));
@@ -1112,8 +1128,10 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
         schemas.push_back(&schema);
     }
 
+    z::MsgPackRootSerializer& rs = msgpack_reusable_root();
+    msgpack_sbuffer_clear(&rs.sbuf);
+
     try {
-        z::MsgPackRootSerializer rs;
         z::MsgPackSerializer writer(rs);
         TupleDeformScratch scratch;
 
@@ -1128,19 +1146,15 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
         }
         writer.end_array();
 
-        z::ZBuffer buffer = rs.finish();
-        std::span<const uint8_t> data = buffer.buf();
-        size_t len = data.size();
-        bytea* result = (bytea*) palloc(len + VARHDRSZ);
-        SET_VARSIZE(result, len + VARHDRSZ);
-        memcpy(VARDATA(result), data.data(), len);
-        return result;
+        return msgpack_result_from_reusable_root(rs);
     } catch (const std::exception& ex) {
+        msgpack_sbuffer_clear(&rs.sbuf);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("fast MessagePack batch serialization failed"),
                  errdetail("%s", ex.what())));
     } catch (...) {
+        msgpack_sbuffer_clear(&rs.sbuf);
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
                  errmsg("fast MessagePack batch serialization failed with unknown exception")));
