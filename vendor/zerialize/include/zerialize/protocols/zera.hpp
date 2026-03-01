@@ -810,6 +810,25 @@ struct Serializer {
         ctx.pending_value_patch = patch;
         ++ctx.count;
     }
+
+    void key_preencoded(std::span<const std::uint8_t> encoded_key) {
+        if (r->st_.empty() || !std::holds_alternative<RootSerializer::MapCtx>(r->st_.back()))
+            throw SerializationError("zera: key_preencoded() outside map");
+        auto& ctx = std::get<RootSerializer::MapCtx>(r->st_.back());
+        if (ctx.pending_value_patch) throw SerializationError("zera: key_preencoded() called twice without value");
+        if (encoded_key.size() < 4) throw SerializationError("zera: invalid preencoded key payload");
+
+        const std::uint16_t key_len = read_u16_le(encoded_key.data());
+        if (std::size_t(key_len) + 4 != encoded_key.size()) {
+            throw SerializationError("zera: preencoded key length mismatch");
+        }
+
+        ctx.payload.insert(ctx.payload.end(), encoded_key.begin(), encoded_key.end());
+        const std::size_t patch = ctx.payload.size();
+        ctx.payload.resize(ctx.payload.size() + 16, 0);
+        ctx.pending_value_patch = patch;
+        ++ctx.count;
+    }
 };
 
 } // namespace zera

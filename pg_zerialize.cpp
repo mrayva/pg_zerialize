@@ -113,6 +113,8 @@ enum class ConverterKind {
 struct CachedColumn {
     int attnum;
     std::string name;
+    std::vector<uint8_t> msgpack_key_encoded;
+    std::vector<uint8_t> zera_key_encoded;
     Oid typid;
     Oid typoutput;
     ConverterKind kind;
@@ -135,6 +137,8 @@ struct CachedSchema {
 static bool is_msgpack_fast_kind(ConverterKind kind);
 static bool is_msgpack_fast_array_element_kind(ConverterKind kind);
 static bool is_msgpack_fast_column(const CachedColumn& col);
+static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key);
+static std::vector<uint8_t> encode_zera_key(std::string_view key);
 
 // Global cache for per-schema metadata and TupleDesc lookups.
 static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
@@ -239,6 +243,8 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         CachedColumn col;
         col.attnum = i + 1;
         col.name = std::string(NameStr(att->attname));
+        col.msgpack_key_encoded = encode_msgpack_string_key(col.name);
+        col.zera_key_encoded = encode_zera_key(col.name);
         col.typid = att->atttypid;
         col.kind = classify_type(col.typid);
         col.typoutput = InvalidOid;
@@ -516,6 +522,59 @@ static bool is_msgpack_fast_column(const CachedColumn& col)
            is_msgpack_fast_array_element_kind(col.array_element_kind);
 }
 
+static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key)
+{
+    std::vector<uint8_t> out;
+    const size_t n = key.size();
+
+    if (n <= 31) {
+        out.reserve(1 + n);
+        out.push_back(static_cast<uint8_t>(0xA0u | static_cast<uint8_t>(n)));
+    } else if (n <= 0xFFu) {
+        out.reserve(2 + n);
+        out.push_back(0xD9u);
+        out.push_back(static_cast<uint8_t>(n));
+    } else if (n <= 0xFFFFu) {
+        out.reserve(3 + n);
+        out.push_back(0xDAu);
+        out.push_back(static_cast<uint8_t>((n >> 8) & 0xFFu));
+        out.push_back(static_cast<uint8_t>(n & 0xFFu));
+    } else if (n <= 0xFFFFFFFFu) {
+        out.reserve(5 + n);
+        out.push_back(0xDBu);
+        out.push_back(static_cast<uint8_t>((n >> 24) & 0xFFu));
+        out.push_back(static_cast<uint8_t>((n >> 16) & 0xFFu));
+        out.push_back(static_cast<uint8_t>((n >> 8) & 0xFFu));
+        out.push_back(static_cast<uint8_t>(n & 0xFFu));
+    } else {
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("map key length exceeds MessagePack limits")));
+    }
+
+    out.insert(out.end(), key.begin(), key.end());
+    return out;
+}
+
+static std::vector<uint8_t> encode_zera_key(std::string_view key)
+{
+    if (key.size() > 0xFFFFu) {
+        ereport(ERROR,
+                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                 errmsg("map key length exceeds ZERA key limit")));
+    }
+
+    std::vector<uint8_t> out;
+    out.reserve(4 + key.size());
+    const uint16_t len = static_cast<uint16_t>(key.size());
+    out.push_back(static_cast<uint8_t>(len & 0xFFu));
+    out.push_back(static_cast<uint8_t>((len >> 8) & 0xFFu));
+    out.push_back(0);
+    out.push_back(0);
+    out.insert(out.end(), key.begin(), key.end());
+    return out;
+}
+
 static inline void msgpack_write_text(z::MsgPackSerializer& writer, Datum value)
 {
     text* txt = DatumGetTextPP(value);
@@ -683,7 +742,7 @@ static inline void msgpack_write_record_map(
         bool isnull;
 
         value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-        writer.key(col.name);
+        writer.key_preencoded(col.msgpack_key_encoded);
         msgpack_write_scalar(writer, col, value, isnull);
     }
     writer.end_map();
@@ -1217,7 +1276,7 @@ static inline void zera_write_record_map(
         bool isnull;
 
         value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-        writer.key(col.name);
+        writer.key_preencoded(col.zera_key_encoded);
         zera_write_scalar(writer, col, value, isnull);
     }
     writer.end_map();

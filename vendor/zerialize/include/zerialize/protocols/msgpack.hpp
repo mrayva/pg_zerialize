@@ -513,12 +513,22 @@ public:
         sbuf.data = nullptr; sbuf.size = 0; sbuf.alloc = 0;
         return ZBuffer(d, n, ZBuffer::Deleters::Free);
     }
+
+    void write_raw(std::span<const uint8_t> bytes) {
+        if (bytes.empty()) return;
+        if (msgpack_sbuffer_write(&sbuf,
+                                  reinterpret_cast<const char*>(bytes.data()),
+                                  bytes.size()) != 0) {
+            throw SerializationError("msgpack: failed to append preencoded bytes");
+        }
+    }
 };
 
 class MsgPackSerializer {
     msgpack_packer& pk_;
+    MsgPackRootSerializer* rs_;
 public:
-    explicit MsgPackSerializer(MsgPackRootSerializer& rs) : pk_(rs.pk) {}
+    explicit MsgPackSerializer(MsgPackRootSerializer& rs) : pk_(rs.pk), rs_(&rs) {}
 
     // primitives
     void null()                 { msgpack_pack_nil(&pk_); }
@@ -544,6 +554,7 @@ public:
     void end_map()                  { /* no-op */ }
 
     void key(std::string_view k)    { string(k); }
+    void key_preencoded(std::span<const uint8_t> encoded_key) { rs_->write_raw(encoded_key); }
 };
 
 struct MsgPack {
