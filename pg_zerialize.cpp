@@ -122,6 +122,7 @@ enum class ConverterKind {
 
 struct CachedColumn;
 using MsgpackScalarWriterFn = void (*)(z::MsgPackSerializer&, const CachedColumn&, Datum, bool);
+using MsgpackArrayElemWriterFn = void (*)(z::MsgPackSerializer&, Datum, bool);
 
 struct CachedColumn {
     int attnum;
@@ -129,6 +130,7 @@ struct CachedColumn {
     std::vector<uint8_t> msgpack_key_encoded;
     std::vector<uint8_t> zera_key_encoded;
     MsgpackScalarWriterFn msgpack_scalar_writer;
+    MsgpackArrayElemWriterFn msgpack_array_elem_writer;
     Oid typid;
     Oid typoutput;
     ConverterKind kind;
@@ -155,6 +157,7 @@ static bool is_msgpack_fast_column(const CachedColumn& col);
 static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key);
 static std::vector<uint8_t> encode_zera_key(std::string_view key);
 static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind);
+static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind kind);
 static inline std::span<const std::byte> datum_bytea_span(Datum value);
 static inline std::span<const std::byte> datum_jsonb_span(Datum value);
 static constexpr size_t kHybridHeapDeformThreshold = 24;
@@ -303,6 +306,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         col.msgpack_key_encoded = encode_msgpack_string_key(col.name);
         col.zera_key_encoded = encode_zera_key(col.name);
         col.msgpack_scalar_writer = nullptr;
+        col.msgpack_array_elem_writer = nullptr;
         col.typid = att->atttypid;
         col.kind = classify_type(col.typid);
         col.msgpack_scalar_writer = select_msgpack_scalar_writer(col.kind);
@@ -317,6 +321,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
             col.array_element_typid = get_element_type(col.typid);
             if (OidIsValid(col.array_element_typid)) {
                 col.array_element_kind = classify_type(col.array_element_typid);
+                col.msgpack_array_elem_writer = select_msgpack_array_elem_writer(col.array_element_kind);
                 get_typlenbyvalalign(col.array_element_typid,
                                     &col.array_typlen,
                                     &col.array_typbyval,
@@ -417,6 +422,44 @@ static z::dyn::Value array_to_dynamic(Datum value, Oid typid)
     return z::dyn::Value::array(std::move(result_array));
 }
 
+static inline bool numeric_try_int64(Datum value, int64_t* out)
+{
+    Numeric num = DatumGetNumeric(value);
+    bool have_error = false;
+    int64 v = numeric_int8_opt_error(num, &have_error);
+    if (!have_error) {
+        *out = static_cast<int64_t>(v);
+        return true;
+    }
+    return false;
+}
+
+static inline double numeric_to_float8_fast(Datum value)
+{
+    Datum float_val = DirectFunctionCall1(numeric_float8, value);
+    return DatumGetFloat8(float_val);
+}
+
+template <typename WriterT>
+static inline void numeric_write_fast(WriterT& writer, Datum value)
+{
+    int64_t i64;
+    if (numeric_try_int64(value, &i64)) {
+        writer.int64(i64);
+    } else {
+        writer.double_(numeric_to_float8_fast(value));
+    }
+}
+
+static inline z::dyn::Value numeric_to_dynamic_fast(Datum value)
+{
+    int64_t i64;
+    if (numeric_try_int64(value, &i64)) {
+        return z::dyn::Value(i64);
+    }
+    return z::dyn::Value(numeric_to_float8_fast(value));
+}
+
 /*
  * Convert a PostgreSQL Datum to a zerialize dyn::Value
  */
@@ -462,13 +505,7 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
         }
 
         case NUMERICOID:
-        {
-            // Convert NUMERIC to double (float8)
-            // This works for most use cases (prices, percentages, measurements)
-            // Note: May lose precision for very large or very precise decimals
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            return z::dyn::Value(DatumGetFloat8(float_val));
-        }
+            return numeric_to_dynamic_fast(value);
         case DATEOID:
             return z::dyn::Value(static_cast<int64_t>(DatumGetDateADT(value)));
         case TIMESTAMPOID:
@@ -552,10 +589,7 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
             return z::dyn::Value(strval);
         }
         case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            return z::dyn::Value(DatumGetFloat8(float_val));
-        }
+            return numeric_to_dynamic_fast(value);
         case ConverterKind::Date:
             return z::dyn::Value(static_cast<int64_t>(DatumGetDateADT(value)));
         case ConverterKind::Timestamp:
@@ -689,67 +723,115 @@ static inline void msgpack_write_text(z::MsgPackSerializer& writer, Datum value)
     writer.string(std::string_view(ptr, static_cast<size_t>(len)));
 }
 
-static inline void msgpack_write_array_element(
+static inline void msgpack_array_elem_unsupported(
     z::MsgPackSerializer& writer,
-    ConverterKind elem_kind,
     Datum value,
     bool isnull)
 {
-    if (isnull) {
-        writer.null();
-        return;
-    }
-
-    switch (elem_kind) {
-        case ConverterKind::Int2:
-            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
-            return;
-        case ConverterKind::Int4:
-            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
-            return;
-        case ConverterKind::Int8:
-            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
-            return;
-        case ConverterKind::Float4:
-            writer.double_(static_cast<double>(DatumGetFloat4(value)));
-            return;
-        case ConverterKind::Float8:
-            writer.double_(DatumGetFloat8(value));
-            return;
-        case ConverterKind::Bool:
-            writer.boolean(DatumGetBool(value));
-            return;
-        case ConverterKind::Text:
-            msgpack_write_text(writer, value);
-            return;
-        case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
-            return;
-        }
-        case ConverterKind::Date:
-            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
-            return;
-        case ConverterKind::Timestamp:
-            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
-            return;
-        case ConverterKind::Timestamptz:
-            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
-            return;
-        case ConverterKind::Jsonb:
-            writer.binary(datum_jsonb_span(value));
-            return;
-        case ConverterKind::Bytea:
-            writer.binary(datum_bytea_span(value));
-            return;
-        default:
-            break;
-    }
-
+    (void)writer;
+    (void)value;
+    (void)isnull;
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
              errmsg("unsupported array element type for fast MessagePack path")));
+}
+
+static inline void msgpack_array_elem_int2(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
+}
+
+static inline void msgpack_array_elem_int4(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
+}
+
+static inline void msgpack_array_elem_int8(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
+}
+
+static inline void msgpack_array_elem_float4(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.double_(static_cast<double>(DatumGetFloat4(value)));
+}
+
+static inline void msgpack_array_elem_float8(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.double_(DatumGetFloat8(value));
+}
+
+static inline void msgpack_array_elem_bool(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.boolean(DatumGetBool(value));
+}
+
+static inline void msgpack_array_elem_text(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    msgpack_write_text(writer, value);
+}
+
+static inline void msgpack_array_elem_numeric(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    numeric_write_fast(writer, value);
+}
+
+static inline void msgpack_array_elem_date(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+}
+
+static inline void msgpack_array_elem_timestamp(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+}
+
+static inline void msgpack_array_elem_timestamptz(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+}
+
+static inline void msgpack_array_elem_jsonb(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.binary(datum_jsonb_span(value));
+}
+
+static inline void msgpack_array_elem_bytea(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.binary(datum_bytea_span(value));
+}
+
+static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind kind)
+{
+    switch (kind) {
+        case ConverterKind::Int2: return &msgpack_array_elem_int2;
+        case ConverterKind::Int4: return &msgpack_array_elem_int4;
+        case ConverterKind::Int8: return &msgpack_array_elem_int8;
+        case ConverterKind::Float4: return &msgpack_array_elem_float4;
+        case ConverterKind::Float8: return &msgpack_array_elem_float8;
+        case ConverterKind::Bool: return &msgpack_array_elem_bool;
+        case ConverterKind::Text: return &msgpack_array_elem_text;
+        case ConverterKind::Numeric: return &msgpack_array_elem_numeric;
+        case ConverterKind::Date: return &msgpack_array_elem_date;
+        case ConverterKind::Timestamp: return &msgpack_array_elem_timestamp;
+        case ConverterKind::Timestamptz: return &msgpack_array_elem_timestamptz;
+        case ConverterKind::Jsonb: return &msgpack_array_elem_jsonb;
+        case ConverterKind::Bytea: return &msgpack_array_elem_bytea;
+        default: return &msgpack_array_elem_unsupported;
+    }
 }
 
 static inline void msgpack_write_array(
@@ -786,9 +868,14 @@ static inline void msgpack_write_array(
                       &nulls,
                       &nitems);
 
+    MsgpackArrayElemWriterFn elem_writer = col.msgpack_array_elem_writer;
+    if (elem_writer == nullptr) {
+        elem_writer = &msgpack_array_elem_unsupported;
+    }
+
     writer.begin_array(static_cast<size_t>(nitems));
     for (int i = 0; i < nitems; i++) {
-        msgpack_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
+        elem_writer(writer, elements[i], nulls[i]);
     }
     writer.end_array();
 
@@ -864,8 +951,7 @@ static inline void msgpack_scalar_numeric(
     z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
 {
     if (isnull) { writer.null(); return; }
-    Datum float_val = DirectFunctionCall1(numeric_float8, value);
-    writer.double_(DatumGetFloat8(float_val));
+    numeric_write_fast(writer, value);
 }
 
 static inline void msgpack_scalar_date(
@@ -1105,11 +1191,8 @@ static inline void cbor_write_array_element(
             cbor_write_text(writer, value);
             return;
         case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
+            numeric_write_fast(writer, value);
             return;
-        }
         case ConverterKind::Date:
             writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
             return;
@@ -1212,11 +1295,8 @@ static inline void cbor_write_scalar(
             cbor_write_text(writer, value);
             return;
         case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
+            numeric_write_fast(writer, value);
             return;
-        }
         case ConverterKind::Date:
             writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
             return;
@@ -1418,11 +1498,8 @@ static inline void zera_write_array_element(
             zera_write_text(writer, value);
             return;
         case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
+            numeric_write_fast(writer, value);
             return;
-        }
         case ConverterKind::Date:
             writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
             return;
@@ -1525,11 +1602,8 @@ static inline void zera_write_scalar(
             zera_write_text(writer, value);
             return;
         case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
+            numeric_write_fast(writer, value);
             return;
-        }
         case ConverterKind::Date:
             writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
             return;
@@ -1731,11 +1805,8 @@ static inline void flex_write_array_element(
             flex_write_text(writer, value);
             return;
         case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
+            numeric_write_fast(writer, value);
             return;
-        }
         case ConverterKind::Date:
             writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
             return;
@@ -1838,11 +1909,8 @@ static inline void flex_write_scalar(
             flex_write_text(writer, value);
             return;
         case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
+            numeric_write_fast(writer, value);
             return;
-        }
         case ConverterKind::Date:
             writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
             return;
