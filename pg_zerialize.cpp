@@ -120,11 +120,15 @@ enum class ConverterKind {
     Fallback
 };
 
+struct CachedColumn;
+using MsgpackScalarWriterFn = void (*)(z::MsgPackSerializer&, const CachedColumn&, Datum, bool);
+
 struct CachedColumn {
     int attnum;
     std::string name;
     std::vector<uint8_t> msgpack_key_encoded;
     std::vector<uint8_t> zera_key_encoded;
+    MsgpackScalarWriterFn msgpack_scalar_writer;
     Oid typid;
     Oid typoutput;
     ConverterKind kind;
@@ -150,6 +154,7 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind);
 static bool is_msgpack_fast_column(const CachedColumn& col);
 static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key);
 static std::vector<uint8_t> encode_zera_key(std::string_view key);
+static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind);
 static inline std::span<const std::byte> datum_bytea_span(Datum value);
 static inline std::span<const std::byte> datum_jsonb_span(Datum value);
 static constexpr size_t kHybridHeapDeformThreshold = 24;
@@ -297,8 +302,10 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         col.name = std::string(NameStr(att->attname));
         col.msgpack_key_encoded = encode_msgpack_string_key(col.name);
         col.zera_key_encoded = encode_zera_key(col.name);
+        col.msgpack_scalar_writer = nullptr;
         col.typid = att->atttypid;
         col.kind = classify_type(col.typid);
+        col.msgpack_scalar_writer = select_msgpack_scalar_writer(col.kind);
         col.typoutput = InvalidOid;
         col.array_element_typid = InvalidOid;
         col.array_element_kind = ConverterKind::Fallback;
@@ -789,71 +796,140 @@ static inline void msgpack_write_array(
     pfree(nulls);
 }
 
-static inline void msgpack_write_scalar(
+static inline void msgpack_scalar_unsupported(
     z::MsgPackSerializer& writer,
     const CachedColumn& col,
     Datum value,
     bool isnull)
 {
-    if (isnull) {
-        writer.null();
-        return;
-    }
-
-    switch (col.kind) {
-        case ConverterKind::Int2:
-            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
-            return;
-        case ConverterKind::Int4:
-            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
-            return;
-        case ConverterKind::Int8:
-            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
-            return;
-        case ConverterKind::Float4:
-            writer.double_(static_cast<double>(DatumGetFloat4(value)));
-            return;
-        case ConverterKind::Float8:
-            writer.double_(DatumGetFloat8(value));
-            return;
-        case ConverterKind::Bool:
-            writer.boolean(DatumGetBool(value));
-            return;
-        case ConverterKind::Text:
-            msgpack_write_text(writer, value);
-            return;
-        case ConverterKind::Numeric:
-        {
-            Datum float_val = DirectFunctionCall1(numeric_float8, value);
-            writer.double_(DatumGetFloat8(float_val));
-            return;
-        }
-        case ConverterKind::Date:
-            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
-            return;
-        case ConverterKind::Timestamp:
-            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
-            return;
-        case ConverterKind::Timestamptz:
-            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
-            return;
-        case ConverterKind::Jsonb:
-            writer.binary(datum_jsonb_span(value));
-            return;
-        case ConverterKind::Bytea:
-            writer.binary(datum_bytea_span(value));
-            return;
-        case ConverterKind::Array:
-            msgpack_write_array(writer, col, value);
-            return;
-        default:
-            break;
-    }
-
+    (void)writer;
+    (void)value;
+    (void)isnull;
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
              errmsg("unsupported type for fast MessagePack path"),
              errdetail("column type OID %u", col.typid)));
+}
+
+static inline void msgpack_scalar_int2(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
+}
+
+static inline void msgpack_scalar_int4(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
+}
+
+static inline void msgpack_scalar_int8(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
+}
+
+static inline void msgpack_scalar_float4(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.double_(static_cast<double>(DatumGetFloat4(value)));
+}
+
+static inline void msgpack_scalar_float8(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.double_(DatumGetFloat8(value));
+}
+
+static inline void msgpack_scalar_bool(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.boolean(DatumGetBool(value));
+}
+
+static inline void msgpack_scalar_text(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    msgpack_write_text(writer, value);
+}
+
+static inline void msgpack_scalar_numeric(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    Datum float_val = DirectFunctionCall1(numeric_float8, value);
+    writer.double_(DatumGetFloat8(float_val));
+}
+
+static inline void msgpack_scalar_date(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+}
+
+static inline void msgpack_scalar_timestamp(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+}
+
+static inline void msgpack_scalar_timestamptz(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+}
+
+static inline void msgpack_scalar_jsonb(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.binary(datum_jsonb_span(value));
+}
+
+static inline void msgpack_scalar_bytea(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.binary(datum_bytea_span(value));
+}
+
+static inline void msgpack_scalar_array(
+    z::MsgPackSerializer& writer, const CachedColumn& col, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    msgpack_write_array(writer, col, value);
+}
+
+static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
+{
+    switch (kind) {
+        case ConverterKind::Int2: return &msgpack_scalar_int2;
+        case ConverterKind::Int4: return &msgpack_scalar_int4;
+        case ConverterKind::Int8: return &msgpack_scalar_int8;
+        case ConverterKind::Float4: return &msgpack_scalar_float4;
+        case ConverterKind::Float8: return &msgpack_scalar_float8;
+        case ConverterKind::Bool: return &msgpack_scalar_bool;
+        case ConverterKind::Text: return &msgpack_scalar_text;
+        case ConverterKind::Numeric: return &msgpack_scalar_numeric;
+        case ConverterKind::Date: return &msgpack_scalar_date;
+        case ConverterKind::Timestamp: return &msgpack_scalar_timestamp;
+        case ConverterKind::Timestamptz: return &msgpack_scalar_timestamptz;
+        case ConverterKind::Jsonb: return &msgpack_scalar_jsonb;
+        case ConverterKind::Bytea: return &msgpack_scalar_bytea;
+        case ConverterKind::Array: return &msgpack_scalar_array;
+        case ConverterKind::Fallback: return &msgpack_scalar_unsupported;
+    }
+    return &msgpack_scalar_unsupported;
 }
 
 static inline void msgpack_write_record_map(
@@ -872,7 +948,7 @@ static inline void msgpack_write_record_map(
             bool isnull;
             Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
             writer.key_preencoded(col.msgpack_key_encoded);
-            msgpack_write_scalar(writer, col, value, isnull);
+            col.msgpack_scalar_writer(writer, col, value, isnull);
         }
     } else {
         const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
@@ -881,7 +957,7 @@ static inline void msgpack_write_record_map(
         for (const CachedColumn& col : schema.columns) {
             const int idx = col.attnum - 1;
             writer.key_preencoded(col.msgpack_key_encoded);
-            msgpack_write_scalar(writer, col, scratch->values[idx], scratch->nulls[idx]);
+            col.msgpack_scalar_writer(writer, col, scratch->values[idx], scratch->nulls[idx]);
         }
     }
     writer.end_map();
