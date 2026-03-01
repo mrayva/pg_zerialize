@@ -26,6 +26,7 @@ PG_MODULE_MAGIC;
 #include <vector>
 #include <string>
 #include <cstring>
+#include <exception>
 #include <unordered_map>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
@@ -391,25 +392,39 @@ static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec)
 template<typename Protocol>
 static bytea* tuple_to_binary(HeapTupleHeader rec)
 {
-    // Estimate output size for better memory allocation
-    // (Note: This is a hint; actual size may vary)
-    size_t estimated_size = estimate_record_size(rec);
+    try {
+        // Estimate output size for better memory allocation
+        // (Note: This is a hint; actual size may vary)
+        size_t estimated_size = estimate_record_size(rec);
+        (void)estimated_size;
 
-    // Convert record to dynamic map
-    z::dyn::Value map = record_to_dynamic_map(rec);
+        // Convert record to dynamic map
+        z::dyn::Value map = record_to_dynamic_map(rec);
 
-    // Serialize
-    z::ZBuffer buffer = z::serialize<Protocol>(map);
-    std::span<const uint8_t> data = buffer.buf();
+        // Serialize
+        z::ZBuffer buffer = z::serialize<Protocol>(map);
+        std::span<const uint8_t> data = buffer.buf();
 
-    // Allocate PostgreSQL bytea with actual size
-    // (Estimation helps zerialize internally, allocation uses actual size)
-    size_t len = data.size();
-    bytea* result = (bytea*) palloc(len + VARHDRSZ);
-    SET_VARSIZE(result, len + VARHDRSZ);
-    memcpy(VARDATA(result), data.data(), len);
+        // Allocate PostgreSQL bytea with actual size
+        // (Estimation helps zerialize internally, allocation uses actual size)
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
 
-    return result;
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("serialization failed with unknown exception")));
+    }
+
+    return nullptr;
 }
 
 /*
@@ -441,6 +456,14 @@ static bytea* array_to_binary(ArrayType* arr)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("multidimensional arrays not supported for batch serialization")));
+    }
+
+    // Batch functions only support arrays of records/composite values.
+    if (element_type != RECORDOID && get_typtype(element_type) != TYPTYPE_COMPOSITE) {
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("batch serialization requires an array of composite records"),
+                 errdetail("Got array element type OID %u.", element_type)));
     }
 
     // Get array element info
@@ -484,17 +507,30 @@ static bytea* array_to_binary(ArrayType* arr)
     pfree(elements);
     pfree(nulls);
 
-    // Serialize the array
-    z::ZBuffer buffer = z::serialize<Protocol>(z::dyn::Value::array(std::move(result_array)));
-    std::span<const uint8_t> data = buffer.buf();
+    try {
+        // Serialize the array
+        z::ZBuffer buffer = z::serialize<Protocol>(z::dyn::Value::array(std::move(result_array)));
+        std::span<const uint8_t> data = buffer.buf();
 
-    // Copy to PostgreSQL bytea
-    size_t len = data.size();
-    bytea* result = (bytea*) palloc(len + VARHDRSZ);
-    SET_VARSIZE(result, len + VARHDRSZ);
-    memcpy(VARDATA(result), data.data(), len);
+        // Copy to PostgreSQL bytea
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
 
-    return result;
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("batch serialization failed with unknown exception")));
+    }
+
+    return nullptr;
 }
 
 /*

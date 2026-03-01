@@ -2,7 +2,8 @@
 
 ## Overview
 
-`pg_zerialize` is a PostgreSQL extension that converts database rows to efficient binary formats using the zerialize library. Currently implements FlexBuffers with plans for MessagePack, CBOR, and ZERA.
+`pg_zerialize` is a PostgreSQL extension that converts database rows to efficient binary formats using the zerialize library.
+Current supported formats are FlexBuffers, MessagePack, CBOR, and ZERA for both single-row and batch APIs.
 
 ## Design
 
@@ -45,7 +46,7 @@ Convert to zerialize::Dynamic
     ↓
 Build Dynamic::Map
     ↓
-serialize<Flex>()
+serialize<Protocol>()
     ↓
 Copy to bytea
     ↓
@@ -60,16 +61,15 @@ Return to PostgreSQL
 - **Floats**: FLOAT4, FLOAT8 → `double`
 - **Boolean**: BOOL → `bool`
 - **Text**: TEXT, VARCHAR, BPCHAR → `string`
+- **Numeric**: NUMERIC/DECIMAL → `float8` (`double`, may lose precision)
+- **Arrays**: 1D arrays of supported element types
 - **Fallback**: All other types converted to text representation
 
 ### Not Yet Supported
 
-- NUMERIC (arbitrary precision decimals)
-- DATE, TIMESTAMP (temporal types)
-- JSON/JSONB (nested structures)
-- Arrays
-- Nested composite types
-- Binary data (BYTEA)
+- Nested composite values inside records
+- Native semantic handling for DATE/TIMESTAMP/JSON/JSONB/BYTEA
+- Multidimensional arrays in batch serialization
 
 ## Building
 
@@ -122,18 +122,16 @@ SELECT octet_length(row_to_flexbuffers(users.*)) FROM users;
 
 ### Near-term (FlexBuffers polish)
 
-1. **Array support**: PostgreSQL arrays → FlexBuffers vectors
-2. **Nested records**: Composite types → nested maps
-3. **NUMERIC handling**: Proper decimal serialization
-4. **NULL handling**: Verify null behavior across types
-5. **Error handling**: Better error messages for unsupported types
+1. **Nested records**: Composite types → nested maps
+2. **NUMERIC handling**: Exact decimal representation option
+3. **Temporal types**: Native DATE/TIMESTAMP encoding options
+4. **JSON/JSONB**: Preserve nested structure instead of text fallback
+5. **BYTEA**: Native binary passthrough mode
 
 ### Medium-term (Additional formats)
 
-1. **MessagePack**: Add `row_to_msgpack()` function
-2. **CBOR**: Add `row_to_cbor()` function
-3. **ZERA**: Add `row_to_zera()` function
-4. **Format parameter**: Single function with format arg
+1. **Format parameter**: Single function with format arg
+2. **Deserialization**: Add binary → record helpers
 
 ### Long-term (Advanced features)
 
@@ -170,7 +168,8 @@ SELECT octet_length(row_to_flexbuffers(users.*)) FROM users;
 Run the test suite:
 
 ```bash
-psql -d postgres -f test.sql
+make installcheck
+psql -d postgres -f test_pg_zerialize.sql
 ```
 
 Tests cover:

@@ -4,7 +4,7 @@
 CREATE OR REPLACE FUNCTION row_to_flexbuffers(record)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'row_to_flexbuffers'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION row_to_flexbuffers(record) IS
 'Convert a PostgreSQL row/record to FlexBuffers binary format';
@@ -13,7 +13,7 @@ COMMENT ON FUNCTION row_to_flexbuffers(record) IS
 CREATE OR REPLACE FUNCTION row_to_msgpack(record)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'row_to_msgpack'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION row_to_msgpack(record) IS
 'Convert a PostgreSQL row/record to MessagePack binary format';
@@ -22,7 +22,7 @@ COMMENT ON FUNCTION row_to_msgpack(record) IS
 CREATE OR REPLACE FUNCTION row_to_cbor(record)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'row_to_cbor'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION row_to_cbor(record) IS
 'Convert a PostgreSQL row/record to CBOR binary format';
@@ -31,7 +31,7 @@ COMMENT ON FUNCTION row_to_cbor(record) IS
 CREATE OR REPLACE FUNCTION row_to_zera(record)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'row_to_zera'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION row_to_zera(record) IS
 'Convert a PostgreSQL row/record to ZERA binary format (zerialize native protocol)';
@@ -42,7 +42,7 @@ COMMENT ON FUNCTION row_to_zera(record) IS
 CREATE OR REPLACE FUNCTION rows_to_flexbuffers(anyarray)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'rows_to_flexbuffers'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION rows_to_flexbuffers(anyarray) IS
 'Convert an array of PostgreSQL rows/records to FlexBuffers binary format (batch processing)';
@@ -51,7 +51,7 @@ COMMENT ON FUNCTION rows_to_flexbuffers(anyarray) IS
 CREATE OR REPLACE FUNCTION rows_to_msgpack(anyarray)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'rows_to_msgpack'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION rows_to_msgpack(anyarray) IS
 'Convert an array of PostgreSQL rows/records to MessagePack binary format (batch processing)';
@@ -60,7 +60,7 @@ COMMENT ON FUNCTION rows_to_msgpack(anyarray) IS
 CREATE OR REPLACE FUNCTION rows_to_cbor(anyarray)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'rows_to_cbor'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION rows_to_cbor(anyarray) IS
 'Convert an array of PostgreSQL rows/records to CBOR binary format (batch processing)';
@@ -69,7 +69,7 @@ COMMENT ON FUNCTION rows_to_cbor(anyarray) IS
 CREATE OR REPLACE FUNCTION rows_to_zera(anyarray)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'rows_to_zera'
-LANGUAGE C IMMUTABLE STRICT;
+LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION rows_to_zera(anyarray) IS
 'Convert an array of PostgreSQL rows/records to ZERA binary format (batch processing)';

@@ -32,11 +32,14 @@ CREATE EXTENSION pg_zerialize;
 
 ## Basic Usage
 
-### Convert a row to FlexBuffers
+### Convert a row to binary formats
 
 ```sql
 -- Anonymous record
 SELECT row_to_flexbuffers(ROW('Alice', 30, true));
+SELECT row_to_msgpack(ROW('Alice', 30, true));
+SELECT row_to_cbor(ROW('Alice', 30, true));
+SELECT row_to_zera(ROW('Alice', 30, true));
 
 -- Named type
 CREATE TYPE person AS (name text, age int, active bool);
@@ -114,10 +117,10 @@ for row in cur:
 
 ## Current Limitations
 
-- Arrays not yet supported
 - Nested composite types not yet supported
-- NUMERIC converted to string
-- Dates/timestamps converted to string
+- Date/timestamp values currently use text fallback serialization
+- JSON/JSONB values currently use text fallback serialization
+- NUMERIC is converted to `float8` (possible precision loss for high-precision decimals)
 
 See ARCHITECTURE.md for roadmap.
 
@@ -156,9 +159,10 @@ g++ --version  # Need GCC 10+ or Clang 10+
 ## Next Steps
 
 1. Read ARCHITECTURE.md for detailed design info
-2. Run test.sql to verify installation
-3. Experiment with your own data types
-4. Report issues or contribute improvements
+2. Run `make installcheck` for PGXS regression tests
+3. Run `psql -d postgres -f test_pg_zerialize.sql` for the full test suite
+4. Experiment with your own data types
+5. Report issues or contribute improvements
 
 ## Performance Tips
 

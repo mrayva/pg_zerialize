@@ -20,8 +20,6 @@ PostgreSQL extension for converting rows to efficient binary formats using the [
 - PostgreSQL 12+ (with development headers)
 - C++20 compatible compiler (GCC 10+, Clang 10+)
 - FlatBuffers library (`libflatbuffers-dev`)
-- MessagePack C library (`libmsgpack-c-dev`)
-- jsoncons library (`libjsoncons-dev`)
 - zerialize library (header-only, included in `vendor/`)
 
 ## Building
@@ -29,6 +27,16 @@ PostgreSQL extension for converting rows to efficient binary formats using the [
 ```bash
 make
 sudo make install
+```
+
+## Testing
+
+```bash
+# Lightweight PGXS regression tests
+make installcheck
+
+# Comprehensive manual suite
+psql -d postgres -f test_pg_zerialize.sql
 ```
 
 ## Usage

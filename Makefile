@@ -5,6 +5,7 @@ OBJS = pg_zerialize.o
 
 EXTENSION = pg_zerialize
 DATA = pg_zerialize--1.0.sql
+REGRESS = pg_zerialize
 
 # C++ compilation flags
 PG_CPPFLAGS = -std=c++20 -fPIC -Ivendor/zerialize/include
