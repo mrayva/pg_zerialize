@@ -17,6 +17,7 @@ extern "C" {
 #include "executor/spi.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+#include "utils/inval.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -41,6 +42,8 @@ namespace z = zerialize;
  * Forward declarations
  */
 extern "C" {
+    void _PG_init(void);
+
     // Single record functions
     Datum row_to_flexbuffers(PG_FUNCTION_ARGS);
     Datum row_to_msgpack(PG_FUNCTION_ARGS);
@@ -94,6 +97,39 @@ namespace std {
 
 // Global cache for TupleDesc lookups
 static std::unordered_map<TypeCacheKey, TupleDesc> tupdesc_cache;
+
+static inline void clear_tupdesc_cache()
+{
+    tupdesc_cache.clear();
+}
+
+/*
+ * Invalidate cached tuple descriptors when catalog/relcache changes occur.
+ * This avoids stale descriptors after ALTER TABLE/TYPE.
+ */
+static void tupdesc_syscache_callback(Datum arg, int cacheid, uint32 hashvalue)
+{
+    (void)arg;
+    (void)cacheid;
+    (void)hashvalue;
+    clear_tupdesc_cache();
+}
+
+static void tupdesc_relcache_callback(Datum arg, Oid relid)
+{
+    (void)arg;
+    (void)relid;
+    clear_tupdesc_cache();
+}
+
+extern "C" void
+_PG_init(void)
+{
+    CacheRegisterSyscacheCallback(TYPEOID, tupdesc_syscache_callback, (Datum) 0);
+    CacheRegisterSyscacheCallback(RELOID, tupdesc_syscache_callback, (Datum) 0);
+    CacheRegisterSyscacheCallback(ATTNUM, tupdesc_syscache_callback, (Datum) 0);
+    CacheRegisterRelcacheCallback(tupdesc_relcache_callback, (Datum) 0);
+}
 
 /*
  * Get TupleDesc with caching to avoid repeated system catalog queries

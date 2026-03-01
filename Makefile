@@ -4,7 +4,7 @@ MODULE_big = pg_zerialize
 OBJS = pg_zerialize.o
 
 EXTENSION = pg_zerialize
-DATA = pg_zerialize--1.0.sql
+DATA = pg_zerialize--1.0.sql pg_zerialize--1.1.sql pg_zerialize--1.0--1.1.sql
 REGRESS = pg_zerialize
 
 # C++ compilation flags
