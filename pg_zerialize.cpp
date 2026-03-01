@@ -95,12 +95,38 @@ namespace std {
     };
 }
 
-// Global cache for TupleDesc lookups
-static std::unordered_map<TypeCacheKey, TupleDesc> tupdesc_cache;
+enum class ConverterKind {
+    Int2,
+    Int4,
+    Int8,
+    Float4,
+    Float8,
+    Bool,
+    Text,
+    Numeric,
+    Array,
+    Fallback
+};
+
+struct CachedColumn {
+    int attnum;
+    std::string name;
+    Oid typid;
+    Oid typoutput;
+    ConverterKind kind;
+};
+
+struct CachedSchema {
+    TupleDesc tupdesc;
+    std::vector<CachedColumn> columns;
+};
+
+// Global cache for per-schema metadata and TupleDesc lookups.
+static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
 
 static inline void clear_tupdesc_cache()
 {
-    tupdesc_cache.clear();
+    schema_cache.clear();
 }
 
 /*
@@ -132,30 +158,83 @@ _PG_init(void)
 }
 
 /*
- * Get TupleDesc with caching to avoid repeated system catalog queries
+ * Classify PostgreSQL type into converter kind for fast per-column dispatch.
  */
-static TupleDesc get_cached_tupdesc(Oid tupType, int32 tupTypmod)
+static ConverterKind classify_type(Oid typid)
+{
+    switch (typid) {
+        case INT2OID:
+            return ConverterKind::Int2;
+        case INT4OID:
+            return ConverterKind::Int4;
+        case INT8OID:
+            return ConverterKind::Int8;
+        case FLOAT4OID:
+            return ConverterKind::Float4;
+        case FLOAT8OID:
+            return ConverterKind::Float8;
+        case BOOLOID:
+            return ConverterKind::Bool;
+        case TEXTOID:
+        case VARCHAROID:
+        case BPCHAROID:
+            return ConverterKind::Text;
+        case NUMERICOID:
+            return ConverterKind::Numeric;
+        default:
+            if (OidIsValid(get_element_type(typid))) {
+                return ConverterKind::Array;
+            }
+            return ConverterKind::Fallback;
+    }
+}
+
+/*
+ * Get per-schema metadata with caching to avoid repeated catalog lookups and
+ * repeated per-column type classification.
+ */
+static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 {
     TypeCacheKey key{tupType, tupTypmod};
 
-    auto it = tupdesc_cache.find(key);
-    if (it != tupdesc_cache.end()) {
+    auto it = schema_cache.find(key);
+    if (it != schema_cache.end()) {
         return it->second;
     }
 
     // Not in cache, look it up
     TupleDesc tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
-
-    // Make it permanent so we can cache it (no need to release later)
     TupleDesc blessed = BlessTupleDesc(tupdesc);
-
-    // Cache the blessed descriptor
-    tupdesc_cache[key] = blessed;
-
-    // Release the original (we're keeping the blessed one)
     ReleaseTupleDesc(tupdesc);
 
-    return blessed;
+    CachedSchema schema;
+    schema.tupdesc = blessed;
+    schema.columns.reserve(blessed->natts);
+
+    for (int i = 0; i < blessed->natts; i++) {
+        Form_pg_attribute att = TupleDescAttr(blessed, i);
+        if (att->attisdropped) {
+            continue;
+        }
+
+        CachedColumn col;
+        col.attnum = i + 1;
+        col.name = std::string(NameStr(att->attname));
+        col.typid = att->atttypid;
+        col.kind = classify_type(col.typid);
+        col.typoutput = InvalidOid;
+
+        if (col.kind == ConverterKind::Fallback) {
+            bool typIsVarlena;
+            getTypeOutputInfo(col.typid, &col.typoutput, &typIsVarlena);
+        }
+
+        schema.columns.push_back(std::move(col));
+    }
+
+    auto [inserted_it, inserted] = schema_cache.emplace(key, std::move(schema));
+    (void)inserted;
+    return inserted_it->second;
 }
 
 /*
@@ -163,73 +242,6 @@ static TupleDesc get_cached_tupdesc(Oid tupType, int32 tupTypmod)
  */
 static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull);
 static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec);
-
-/*
- * Estimate serialized size for a given type
- * Used for buffer pre-allocation and monitoring
- * Returns conservative estimate (may overestimate for safety)
- */
-static size_t estimate_type_size(Oid typid)
-{
-    switch (typid) {
-        case BOOLOID:
-            return 2;  // 1 byte type + 1 byte value
-
-        case INT2OID:
-            return 3;  // 1 byte type + ~2 bytes value
-
-        case INT4OID:
-        case FLOAT4OID:
-            return 5;  // 1 byte type + ~4 bytes value
-
-        case INT8OID:
-        case FLOAT8OID:
-        case NUMERICOID:
-            return 9;  // 1 byte type + ~8 bytes value
-
-        case TEXTOID:
-        case VARCHAROID:
-        case BPCHAROID:
-            return 32;  // Conservative estimate for text (1 type + length + avg ~30 chars)
-
-        default:
-            // For arrays and other types, estimate conservatively
-            return 50;
-    }
-}
-
-/*
- * Estimate total serialized size for a record
- * Used for pre-allocation and capacity planning
- */
-static size_t estimate_record_size(HeapTupleHeader rec)
-{
-    Oid tupType;
-    int32 tupTypmod;
-    TupleDesc tupdesc;
-    size_t estimated_size = 10;  // Base overhead (map marker, length, etc.)
-
-    // Extract type info from the record
-    tupType = HeapTupleHeaderGetTypeId(rec);
-    tupTypmod = HeapTupleHeaderGetTypMod(rec);
-    tupdesc = get_cached_tupdesc(tupType, tupTypmod);
-
-    // Estimate size for each column
-    for (int i = 0; i < tupdesc->natts; i++) {
-        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-
-        if (att->attisdropped)
-            continue;
-
-        // Add size for key (field name)
-        estimated_size += 1 + strlen(NameStr(att->attname));  // 1 byte type + name length
-
-        // Add size for value
-        estimated_size += estimate_type_size(att->atttypid);
-    }
-
-    return estimated_size;
-}
 
 /*
  * Convert a PostgreSQL array to a zerialize dyn::Value array
@@ -298,15 +310,8 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
     }
 
     // Check if this is an array type
-    char typtype = get_typtype(typid);
-    if (typtype == TYPTYPE_BASE || typtype == TYPTYPE_RANGE ||
-        typtype == TYPTYPE_ENUM || typtype == TYPTYPE_COMPOSITE) {
-        // Check if the type name ends with [] or is marked as an array
-        Oid array_element_type = get_element_type(typid);
-        if (OidIsValid(array_element_type)) {
-            // This is an array type
-            return array_to_dynamic(value, typid);
-        }
+    if (OidIsValid(get_element_type(typid))) {
+        return array_to_dynamic(value, typid);
     }
 
     switch (typid) {
@@ -369,6 +374,55 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
     }
 }
 
+static z::dyn::Value fallback_to_text_output(Datum value, Oid typoutput)
+{
+    char* str = OidOutputFunctionCall(typoutput, value);
+    std::string strval(str);
+    pfree(str);
+    return z::dyn::Value(strval);
+}
+
+static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const CachedColumn& col)
+{
+    if (isnull) {
+        return z::dyn::Value();
+    }
+
+    switch (col.kind) {
+        case ConverterKind::Int2:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetInt16(value)));
+        case ConverterKind::Int4:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetInt32(value)));
+        case ConverterKind::Int8:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetInt64(value)));
+        case ConverterKind::Float4:
+            return z::dyn::Value(static_cast<double>(DatumGetFloat4(value)));
+        case ConverterKind::Float8:
+            return z::dyn::Value(DatumGetFloat8(value));
+        case ConverterKind::Bool:
+            return z::dyn::Value(DatumGetBool(value));
+        case ConverterKind::Text:
+        {
+            text* txt = DatumGetTextP(value);
+            char* str = text_to_cstring(txt);
+            std::string strval(str);
+            pfree(str);
+            return z::dyn::Value(strval);
+        }
+        case ConverterKind::Numeric:
+        {
+            Datum float_val = DirectFunctionCall1(numeric_float8, value);
+            return z::dyn::Value(DatumGetFloat8(float_val));
+        }
+        case ConverterKind::Array:
+            return array_to_dynamic(value, col.typid);
+        case ConverterKind::Fallback:
+            return fallback_to_text_output(value, col.typoutput);
+    }
+
+    return z::dyn::Value();
+}
+
 /*
  * Convert a PostgreSQL record (HeapTupleHeader) to a zerialize dynamic map
  * This is used by both single-record and batch processing functions
@@ -377,46 +431,33 @@ static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec)
 {
     Oid tupType;
     int32 tupTypmod;
-    TupleDesc tupdesc;
+    const CachedSchema* schema;
     HeapTupleData tuple;
-    int ncolumns;
 
     // Extract type info from the record
     tupType = HeapTupleHeaderGetTypeId(rec);
     tupTypmod = HeapTupleHeaderGetTypMod(rec);
-    tupdesc = get_cached_tupdesc(tupType, tupTypmod);
+    schema = &get_cached_schema(tupType, tupTypmod);
 
     // Build a temporary HeapTuple for attribute access
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
     tuple.t_data = rec;
 
-    ncolumns = tupdesc->natts;
-
     // Build map of column name -> value
     // Pre-allocate space to avoid reallocation overhead
     z::dyn::Value::Map entries;
-    entries.reserve(ncolumns);  // Reserve space for all columns
+    entries.reserve(schema->columns.size());
 
-    for (int i = 0; i < ncolumns; i++) {
-        Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+    for (const CachedColumn& col : schema->columns) {
         Datum value;
         bool isnull;
 
-        // Skip dropped columns
-        if (att->attisdropped)
-            continue;
-
         // Get the attribute value
-        value = heap_getattr(&tuple, i + 1, tupdesc, &isnull);
-
-        // Get column name
-        const char* attname = NameStr(att->attname);
+        value = heap_getattr(&tuple, col.attnum, schema->tupdesc, &isnull);
 
         // Add to map
-        entries.emplace_back(std::string(attname), datum_to_dynamic(value, att->atttypid, isnull));
+        entries.emplace_back(col.name, datum_to_dynamic_cached(value, isnull, col));
     }
-
-    // No need to release tupdesc - it's cached and blessed (permanent)
 
     return z::dyn::Value::map(std::move(entries));
 }
@@ -429,11 +470,6 @@ template<typename Protocol>
 static bytea* tuple_to_binary(HeapTupleHeader rec)
 {
     try {
-        // Estimate output size for better memory allocation
-        // (Note: This is a hint; actual size may vary)
-        size_t estimated_size = estimate_record_size(rec);
-        (void)estimated_size;
-
         // Convert record to dynamic map
         z::dyn::Value map = record_to_dynamic_map(rec);
 
@@ -515,15 +551,6 @@ static bytea* array_to_binary(ArrayType* arr)
 
     deconstruct_array(arr, element_type, typlen, typbyval, typalign,
                      &elements, &nulls, &nitems);
-
-    // Estimate total output size for batch
-    // (Helps with memory planning, though actual size may vary)
-    size_t estimated_total = 10;  // Base array overhead
-    if (nitems > 0 && !nulls[0]) {
-        HeapTupleHeader first_rec = DatumGetHeapTupleHeader(elements[0]);
-        size_t per_record_estimate = estimate_record_size(first_rec);
-        estimated_total += per_record_estimate * nitems;
-    }
 
     // Build array of record maps with pre-allocated capacity
     z::dyn::Value::Array result_array;
