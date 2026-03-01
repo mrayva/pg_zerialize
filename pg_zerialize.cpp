@@ -31,7 +31,9 @@ PG_MODULE_MAGIC;
 #include <string>
 #include <string_view>
 #include <cstring>
+#include <array>
 #include <exception>
+#include <memory>
 #include <unordered_map>
 #include <type_traits>
 #include <zerialize/zerialize.hpp>
@@ -136,6 +138,7 @@ struct CachedColumn {
 struct CachedSchema {
     TupleDesc tupdesc;
     std::vector<CachedColumn> columns;
+    bool use_deform_access;
     bool msgpack_fast_supported;
     bool cbor_fast_supported;
     bool zera_fast_supported;
@@ -149,6 +152,34 @@ static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key);
 static std::vector<uint8_t> encode_zera_key(std::string_view key);
 static inline std::span<const std::byte> datum_bytea_span(Datum value);
 static inline std::span<const std::byte> datum_jsonb_span(Datum value);
+static constexpr size_t kHybridHeapDeformThreshold = 24;
+
+struct TupleDeformScratch {
+    static constexpr size_t kInlineCapacity = 64;
+
+private:
+    std::array<Datum, kInlineCapacity> inline_values;
+    std::array<bool, kInlineCapacity> inline_nulls;
+    std::unique_ptr<Datum[]> heap_values;
+    std::unique_ptr<bool[]> heap_nulls;
+
+public:
+    size_t capacity = kInlineCapacity;
+    Datum* values = inline_values.data();
+    bool* nulls = inline_nulls.data();
+
+    void ensure(size_t nattrs)
+    {
+        if (capacity >= nattrs) {
+            return;
+        }
+        heap_values = std::make_unique<Datum[]>(nattrs);
+        heap_nulls = std::make_unique<bool[]>(nattrs);
+        values = heap_values.get();
+        nulls = heap_nulls.get();
+        capacity = nattrs;
+    }
+};
 
 // Global cache for per-schema metadata and TupleDesc lookups.
 static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
@@ -248,6 +279,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 
     CachedSchema schema;
     schema.tupdesc = blessed;
+    schema.use_deform_access = false;
     schema.msgpack_fast_supported = true;
     schema.cbor_fast_supported = true;
     schema.zera_fast_supported = true;
@@ -299,6 +331,8 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 
         schema.columns.push_back(std::move(col));
     }
+
+    schema.use_deform_access = schema.columns.size() >= kHybridHeapDeformThreshold;
 
     auto [inserted_it, inserted] = schema_cache.emplace(key, std::move(schema));
     (void)inserted;
@@ -825,20 +859,30 @@ static inline void msgpack_write_scalar(
 static inline void msgpack_write_record_map(
     z::MsgPackSerializer& writer,
     HeapTupleHeader rec,
-    const CachedSchema& schema)
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch)
 {
     HeapTupleData tuple;
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
     tuple.t_data = rec;
 
     writer.begin_map(schema.columns.size());
-    for (const CachedColumn& col : schema.columns) {
-        Datum value;
-        bool isnull;
-
-        value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-        writer.key_preencoded(col.msgpack_key_encoded);
-        msgpack_write_scalar(writer, col, value, isnull);
+    if (!schema.use_deform_access) {
+        for (const CachedColumn& col : schema.columns) {
+            bool isnull;
+            Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
+            writer.key_preencoded(col.msgpack_key_encoded);
+            msgpack_write_scalar(writer, col, value, isnull);
+        }
+    } else {
+        const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
+        scratch->ensure(nattrs);
+        heap_deform_tuple(&tuple, schema.tupdesc, scratch->values, scratch->nulls);
+        for (const CachedColumn& col : schema.columns) {
+            const int idx = col.attnum - 1;
+            writer.key_preencoded(col.msgpack_key_encoded);
+            msgpack_write_scalar(writer, col, scratch->values[idx], scratch->nulls[idx]);
+        }
     }
     writer.end_map();
 }
@@ -856,7 +900,12 @@ static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
     try {
         z::MsgPackRootSerializer rs;
         z::MsgPackSerializer writer(rs);
-        msgpack_write_record_map(writer, rec, schema);
+        if (!schema.use_deform_access) {
+            msgpack_write_record_map(writer, rec, schema, nullptr);
+        } else {
+            TupleDeformScratch scratch;
+            msgpack_write_record_map(writer, rec, schema, &scratch);
+        }
 
         z::ZBuffer buffer = rs.finish();
         std::span<const uint8_t> data = buffer.buf();
@@ -904,6 +953,7 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
     try {
         z::MsgPackRootSerializer rs;
         z::MsgPackSerializer writer(rs);
+        TupleDeformScratch scratch;
 
         writer.begin_array(static_cast<size_t>(nitems));
         for (int i = 0; i < nitems; i++) {
@@ -911,7 +961,7 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
                 writer.null();
             } else {
                 HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
-                msgpack_write_record_map(writer, rec, *schemas[i]);
+                msgpack_write_record_map(writer, rec, *schemas[i], &scratch);
             }
         }
         writer.end_array();
@@ -1122,20 +1172,30 @@ static inline void cbor_write_scalar(
 static inline void cbor_write_record_map(
     z::cborjc::Serializer& writer,
     HeapTupleHeader rec,
-    const CachedSchema& schema)
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch)
 {
     HeapTupleData tuple;
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
     tuple.t_data = rec;
 
     writer.begin_map(schema.columns.size());
-    for (const CachedColumn& col : schema.columns) {
-        Datum value;
-        bool isnull;
-
-        value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-        writer.key(col.name);
-        cbor_write_scalar(writer, col, value, isnull);
+    if (!schema.use_deform_access) {
+        for (const CachedColumn& col : schema.columns) {
+            bool isnull;
+            Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
+            writer.key(col.name);
+            cbor_write_scalar(writer, col, value, isnull);
+        }
+    } else {
+        const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
+        scratch->ensure(nattrs);
+        heap_deform_tuple(&tuple, schema.tupdesc, scratch->values, scratch->nulls);
+        for (const CachedColumn& col : schema.columns) {
+            const int idx = col.attnum - 1;
+            writer.key(col.name);
+            cbor_write_scalar(writer, col, scratch->values[idx], scratch->nulls[idx]);
+        }
     }
     writer.end_map();
 }
@@ -1153,7 +1213,12 @@ static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec)
     try {
         z::cborjc::RootSerializer rs;
         z::cborjc::Serializer writer(rs);
-        cbor_write_record_map(writer, rec, schema);
+        if (!schema.use_deform_access) {
+            cbor_write_record_map(writer, rec, schema, nullptr);
+        } else {
+            TupleDeformScratch scratch;
+            cbor_write_record_map(writer, rec, schema, &scratch);
+        }
 
         z::ZBuffer buffer = rs.finish();
         std::span<const uint8_t> data = buffer.buf();
@@ -1201,6 +1266,7 @@ static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int ni
     try {
         z::cborjc::RootSerializer rs;
         z::cborjc::Serializer writer(rs);
+        TupleDeformScratch scratch;
 
         writer.begin_array(static_cast<size_t>(nitems));
         for (int i = 0; i < nitems; i++) {
@@ -1208,7 +1274,7 @@ static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int ni
                 writer.null();
             } else {
                 HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
-                cbor_write_record_map(writer, rec, *schemas[i]);
+                cbor_write_record_map(writer, rec, *schemas[i], &scratch);
             }
         }
         writer.end_array();
@@ -1419,20 +1485,30 @@ static inline void zera_write_scalar(
 static inline void zera_write_record_map(
     z::zera::Serializer& writer,
     HeapTupleHeader rec,
-    const CachedSchema& schema)
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch)
 {
     HeapTupleData tuple;
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
     tuple.t_data = rec;
 
     writer.begin_map(schema.columns.size());
-    for (const CachedColumn& col : schema.columns) {
-        Datum value;
-        bool isnull;
-
-        value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-        writer.key_preencoded(col.zera_key_encoded);
-        zera_write_scalar(writer, col, value, isnull);
+    if (!schema.use_deform_access) {
+        for (const CachedColumn& col : schema.columns) {
+            bool isnull;
+            Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
+            writer.key_preencoded(col.zera_key_encoded);
+            zera_write_scalar(writer, col, value, isnull);
+        }
+    } else {
+        const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
+        scratch->ensure(nattrs);
+        heap_deform_tuple(&tuple, schema.tupdesc, scratch->values, scratch->nulls);
+        for (const CachedColumn& col : schema.columns) {
+            const int idx = col.attnum - 1;
+            writer.key_preencoded(col.zera_key_encoded);
+            zera_write_scalar(writer, col, scratch->values[idx], scratch->nulls[idx]);
+        }
     }
     writer.end_map();
 }
@@ -1450,7 +1526,12 @@ static bytea* try_serialize_zera_row_fast(HeapTupleHeader rec)
     try {
         z::zera::RootSerializer rs;
         z::zera::Serializer writer(rs);
-        zera_write_record_map(writer, rec, schema);
+        if (!schema.use_deform_access) {
+            zera_write_record_map(writer, rec, schema, nullptr);
+        } else {
+            TupleDeformScratch scratch;
+            zera_write_record_map(writer, rec, schema, &scratch);
+        }
 
         z::ZBuffer buffer = rs.finish();
         std::span<const uint8_t> data = buffer.buf();
@@ -1498,6 +1579,7 @@ static bytea* try_serialize_zera_array_fast(Datum* elements, bool* nulls, int ni
     try {
         z::zera::RootSerializer rs;
         z::zera::Serializer writer(rs);
+        TupleDeformScratch scratch;
 
         writer.begin_array(static_cast<size_t>(nitems));
         for (int i = 0; i < nitems; i++) {
@@ -1505,7 +1587,7 @@ static bytea* try_serialize_zera_array_fast(Datum* elements, bool* nulls, int ni
                 writer.null();
             } else {
                 HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
-                zera_write_record_map(writer, rec, *schemas[i]);
+                zera_write_record_map(writer, rec, *schemas[i], &scratch);
             }
         }
         writer.end_array();
@@ -1716,20 +1798,30 @@ static inline void flex_write_scalar(
 static inline void flex_write_record_map(
     z::flex::Serializer& writer,
     HeapTupleHeader rec,
-    const CachedSchema& schema)
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch)
 {
     HeapTupleData tuple;
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
     tuple.t_data = rec;
 
     writer.begin_map(schema.columns.size());
-    for (const CachedColumn& col : schema.columns) {
-        Datum value;
-        bool isnull;
-
-        value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-        writer.key(col.name);
-        flex_write_scalar(writer, col, value, isnull);
+    if (!schema.use_deform_access) {
+        for (const CachedColumn& col : schema.columns) {
+            bool isnull;
+            Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
+            writer.key(col.name);
+            flex_write_scalar(writer, col, value, isnull);
+        }
+    } else {
+        const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
+        scratch->ensure(nattrs);
+        heap_deform_tuple(&tuple, schema.tupdesc, scratch->values, scratch->nulls);
+        for (const CachedColumn& col : schema.columns) {
+            const int idx = col.attnum - 1;
+            writer.key(col.name);
+            flex_write_scalar(writer, col, scratch->values[idx], scratch->nulls[idx]);
+        }
     }
     writer.end_map();
 }
@@ -1747,7 +1839,12 @@ static bytea* try_serialize_flex_row_fast(HeapTupleHeader rec)
     try {
         z::flex::RootSerializer rs;
         z::flex::Serializer writer(rs);
-        flex_write_record_map(writer, rec, schema);
+        if (!schema.use_deform_access) {
+            flex_write_record_map(writer, rec, schema, nullptr);
+        } else {
+            TupleDeformScratch scratch;
+            flex_write_record_map(writer, rec, schema, &scratch);
+        }
 
         z::ZBuffer buffer = rs.finish();
         std::span<const uint8_t> data = buffer.buf();
@@ -1795,6 +1892,7 @@ static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int ni
     try {
         z::flex::RootSerializer rs;
         z::flex::Serializer writer(rs);
+        TupleDeformScratch scratch;
 
         writer.begin_array(static_cast<size_t>(nitems));
         for (int i = 0; i < nitems; i++) {
@@ -1802,7 +1900,7 @@ static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int ni
                 writer.null();
             } else {
                 HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
-                flex_write_record_map(writer, rec, *schemas[i]);
+                flex_write_record_map(writer, rec, *schemas[i], &scratch);
             }
         }
         writer.end_array();
@@ -1843,8 +1941,6 @@ static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec)
     tupType = HeapTupleHeaderGetTypeId(rec);
     tupTypmod = HeapTupleHeaderGetTypMod(rec);
     schema = &get_cached_schema(tupType, tupTypmod);
-
-    // Build a temporary HeapTuple for attribute access
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
     tuple.t_data = rec;
 
@@ -1853,15 +1949,22 @@ static z::dyn::Value record_to_dynamic_map(HeapTupleHeader rec)
     z::dyn::Value::Map entries;
     entries.reserve(schema->columns.size());
 
-    for (const CachedColumn& col : schema->columns) {
-        Datum value;
-        bool isnull;
-
-        // Get the attribute value
-        value = heap_getattr(&tuple, col.attnum, schema->tupdesc, &isnull);
-
-        // Add to map
-        entries.emplace_back(col.name, datum_to_dynamic_cached(value, isnull, col));
+    if (!schema->use_deform_access) {
+        for (const CachedColumn& col : schema->columns) {
+            bool isnull;
+            Datum value = heap_getattr(&tuple, col.attnum, schema->tupdesc, &isnull);
+            entries.emplace_back(col.name, datum_to_dynamic_cached(value, isnull, col));
+        }
+    } else {
+        TupleDeformScratch scratch;
+        const size_t nattrs = static_cast<size_t>(schema->tupdesc->natts);
+        scratch.ensure(nattrs);
+        heap_deform_tuple(&tuple, schema->tupdesc, scratch.values, scratch.nulls);
+        for (const CachedColumn& col : schema->columns) {
+            const int idx = col.attnum - 1;
+            entries.emplace_back(col.name,
+                                 datum_to_dynamic_cached(scratch.values[idx], scratch.nulls[idx], col));
+        }
     }
 
     return z::dyn::Value::map(std::move(entries));
