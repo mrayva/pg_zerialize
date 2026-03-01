@@ -13,6 +13,9 @@ extern "C" {
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/array.h"
+#include "utils/date.h"
+#include "utils/jsonb.h"
+#include "utils/timestamp.h"
 #include "access/tupdesc.h"
 #include "executor/spi.h"
 #include "utils/syscache.h"
@@ -106,6 +109,11 @@ enum class ConverterKind {
     Bool,
     Text,
     Numeric,
+    Date,
+    Timestamp,
+    Timestamptz,
+    Jsonb,
+    Bytea,
     Array,
     Fallback
 };
@@ -139,6 +147,8 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind);
 static bool is_msgpack_fast_column(const CachedColumn& col);
 static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key);
 static std::vector<uint8_t> encode_zera_key(std::string_view key);
+static inline std::span<const std::byte> datum_bytea_span(Datum value);
+static inline std::span<const std::byte> datum_jsonb_span(Datum value);
 
 // Global cache for per-schema metadata and TupleDesc lookups.
 static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
@@ -200,6 +210,16 @@ static ConverterKind classify_type(Oid typid)
             return ConverterKind::Text;
         case NUMERICOID:
             return ConverterKind::Numeric;
+        case DATEOID:
+            return ConverterKind::Date;
+        case TIMESTAMPOID:
+            return ConverterKind::Timestamp;
+        case TIMESTAMPTZOID:
+            return ConverterKind::Timestamptz;
+        case JSONBOID:
+            return ConverterKind::Jsonb;
+        case BYTEAOID:
+            return ConverterKind::Bytea;
         default:
             if (OidIsValid(get_element_type(typid))) {
                 return ConverterKind::Array;
@@ -408,10 +428,19 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
             Datum float_val = DirectFunctionCall1(numeric_float8, value);
             return z::dyn::Value(DatumGetFloat8(float_val));
         }
+        case DATEOID:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetDateADT(value)));
+        case TIMESTAMPOID:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetTimestamp(value)));
+        case TIMESTAMPTZOID:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetTimestampTz(value)));
+        case JSONBOID:
+            return z::dyn::Value::blob(datum_jsonb_span(value));
+        case BYTEAOID:
+            return z::dyn::Value::blob(datum_bytea_span(value));
 
         // TODO: Add support for more types:
-        // - DATEOID, TIMESTAMPOID (dates/timestamps)
-        // - JSONOID, JSONBOID (nested JSON)
+        // - JSONOID (nested JSON)
         // - Composite types (nested records)
 
         default:
@@ -436,6 +465,22 @@ static z::dyn::Value fallback_to_text_output(Datum value, Oid typoutput)
     std::string strval(str);
     pfree(str);
     return z::dyn::Value(strval);
+}
+
+static inline std::span<const std::byte> datum_bytea_span(Datum value)
+{
+    bytea* b = DatumGetByteaPP(value);
+    const std::byte* ptr = reinterpret_cast<const std::byte*>(VARDATA_ANY(b));
+    size_t len = static_cast<size_t>(VARSIZE_ANY_EXHDR(b));
+    return std::span<const std::byte>(ptr, len);
+}
+
+static inline std::span<const std::byte> datum_jsonb_span(Datum value)
+{
+    Jsonb* jb = DatumGetJsonbP(value);
+    const std::byte* ptr = reinterpret_cast<const std::byte*>(VARDATA_ANY(jb));
+    size_t len = static_cast<size_t>(VARSIZE_ANY_EXHDR(jb));
+    return std::span<const std::byte>(ptr, len);
 }
 
 static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const CachedColumn& col)
@@ -470,6 +515,16 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
             Datum float_val = DirectFunctionCall1(numeric_float8, value);
             return z::dyn::Value(DatumGetFloat8(float_val));
         }
+        case ConverterKind::Date:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetDateADT(value)));
+        case ConverterKind::Timestamp:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetTimestamp(value)));
+        case ConverterKind::Timestamptz:
+            return z::dyn::Value(static_cast<int64_t>(DatumGetTimestampTz(value)));
+        case ConverterKind::Jsonb:
+            return z::dyn::Value::blob(datum_jsonb_span(value));
+        case ConverterKind::Bytea:
+            return z::dyn::Value::blob(datum_bytea_span(value));
         case ConverterKind::Array:
             return array_to_dynamic(value, col.typid);
         case ConverterKind::Fallback:
@@ -490,6 +545,11 @@ static bool is_msgpack_fast_kind(ConverterKind kind)
         case ConverterKind::Bool:
         case ConverterKind::Text:
         case ConverterKind::Numeric:
+        case ConverterKind::Date:
+        case ConverterKind::Timestamp:
+        case ConverterKind::Timestamptz:
+        case ConverterKind::Jsonb:
+        case ConverterKind::Bytea:
             return true;
         default:
             return false;
@@ -507,6 +567,11 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
         case ConverterKind::Bool:
         case ConverterKind::Text:
         case ConverterKind::Numeric:
+        case ConverterKind::Date:
+        case ConverterKind::Timestamp:
+        case ConverterKind::Timestamptz:
+        case ConverterKind::Jsonb:
+        case ConverterKind::Bytea:
             return true;
         default:
             return false;
@@ -622,6 +687,21 @@ static inline void msgpack_write_array_element(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         default:
             break;
     }
@@ -714,6 +794,21 @@ static inline void msgpack_write_scalar(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         case ConverterKind::Array:
             msgpack_write_array(writer, col, value);
             return;
@@ -889,6 +984,21 @@ static inline void cbor_write_array_element(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         default:
             break;
     }
@@ -981,6 +1091,21 @@ static inline void cbor_write_scalar(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         case ConverterKind::Array:
             cbor_write_array(writer, col, value);
             return;
@@ -1156,6 +1281,21 @@ static inline void zera_write_array_element(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         default:
             break;
     }
@@ -1248,6 +1388,21 @@ static inline void zera_write_scalar(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         case ConverterKind::Array:
             zera_write_array(writer, col, value);
             return;
@@ -1423,6 +1578,21 @@ static inline void flex_write_array_element(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         default:
             break;
     }
@@ -1515,6 +1685,21 @@ static inline void flex_write_scalar(
             writer.double_(DatumGetFloat8(float_val));
             return;
         }
+        case ConverterKind::Date:
+            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
+            return;
+        case ConverterKind::Timestamp:
+            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
+            return;
+        case ConverterKind::Timestamptz:
+            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
+            return;
+        case ConverterKind::Jsonb:
+            writer.binary(datum_jsonb_span(value));
+            return;
+        case ConverterKind::Bytea:
+            writer.binary(datum_bytea_span(value));
+            return;
         case ConverterKind::Array:
             flex_write_array(writer, col, value);
             return;

@@ -239,28 +239,32 @@ BEGIN
 END $$;
 
 -- ============================================================
--- 11. FALLBACK TYPE (unsupported -> text representation)
+-- 11. NATIVE NON-PRIMITIVE TYPE HANDLING
 -- ============================================================
 DO $$
 DECLARE b bytea;
 BEGIN
-    -- DATE is not directly supported; falls through to text
+    -- DATE uses native numeric encoding (days from PG epoch)
     SELECT row_to_msgpack(ROW('2025-01-15'::date)) INTO b;
-    PERFORM assert_nonempty(b, 'date fallback');
+    PERFORM assert_nonempty(b, 'date native');
 
-    -- TIMESTAMP also falls through
+    -- TIMESTAMP/TIMESTAMPTZ use native numeric encoding (microseconds)
     SELECT row_to_msgpack(ROW('2025-01-15 10:30:00'::timestamp)) INTO b;
-    PERFORM assert_nonempty(b, 'timestamp fallback');
+    PERFORM assert_nonempty(b, 'timestamp native');
+    SELECT row_to_msgpack(ROW('2025-01-15 10:30:00+00'::timestamptz)) INTO b;
+    PERFORM assert_nonempty(b, 'timestamptz native');
 
     -- UUID
     SELECT row_to_msgpack(ROW('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid)) INTO b;
     PERFORM assert_nonempty(b, 'uuid fallback');
 
-    -- JSONB (falls through to text)
+    -- JSONB and BYTEA use native binary payload encoding
     SELECT row_to_msgpack(ROW('{"key":"val"}'::jsonb)) INTO b;
-    PERFORM assert_nonempty(b, 'jsonb fallback');
+    PERFORM assert_nonempty(b, 'jsonb native');
+    SELECT row_to_msgpack(ROW(E'\\\\xDEADBEEF'::bytea)) INTO b;
+    PERFORM assert_nonempty(b, 'bytea native');
 
-    RAISE NOTICE 'PASS: 11. fallback types (date, timestamp, uuid, jsonb)';
+    RAISE NOTICE 'PASS: 11. native non-primitive types (date/time/jsonb/bytea + uuid fallback)';
 END $$;
 
 -- ============================================================
