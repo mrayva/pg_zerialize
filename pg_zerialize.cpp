@@ -872,6 +872,85 @@ static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind k
     }
 }
 
+static inline void msgpack_write_array_no_nulls(
+    z::MsgPackSerializer& writer,
+    ConverterKind elem_kind,
+    Datum* elements,
+    int nitems)
+{
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt16(elements[i])));
+            }
+            return;
+        case ConverterKind::Int4:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt32(elements[i])));
+            }
+            return;
+        case ConverterKind::Int8:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt64(elements[i])));
+            }
+            return;
+        case ConverterKind::Float4:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(static_cast<double>(DatumGetFloat4(elements[i])));
+            }
+            return;
+        case ConverterKind::Float8:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(DatumGetFloat8(elements[i]));
+            }
+            return;
+        case ConverterKind::Bool:
+            for (int i = 0; i < nitems; i++) {
+                writer.boolean(DatumGetBool(elements[i]));
+            }
+            return;
+        case ConverterKind::Text:
+            for (int i = 0; i < nitems; i++) {
+                msgpack_write_text(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Numeric:
+            for (int i = 0; i < nitems; i++) {
+                numeric_write_fast(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Date:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetDateADT(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamp:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestamp(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamptz:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestampTz(elements[i])));
+            }
+            return;
+        case ConverterKind::Jsonb:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_jsonb_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Bytea:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_bytea_span(elements[i]));
+            }
+            return;
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unsupported array element type for fast MessagePack path")));
+    }
+}
+
 static inline void msgpack_write_array(
     z::MsgPackSerializer& writer,
     const CachedColumn& col,
@@ -912,8 +991,12 @@ static inline void msgpack_write_array(
     }
 
     writer.begin_array(static_cast<size_t>(nitems));
-    for (int i = 0; i < nitems; i++) {
-        elem_writer(writer, elements[i], nulls[i]);
+    if (!ARR_HASNULL(arr)) {
+        msgpack_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
+    } else {
+        for (int i = 0; i < nitems; i++) {
+            elem_writer(writer, elements[i], nulls[i]);
+        }
     }
     writer.end_array();
 
