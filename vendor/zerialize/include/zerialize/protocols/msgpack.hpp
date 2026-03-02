@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -514,13 +515,29 @@ public:
         return ZBuffer(d, n, ZBuffer::Deleters::Free);
     }
 
-    void write_raw(std::span<const uint8_t> bytes) {
-        if (bytes.empty()) return;
-        if (msgpack_sbuffer_write(&sbuf,
-                                  reinterpret_cast<const char*>(bytes.data()),
-                                  bytes.size()) != 0) {
-            throw SerializationError("msgpack: failed to append preencoded bytes");
+    void write_raw(const uint8_t* data, std::size_t len) {
+        if (len == 0) return;
+
+        // Fast append path for frequent small key/header chunks.
+        std::size_t needed = sbuf.size + len;
+        if (needed > sbuf.alloc) {
+            std::size_t new_alloc = (sbuf.alloc > 0) ? sbuf.alloc : 256;
+            while (new_alloc < needed) {
+                new_alloc *= 2;
+            }
+            char* new_data = static_cast<char*>(std::realloc(sbuf.data, new_alloc));
+            if (new_data == nullptr) {
+                throw SerializationError("msgpack: failed to grow output buffer");
+            }
+            sbuf.data = new_data;
+            sbuf.alloc = new_alloc;
         }
+        std::memcpy(sbuf.data + sbuf.size, data, len);
+        sbuf.size += len;
+    }
+
+    void write_raw(std::span<const uint8_t> bytes) {
+        write_raw(bytes.data(), bytes.size());
     }
 };
 
@@ -553,9 +570,11 @@ public:
     void begin_map(std::size_t n)   { msgpack_pack_map(&pk_, n); }
     void end_map()                  { /* no-op */ }
     void begin_map_preencoded(std::span<const uint8_t> encoded_header) { rs_->write_raw(encoded_header); }
+    void begin_map_preencoded(const uint8_t* data, std::size_t len) { rs_->write_raw(data, len); }
 
     void key(std::string_view k)    { string(k); }
     void key_preencoded(std::span<const uint8_t> encoded_key) { rs_->write_raw(encoded_key); }
+    void key_preencoded(const uint8_t* data, std::size_t len) { rs_->write_raw(data, len); }
 };
 
 struct MsgPack {

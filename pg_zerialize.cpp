@@ -129,6 +129,8 @@ struct CachedColumn {
     std::string name;
     std::vector<uint8_t> msgpack_key_encoded;
     std::span<const uint8_t> msgpack_key_view;
+    const uint8_t* msgpack_key_ptr;
+    size_t msgpack_key_len;
     std::vector<uint8_t> zera_key_encoded;
     MsgpackScalarWriterFn msgpack_scalar_writer;
     MsgpackArrayElemWriterFn msgpack_array_elem_writer;
@@ -146,6 +148,8 @@ struct CachedSchema {
     TupleDesc tupdesc;
     std::vector<CachedColumn> columns;
     std::vector<uint8_t> msgpack_map_header_encoded;
+    const uint8_t* msgpack_map_header_ptr;
+    size_t msgpack_map_header_len;
     bool use_deform_access;
     bool msgpack_fast_supported;
     bool cbor_fast_supported;
@@ -308,6 +312,8 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         col.name = std::string(NameStr(att->attname));
         col.msgpack_key_encoded = encode_msgpack_string_key(col.name);
         col.msgpack_key_view = std::span<const uint8_t>();
+        col.msgpack_key_ptr = nullptr;
+        col.msgpack_key_len = 0;
         col.zera_key_encoded = encode_zera_key(col.name);
         col.msgpack_scalar_writer = nullptr;
         col.msgpack_array_elem_writer = nullptr;
@@ -347,9 +353,13 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 
         schema.columns.push_back(std::move(col));
         schema.columns.back().msgpack_key_view = schema.columns.back().msgpack_key_encoded;
+        schema.columns.back().msgpack_key_ptr = schema.columns.back().msgpack_key_encoded.data();
+        schema.columns.back().msgpack_key_len = schema.columns.back().msgpack_key_encoded.size();
     }
 
     schema.msgpack_map_header_encoded = encode_msgpack_map_header(schema.columns.size());
+    schema.msgpack_map_header_ptr = schema.msgpack_map_header_encoded.data();
+    schema.msgpack_map_header_len = schema.msgpack_map_header_encoded.size();
     schema.use_deform_access = schema.columns.size() >= kHybridHeapDeformThreshold;
 
     auto [inserted_it, inserted] = schema_cache.emplace(key, std::move(schema));
@@ -1150,7 +1160,7 @@ static inline void msgpack_write_record_map(
     tuple.t_data = rec;
 
     if (schema.columns.size() > 15) {
-        writer.begin_map_preencoded(schema.msgpack_map_header_encoded);
+        writer.begin_map_preencoded(schema.msgpack_map_header_ptr, schema.msgpack_map_header_len);
     } else {
         writer.begin_map(schema.columns.size());
     }
@@ -1158,7 +1168,7 @@ static inline void msgpack_write_record_map(
         for (const CachedColumn& col : schema.columns) {
             bool isnull;
             Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-            writer.key_preencoded(col.msgpack_key_view);
+            writer.key_preencoded(col.msgpack_key_ptr, col.msgpack_key_len);
             col.msgpack_scalar_writer(writer, col, value, isnull);
         }
     } else {
@@ -1167,7 +1177,7 @@ static inline void msgpack_write_record_map(
         heap_deform_tuple(&tuple, schema.tupdesc, scratch->values, scratch->nulls);
         for (const CachedColumn& col : schema.columns) {
             const int idx = col.attnum - 1;
-            writer.key_preencoded(col.msgpack_key_view);
+            writer.key_preencoded(col.msgpack_key_ptr, col.msgpack_key_len);
             col.msgpack_scalar_writer(writer, col, scratch->values[idx], scratch->nulls[idx]);
         }
     }
