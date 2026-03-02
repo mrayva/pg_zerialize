@@ -1,0 +1,140 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+-- Scalar semantics: deterministic and non-empty.
+SELECT msgpack_from_jsonb('null'::jsonb) = msgpack_from_jsonb('null'::jsonb) AS scalar_null_stable;
+ scalar_null_stable 
+--------------------
+ t
+(1 row)
+
+SELECT msgpack_from_jsonb('true'::jsonb) = msgpack_from_jsonb('true'::jsonb) AS scalar_bool_stable;
+ scalar_bool_stable 
+--------------------
+ t
+(1 row)
+
+SELECT msgpack_from_jsonb('123'::jsonb) = msgpack_from_jsonb('123'::jsonb) AS scalar_int_stable;
+ scalar_int_stable 
+-------------------
+ t
+(1 row)
+
+SELECT msgpack_from_jsonb('123.5'::jsonb) = msgpack_from_jsonb('123.5'::jsonb) AS scalar_frac_stable;
+ scalar_frac_stable 
+--------------------
+ t
+(1 row)
+
+SELECT msgpack_from_jsonb('"hello"'::jsonb) = msgpack_from_jsonb('"hello"'::jsonb) AS scalar_text_stable;
+ scalar_text_stable 
+--------------------
+ t
+(1 row)
+
+-- Array semantics parity: builder vs jsonb conversion.
+SELECT msgpack_build_array(1, 'x', true, NULL, 42.5::numeric)
+       = msgpack_from_jsonb(jsonb_build_array(1, 'x', true, NULL, 42.5::numeric)) AS array_parity;
+ array_parity 
+--------------
+ t
+(1 row)
+
+-- Object semantics parity with sorted keys (canonical jsonb key order).
+SELECT msgpack_build_object('a', 1, 'b', 'x', 'c', true)
+       = msgpack_from_jsonb(jsonb_build_object('a', 1, 'b', 'x', 'c', true)) AS object_parity_sorted_keys;
+ object_parity_sorted_keys 
+---------------------------
+ t
+(1 row)
+
+-- Nested semantics parity.
+SELECT msgpack_from_jsonb(
+           jsonb_build_object(
+               'a', jsonb_build_array(1,2,3),
+               'b', jsonb_build_object('x', true, 'y', NULL),
+               'c', jsonb_build_array(jsonb_build_object('k', 1), jsonb_build_object('k', 2))
+           )
+       )
+       = msgpack_from_jsonb(
+           jsonb_build_object(
+               'a', jsonb_build_array(1,2,3),
+               'b', jsonb_build_object('x', true, 'y', NULL),
+               'c', jsonb_build_array(jsonb_build_object('k', 1), jsonb_build_object('k', 2))
+           )
+       ) AS nested_stable;
+ nested_stable 
+---------------
+ t
+(1 row)
+
+-- Aggregate parity against explicit jsonb aggregate conversion.
+CREATE TABLE pgz_sem_emp(id int, dept int, name text, role text);
+INSERT INTO pgz_sem_emp VALUES
+    (1, 10, 'ann', 'dev'),
+    (2, 10, 'bob', 'lead'),
+    (3, 20, 'cam', 'ae');
+SELECT msgpack_agg(jsonb_build_object('id', id, 'name', name) ORDER BY id)
+       = msgpack_from_jsonb(jsonb_agg(jsonb_build_object('id', id, 'name', name) ORDER BY id)) AS agg_parity
+FROM pgz_sem_emp;
+ agg_parity 
+------------
+ t
+(1 row)
+
+SELECT msgpack_object_agg(name, role ORDER BY name)
+       = msgpack_from_jsonb(jsonb_object_agg(name, role ORDER BY name)) AS object_agg_parity
+FROM pgz_sem_emp;
+ object_agg_parity 
+-------------------
+ t
+(1 row)
+
+-- Join-shaped nested semantics (same pattern as docs/user request).
+WITH nested_employees AS (
+  SELECT
+    dept,
+    jsonb_agg(jsonb_build_object('id', id, 'name', name, 'role', role) ORDER BY id) AS staff
+  FROM pgz_sem_emp
+  GROUP BY dept
+)
+SELECT msgpack_from_jsonb(
+         jsonb_build_object(
+           'dept_id', d.dept,
+           'dept_name', d.dept_name,
+           'staff', COALESCE(ne.staff, '[]'::jsonb)
+         )
+       ) IS NOT NULL AS join_nested_not_null
+FROM (VALUES (10,'eng'), (20,'sales'), (30,'ops')) AS d(dept, dept_name)
+LEFT JOIN nested_employees ne ON ne.dept = d.dept
+ORDER BY d.dept;
+ join_nested_not_null 
+----------------------
+ t
+ t
+ t
+(3 rows)
+
+-- Deep nesting stress (20 levels) should not error.
+WITH RECURSIVE nest(n, j) AS (
+  SELECT 1, jsonb_build_object('lvl', 1)
+  UNION ALL
+  SELECT n + 1, jsonb_build_object('lvl', n + 1, 'child', j)
+  FROM nest
+  WHERE n < 20
+)
+SELECT msgpack_from_jsonb(j) IS NOT NULL AS deep_nesting_ok
+FROM nest
+WHERE n = 20;
+ deep_nesting_ok 
+-----------------
+ t
+(1 row)
+
+-- Invalid input checks for builder-style APIs.
+SELECT msgpack_build_object('a', 1, 'b');
+ERROR:  msgpack_build_object requires an even number of arguments
+SELECT msgpack_build_object(NULL, 1);
+ERROR:  msgpack_build_object key must not be null
+DROP TABLE pgz_sem_emp;
+DROP EXTENSION pg_zerialize;
