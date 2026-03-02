@@ -26,10 +26,16 @@ include $(PGXS)
 %.o: %.cpp
 	$(CXX) $(PG_CPPFLAGS) $(CPPFLAGS) -c -o $@ $<
 
-.PHONY: bench bench-quick
+.PHONY: bench bench-quick bench-isolated bench-isolated-quick
 
 bench:
 	./bench/run_microbench.sh
 
 bench-quick:
 	RUNS=3 WARMUP=1 ./bench/run_microbench.sh
+
+bench-isolated:
+	./bench/run_microbench_isolated.sh
+
+bench-isolated-quick:
+	RUNS=3 WARMUP=1 ./bench/run_microbench_isolated.sh

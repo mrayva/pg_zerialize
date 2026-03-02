@@ -8,6 +8,12 @@ Repeatable in-repo benchmark for `pg_zerialize` serialization hot paths.
 make bench
 ```
 
+Protocol-isolated mode (runs each protocol in a separate `psql` session):
+
+```bash
+make bench-isolated
+```
+
 Default connection/runtime settings:
 - `PGHOST=127.0.0.1`
 - `PGPORT=5432`
@@ -21,6 +27,12 @@ You can override any of them:
 
 ```bash
 RUNS=8 WARMUP=2 PGDATABASE=postgres make bench
+```
+
+For isolated mode, you can also choose protocol order/subset:
+
+```bash
+PROTOCOLS="msgpack flex" RUNS=3 WARMUP=1 make bench-isolated
 ```
 
 ## What It Measures
@@ -43,3 +55,5 @@ Format per line:
 
 - Timestamped run log: `results/microbench_YYYYmmdd_HHMMSS.out`
 - Latest symlink: `results/microbench_latest.out`
+- Isolated run log: `results/microbench_isolated_YYYYmmdd_HHMMSS.out`
+- Isolated latest symlink: `results/microbench_isolated_latest.out`
