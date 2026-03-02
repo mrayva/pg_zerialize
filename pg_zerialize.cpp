@@ -25,6 +25,10 @@ extern "C" {
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
+
+/* Builtin final functions used by custom MsgPack aggregate wrappers. */
+Datum jsonb_agg_finalfn(PG_FUNCTION_ARGS);
+Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 }
 
 #include <vector>
@@ -36,6 +40,7 @@ PG_MODULE_MAGIC;
 #include <memory>
 #include <unordered_map>
 #include <type_traits>
+#include <cmath>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/msgpack.hpp>
@@ -55,6 +60,11 @@ extern "C" {
     Datum row_to_flexbuffers(PG_FUNCTION_ARGS);
     Datum row_to_msgpack(PG_FUNCTION_ARGS);
     Datum row_to_msgpack_slow(PG_FUNCTION_ARGS);
+    Datum msgpack_from_jsonb(PG_FUNCTION_ARGS);
+    Datum msgpack_build_object(PG_FUNCTION_ARGS);
+    Datum msgpack_build_array(PG_FUNCTION_ARGS);
+    Datum msgpack_agg_final(PG_FUNCTION_ARGS);
+    Datum msgpack_object_agg_final(PG_FUNCTION_ARGS);
     Datum row_to_cbor(PG_FUNCTION_ARGS);
     Datum row_to_zera(PG_FUNCTION_ARGS);
 
@@ -68,6 +78,11 @@ extern "C" {
     PG_FUNCTION_INFO_V1(row_to_flexbuffers);
     PG_FUNCTION_INFO_V1(row_to_msgpack);
     PG_FUNCTION_INFO_V1(row_to_msgpack_slow);
+    PG_FUNCTION_INFO_V1(msgpack_from_jsonb);
+    PG_FUNCTION_INFO_V1(msgpack_build_object);
+    PG_FUNCTION_INFO_V1(msgpack_build_array);
+    PG_FUNCTION_INFO_V1(msgpack_agg_final);
+    PG_FUNCTION_INFO_V1(msgpack_object_agg_final);
     PG_FUNCTION_INFO_V1(row_to_cbor);
     PG_FUNCTION_INFO_V1(row_to_zera);
 
@@ -480,6 +495,86 @@ static inline z::dyn::Value numeric_to_dynamic_fast(Datum value)
     return z::dyn::Value(numeric_to_float8_fast(value));
 }
 
+static z::dyn::Value jsonb_token_to_dynamic(JsonbIterator** it, JsonbIteratorToken tok, JsonbValue* v);
+
+static z::dyn::Value jsonb_scalar_to_dynamic(const JsonbValue& v)
+{
+    switch (v.type) {
+        case jbvNull:
+            return z::dyn::Value();
+        case jbvBool:
+            return z::dyn::Value(v.val.boolean);
+        case jbvNumeric:
+            return numeric_to_dynamic_fast(NumericGetDatum(v.val.numeric));
+        case jbvString:
+            return z::dyn::Value(std::string(v.val.string.val, v.val.string.len));
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unsupported jsonb scalar type for msgpack conversion")));
+    }
+}
+
+static z::dyn::Value jsonb_token_to_dynamic(JsonbIterator** it, JsonbIteratorToken tok, JsonbValue* v)
+{
+    if (tok == WJB_BEGIN_OBJECT) {
+        z::dyn::Value::Map map_entries;
+        JsonbIteratorToken t = JsonbIteratorNext(it, v, false);
+        while (t != WJB_END_OBJECT) {
+            if (t != WJB_KEY) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_DATA_CORRUPTED),
+                         errmsg("invalid jsonb object token sequence")));
+            }
+            std::string key(v->val.string.val, v->val.string.len);
+            t = JsonbIteratorNext(it, v, false);
+            map_entries.emplace_back(std::move(key), jsonb_token_to_dynamic(it, t, v));
+            t = JsonbIteratorNext(it, v, false);
+        }
+        return z::dyn::Value::map(std::move(map_entries));
+    }
+
+    if (tok == WJB_BEGIN_ARRAY) {
+        z::dyn::Value::Array arr;
+        JsonbIteratorToken t = JsonbIteratorNext(it, v, false);
+        while (t != WJB_END_ARRAY) {
+            arr.push_back(jsonb_token_to_dynamic(it, t, v));
+            t = JsonbIteratorNext(it, v, false);
+        }
+        return z::dyn::Value::array(std::move(arr));
+    }
+
+    if (tok == WJB_VALUE || tok == WJB_ELEM) {
+        return jsonb_scalar_to_dynamic(*v);
+    }
+
+    ereport(ERROR,
+            (errcode(ERRCODE_DATA_CORRUPTED),
+             errmsg("invalid jsonb token for conversion")));
+}
+
+static z::dyn::Value jsonb_to_dynamic(Jsonb* jb)
+{
+    JsonbIterator* it = JsonbIteratorInit(&jb->root);
+    JsonbValue v;
+
+    if (JB_ROOT_IS_SCALAR(jb)) {
+        JsonbIteratorToken tok = JsonbIteratorNext(&it, &v, false); /* begin pseudo-array */
+        if (tok != WJB_BEGIN_ARRAY) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("invalid scalar jsonb root")));
+        }
+        tok = JsonbIteratorNext(&it, &v, false); /* scalar elem */
+        z::dyn::Value out = jsonb_token_to_dynamic(&it, tok, &v);
+        (void) JsonbIteratorNext(&it, &v, false); /* end pseudo-array */
+        return out;
+    }
+
+    JsonbIteratorToken tok = JsonbIteratorNext(&it, &v, false);
+    return jsonb_token_to_dynamic(&it, tok, &v);
+}
+
 /*
  * Convert a PostgreSQL Datum to a zerialize dyn::Value
  */
@@ -563,6 +658,17 @@ static z::dyn::Value fallback_to_text_output(Datum value, Oid typoutput)
     std::string strval(str);
     pfree(str);
     return z::dyn::Value(strval);
+}
+
+static std::string datum_to_string_output(Datum value, Oid typid)
+{
+    Oid typoutput;
+    bool typIsVarlena;
+    getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
+    char* str = OidOutputFunctionCall(typoutput, value);
+    std::string out(str);
+    pfree(str);
+    return out;
 }
 
 static inline std::span<const std::byte> datum_bytea_span(Datum value)
@@ -2347,6 +2453,29 @@ static bytea* tuple_to_binary_slow(HeapTupleHeader rec)
     return nullptr;
 }
 
+static bytea* dynamic_to_msgpack_binary(const z::dyn::Value& v)
+{
+    try {
+        z::ZBuffer buffer = z::serialize<z::MsgPack>(v);
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("msgpack serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("msgpack serialization failed with unknown exception")));
+    }
+    return nullptr;
+}
+
 /*
  * Generic helper function to convert array of PostgreSQL tuples to binary format
  * This is the batch processing version for improved performance
@@ -2598,6 +2727,123 @@ row_to_msgpack_slow(PG_FUNCTION_ARGS)
 
     rec = PG_GETARG_HEAPTUPLEHEADER(0);
     result = tuple_to_binary_slow<z::MsgPack>(rec);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * msgpack_from_jsonb - Convert nested jsonb to nested MessagePack.
+ * This is the core bridge for SQL builder parity workflows.
+ */
+extern "C" Datum
+msgpack_from_jsonb(PG_FUNCTION_ARGS)
+{
+    Jsonb* jb = PG_GETARG_JSONB_P(0);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_msgpack_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * msgpack_build_object - Build a MessagePack object from variadic key/value args.
+ * Mirrors json_build_object semantics at SQL layer.
+ */
+extern "C" Datum
+msgpack_build_object(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    if ((nargs % 2) != 0) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("msgpack_build_object requires an even number of arguments")));
+    }
+
+    z::dyn::Value::Map entries;
+    entries.reserve(static_cast<size_t>(nargs / 2));
+
+    for (int i = 0; i < nargs; i += 2) {
+        if (PG_ARGISNULL(i)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("msgpack_build_object key must not be null")));
+        }
+
+        Oid key_typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(key_typid)) {
+            key_typid = TEXTOID;
+        }
+        std::string key = datum_to_string_output(PG_GETARG_DATUM(i), key_typid);
+
+        Oid val_typid = get_fn_expr_argtype(fcinfo->flinfo, i + 1);
+        if (!OidIsValid(val_typid)) {
+            val_typid = TEXTOID;
+        }
+        Datum val = (i + 1 < nargs && !PG_ARGISNULL(i + 1)) ? PG_GETARG_DATUM(i + 1) : (Datum) 0;
+        entries.emplace_back(std::move(key), datum_to_dynamic(val, val_typid, PG_ARGISNULL(i + 1)));
+    }
+
+    bytea* result = dynamic_to_msgpack_binary(z::dyn::Value::map(std::move(entries)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * msgpack_build_array - Build a MessagePack array from variadic arguments.
+ * Mirrors json_build_array semantics at SQL layer.
+ */
+extern "C" Datum
+msgpack_build_array(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    z::dyn::Value::Array arr;
+    arr.reserve(static_cast<size_t>(nargs));
+
+    for (int i = 0; i < nargs; i++) {
+        Oid typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(typid)) {
+            typid = TEXTOID;
+        }
+        Datum val = (!PG_ARGISNULL(i)) ? PG_GETARG_DATUM(i) : (Datum) 0;
+        arr.push_back(datum_to_dynamic(val, typid, PG_ARGISNULL(i)));
+    }
+
+    bytea* result = dynamic_to_msgpack_binary(z::dyn::Value::array(std::move(arr)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * msgpack_agg_final - Finalize jsonb_agg state and convert to MessagePack.
+ */
+extern "C" Datum
+msgpack_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_msgpack_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * msgpack_object_agg_final - Finalize jsonb_object_agg state and convert.
+ */
+extern "C" Datum
+msgpack_object_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_object_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_msgpack_binary(v);
     PG_RETURN_BYTEA_P(result);
 }
 

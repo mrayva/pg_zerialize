@@ -43,6 +43,13 @@ For MessagePack fast-path parity checks, test-only helper functions are availabl
 - `row_to_msgpack_slow(record)`
 - `rows_to_msgpack_slow(anyarray)`
 
+SQL-builder style MessagePack APIs are available:
+- `msgpack_from_jsonb(jsonb)`
+- `msgpack_build_object(VARIADIC "any")`
+- `msgpack_build_array(VARIADIC "any")`
+- `msgpack_agg(anyelement)`
+- `msgpack_object_agg(text, anyelement)`
+
 ## Microbenchmark
 
 Run the repeatable in-repo microbenchmark harness:

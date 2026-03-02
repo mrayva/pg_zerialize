@@ -26,6 +26,62 @@ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION row_to_msgpack_slow(record) IS
 'Convert a PostgreSQL row/record to MessagePack using generic slow path (test/parity helper)';
 
+CREATE OR REPLACE FUNCTION msgpack_from_jsonb(jsonb)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_from_jsonb'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION msgpack_from_jsonb(jsonb) IS
+'Convert jsonb value (including nested objects/arrays) to MessagePack';
+
+CREATE OR REPLACE FUNCTION msgpack_build_object(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_build_object'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION msgpack_build_object(VARIADIC "any") IS
+'Build a MessagePack object from key/value pairs (json_build_object-style)';
+
+CREATE OR REPLACE FUNCTION msgpack_build_array(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_build_array'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION msgpack_build_array(VARIADIC "any") IS
+'Build a MessagePack array from variadic values (json_build_array-style)';
+
+CREATE OR REPLACE FUNCTION msgpack_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_agg_final'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION msgpack_object_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_object_agg_final'
+LANGUAGE C;
+
+DROP AGGREGATE IF EXISTS msgpack_agg(anyelement);
+CREATE AGGREGATE msgpack_agg(anyelement)
+(
+    SFUNC = jsonb_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = msgpack_agg_final
+);
+
+COMMENT ON AGGREGATE msgpack_agg(anyelement) IS
+'Aggregate values into a MessagePack array (json_agg-style)';
+
+DROP AGGREGATE IF EXISTS msgpack_object_agg(text, anyelement);
+CREATE AGGREGATE msgpack_object_agg(text, anyelement)
+(
+    SFUNC = jsonb_object_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = msgpack_object_agg_final
+);
+
+COMMENT ON AGGREGATE msgpack_object_agg(text, anyelement) IS
+'Aggregate key/value pairs into a MessagePack object (json_object_agg-style)';
+
 -- Function to convert a row to CBOR format
 CREATE OR REPLACE FUNCTION row_to_cbor(record)
 RETURNS bytea
