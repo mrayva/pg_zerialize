@@ -1,0 +1,161 @@
+SET client_min_messages TO warning;
+SET TIME ZONE 'UTC';
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+CREATE TYPE pgz_ex_inner AS (
+    k int,
+    v text
+);
+CREATE TYPE pgz_ex_row AS (
+    id int,
+    b bool,
+    t text,
+    n numeric,
+    d date,
+    ts timestamp,
+    tz timestamptz,
+    j jsonb,
+    ba bytea,
+    ai int[],
+    at text[],
+    ab bool[],
+    inner_row pgz_ex_inner,
+    inner_arr pgz_ex_inner[]
+);
+CREATE TEMP TABLE pgz_ex_src AS
+SELECT
+    i AS id,
+    (i % 2 = 0) AS b,
+    format('name_%s', i) AS t,
+    (i * 1000.125)::numeric AS n,
+    DATE '2025-01-01' + i AS d,
+    TIMESTAMP '2025-01-01 00:00:00' + make_interval(hours => i) AS ts,
+    TIMESTAMPTZ '2025-01-01 00:00:00+00' + make_interval(hours => i) AS tz,
+    jsonb_build_object('i', i, 'arr', jsonb_build_array(i, i + 1), 'flag', (i % 2 = 0)) AS j,
+    decode(lpad(to_hex(i), 8, '0'), 'hex')::bytea AS ba,
+    ARRAY[i, NULL, i + 2]::int[] AS ai,
+    ARRAY[format('t%s', i), NULL, format('u%s', i)]::text[] AS at,
+    ARRAY[(i % 2 = 0), NULL, (i % 3 = 0)]::bool[] AS ab,
+    ROW(i, format('inner_%s', i))::pgz_ex_inner AS inner_row,
+    ARRAY[
+      ROW(i, format('x_%s', i))::pgz_ex_inner,
+      NULL::pgz_ex_inner,
+      ROW(i + 1, format('y_%s', i + 1))::pgz_ex_inner
+    ]::pgz_ex_inner[] AS inner_arr
+FROM generate_series(1, 32) AS gs(i);
+-- Exhaustive type matrix parity: fast MsgPack path must match slow generic path.
+SELECT bool_and(row_to_msgpack(r) = row_to_msgpack_slow(r)) AS row_fast_slow_equal_all
+FROM (
+  SELECT ROW(id, b, t, n, d, ts, tz, j, ba, ai, at, ab, inner_row, inner_arr)::pgz_ex_row AS r
+  FROM pgz_ex_src
+) q;
+ row_fast_slow_equal_all 
+-------------------------
+ t
+(1 row)
+
+-- Batch parity across the same dataset.
+SELECT rows_to_msgpack(array_agg(r ORDER BY id))
+       = rows_to_msgpack_slow(array_agg(r ORDER BY id)) AS batch_fast_slow_equal_all
+FROM (
+  SELECT id, ROW(id, b, t, n, d, ts, tz, j, ba, ai, at, ab, inner_row, inner_arr)::pgz_ex_row AS r
+  FROM pgz_ex_src
+) q;
+ batch_fast_slow_equal_all 
+---------------------------
+ t
+(1 row)
+
+-- Batch parity with explicit NULL records mixed in.
+SELECT rows_to_msgpack(ARRAY[
+         NULL::pgz_ex_row,
+         (SELECT ROW(id, b, t, n, d, ts, tz, j, ba, ai, at, ab, inner_row, inner_arr)::pgz_ex_row FROM pgz_ex_src WHERE id = 7),
+         NULL::pgz_ex_row,
+         (SELECT ROW(id, b, t, n, d, ts, tz, j, ba, ai, at, ab, inner_row, inner_arr)::pgz_ex_row FROM pgz_ex_src WHERE id = 9)
+       ])
+       = rows_to_msgpack_slow(ARRAY[
+         NULL::pgz_ex_row,
+         (SELECT ROW(id, b, t, n, d, ts, tz, j, ba, ai, at, ab, inner_row, inner_arr)::pgz_ex_row FROM pgz_ex_src WHERE id = 7),
+         NULL::pgz_ex_row,
+         (SELECT ROW(id, b, t, n, d, ts, tz, j, ba, ai, at, ab, inner_row, inner_arr)::pgz_ex_row FROM pgz_ex_src WHERE id = 9)
+       ]) AS batch_with_null_rows_equal;
+ batch_with_null_rows_equal 
+----------------------------
+ t
+(1 row)
+
+-- Builders: duplicate keys are preserved in MsgPack maps; require deterministic output.
+SELECT msgpack_build_object('a', 1, 'a', 2, 'b', 7)
+       = msgpack_build_object('a', 1, 'a', 2, 'b', 7) AS duplicate_key_stable;
+ duplicate_key_stable 
+----------------------
+ t
+(1 row)
+
+-- Builders: nested parity against jsonb_build_* equivalents.
+SELECT msgpack_build_array(1, msgpack_build_object('x', 2), NULL)
+       IS NOT NULL AS nested_builder_not_null;
+ nested_builder_not_null 
+-------------------------
+ t
+(1 row)
+
+SELECT msgpack_build_object(
+         'id', 10,
+         'name', 'dept',
+         'staff', msgpack_from_jsonb(
+                    jsonb_build_array(
+                      jsonb_build_object('id', 1, 'name', 'ann'),
+                      jsonb_build_object('id', 2, 'name', 'bob')
+                    )
+                  )
+       ) IS NOT NULL AS nested_object_builder_not_null;
+ nested_object_builder_not_null 
+--------------------------------
+ t
+(1 row)
+
+-- Aggregate semantics: non-empty parity.
+SELECT msgpack_agg(jsonb_build_object('id', id, 'name', t) ORDER BY id)
+       = msgpack_from_jsonb(jsonb_agg(jsonb_build_object('id', id, 'name', t) ORDER BY id)) AS agg_nonempty_parity
+FROM pgz_ex_src;
+ agg_nonempty_parity 
+---------------------
+ t
+(1 row)
+
+SELECT msgpack_object_agg(t, id ORDER BY t)
+       = msgpack_from_jsonb(jsonb_object_agg(t, id ORDER BY t)) AS object_agg_nonempty_parity
+FROM (SELECT t, id FROM pgz_ex_src WHERE id <= 5) s;
+ object_agg_nonempty_parity 
+----------------------------
+ t
+(1 row)
+
+-- Aggregate semantics: empty input returns NULL (matching jsonb aggregates).
+SELECT msgpack_agg(x) IS NULL AS agg_empty_is_null
+FROM (SELECT 1::int AS x WHERE false) s;
+ agg_empty_is_null 
+-------------------
+ t
+(1 row)
+
+SELECT msgpack_object_agg(k, v) IS NULL AS object_agg_empty_is_null
+FROM (SELECT 'a'::text AS k, 1::int AS v WHERE false) s;
+ object_agg_empty_is_null 
+--------------------------
+ t
+(1 row)
+
+-- Error contracts.
+SELECT msgpack_build_object('a', 1, 'b');
+ERROR:  msgpack_build_object requires an even number of arguments
+SELECT msgpack_build_object(NULL, 1);
+ERROR:  msgpack_build_object key must not be null
+SELECT msgpack_object_agg(k, v)
+FROM (VALUES (NULL::text, 1::int)) t(k, v);
+ERROR:  field name must not be null
+DROP TABLE pgz_ex_src;
+DROP TYPE pgz_ex_row;
+DROP TYPE pgz_ex_inner;
+DROP EXTENSION pg_zerialize;
