@@ -32,12 +32,16 @@ sudo make install
 ## Testing
 
 ```bash
-# Lightweight PGXS regression tests
+# PGXS regression tests (core/parity/cache/determinism)
 make installcheck
 
 # Comprehensive manual suite
 psql -d postgres -f test_pg_zerialize.sql
 ```
+
+For MessagePack fast-path parity checks, test-only helper functions are available:
+- `row_to_msgpack_slow(record)`
+- `rows_to_msgpack_slow(anyarray)`
 
 ## Microbenchmark
 

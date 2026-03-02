@@ -18,6 +18,15 @@ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION row_to_msgpack(record) IS
 'Convert a PostgreSQL row/record to MessagePack binary format';
 
+-- Test helper: force generic (slow) MessagePack path for parity validation
+CREATE OR REPLACE FUNCTION row_to_msgpack_slow(record)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'row_to_msgpack_slow'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION row_to_msgpack_slow(record) IS
+'Convert a PostgreSQL row/record to MessagePack using generic slow path (test/parity helper)';
+
 -- Function to convert a row to CBOR format
 CREATE OR REPLACE FUNCTION row_to_cbor(record)
 RETURNS bytea
@@ -55,6 +64,15 @@ LANGUAGE C STABLE STRICT;
 
 COMMENT ON FUNCTION rows_to_msgpack(anyarray) IS
 'Convert an array of PostgreSQL rows/records to MessagePack binary format (batch processing)';
+
+-- Test helper: force generic (slow) MessagePack batch path for parity validation
+CREATE OR REPLACE FUNCTION rows_to_msgpack_slow(anyarray)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'rows_to_msgpack_slow'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION rows_to_msgpack_slow(anyarray) IS
+'Convert an array of PostgreSQL rows/records to MessagePack using generic slow path (test/parity helper)';
 
 -- Function to convert an array of rows to CBOR format
 CREATE OR REPLACE FUNCTION rows_to_cbor(anyarray)

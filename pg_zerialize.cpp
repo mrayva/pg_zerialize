@@ -54,22 +54,26 @@ extern "C" {
     // Single record functions
     Datum row_to_flexbuffers(PG_FUNCTION_ARGS);
     Datum row_to_msgpack(PG_FUNCTION_ARGS);
+    Datum row_to_msgpack_slow(PG_FUNCTION_ARGS);
     Datum row_to_cbor(PG_FUNCTION_ARGS);
     Datum row_to_zera(PG_FUNCTION_ARGS);
 
     // Batch processing functions
     Datum rows_to_flexbuffers(PG_FUNCTION_ARGS);
     Datum rows_to_msgpack(PG_FUNCTION_ARGS);
+    Datum rows_to_msgpack_slow(PG_FUNCTION_ARGS);
     Datum rows_to_cbor(PG_FUNCTION_ARGS);
     Datum rows_to_zera(PG_FUNCTION_ARGS);
 
     PG_FUNCTION_INFO_V1(row_to_flexbuffers);
     PG_FUNCTION_INFO_V1(row_to_msgpack);
+    PG_FUNCTION_INFO_V1(row_to_msgpack_slow);
     PG_FUNCTION_INFO_V1(row_to_cbor);
     PG_FUNCTION_INFO_V1(row_to_zera);
 
     PG_FUNCTION_INFO_V1(rows_to_flexbuffers);
     PG_FUNCTION_INFO_V1(rows_to_msgpack);
+    PG_FUNCTION_INFO_V1(rows_to_msgpack_slow);
     PG_FUNCTION_INFO_V1(rows_to_cbor);
     PG_FUNCTION_INFO_V1(rows_to_zera);
 }
@@ -2318,6 +2322,31 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
     return nullptr;
 }
 
+template<typename Protocol>
+static bytea* tuple_to_binary_slow(HeapTupleHeader rec)
+{
+    try {
+        z::dyn::Value map = record_to_dynamic_map(rec);
+        z::ZBuffer buffer = z::serialize<Protocol>(map);
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("slow-path serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("slow-path serialization failed with unknown exception")));
+    }
+    return nullptr;
+}
+
 /*
  * Generic helper function to convert array of PostgreSQL tuples to binary format
  * This is the batch processing version for improved performance
@@ -2441,6 +2470,82 @@ static bytea* array_to_binary(ArrayType* arr)
     return nullptr;
 }
 
+template<typename Protocol>
+static bytea* array_to_binary_slow(ArrayType* arr)
+{
+    Oid element_type = ARR_ELEMTYPE(arr);
+    int ndim = ARR_NDIM(arr);
+
+    if (ndim == 0 || ArrayGetNItems(ndim, ARR_DIMS(arr)) == 0) {
+        z::ZBuffer buffer = z::serialize<Protocol>(z::dyn::Value::array(z::dyn::Value::Array()));
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    }
+
+    if (ndim > 1) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("multidimensional arrays not supported for batch serialization")));
+    }
+
+    if (element_type != RECORDOID && get_typtype(element_type) != TYPTYPE_COMPOSITE) {
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("batch serialization requires an array of composite records"),
+                 errdetail("Got array element type OID %u.", element_type)));
+    }
+
+    int16 typlen;
+    bool typbyval;
+    char typalign;
+    get_typlenbyvalalign(element_type, &typlen, &typbyval, &typalign);
+
+    Datum* elements;
+    bool* nulls;
+    int nitems;
+    deconstruct_array(arr, element_type, typlen, typbyval, typalign, &elements, &nulls, &nitems);
+
+    z::dyn::Value::Array result_array;
+    result_array.reserve(nitems);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            result_array.push_back(z::dyn::Value());
+        } else {
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+            result_array.push_back(record_to_dynamic_map(rec));
+        }
+    }
+
+    pfree(elements);
+    pfree(nulls);
+
+    try {
+        z::ZBuffer buffer = z::serialize<Protocol>(z::dyn::Value::array(std::move(result_array)));
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("slow-path batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("slow-path batch serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
 /*
  * Single record serialization functions
  */
@@ -2478,6 +2583,21 @@ row_to_msgpack(PG_FUNCTION_ARGS)
     // Convert to MessagePack
     result = tuple_to_binary<z::MsgPack>(rec);
 
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * row_to_msgpack_slow - Convert PostgreSQL record to MessagePack via generic dynamic path
+ * Useful for parity/correctness testing against fast path.
+ */
+extern "C" Datum
+row_to_msgpack_slow(PG_FUNCTION_ARGS)
+{
+    HeapTupleHeader rec;
+    bytea* result;
+
+    rec = PG_GETARG_HEAPTUPLEHEADER(0);
+    result = tuple_to_binary_slow<z::MsgPack>(rec);
     PG_RETURN_BYTEA_P(result);
 }
 
@@ -2554,6 +2674,21 @@ rows_to_msgpack(PG_FUNCTION_ARGS)
     // Convert to MessagePack array
     result = array_to_binary<z::MsgPack>(arr);
 
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * rows_to_msgpack_slow - Convert array of records via generic dynamic path
+ * Useful for parity/correctness testing against fast path.
+ */
+extern "C" Datum
+rows_to_msgpack_slow(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr;
+    bytea* result;
+
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+    result = array_to_binary_slow<z::MsgPack>(arr);
     PG_RETURN_BYTEA_P(result);
 }
 

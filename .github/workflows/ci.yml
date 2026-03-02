@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            lld \
+            llvm-dev \
+            libflatbuffers-dev \
+            postgresql \
+            postgresql-server-dev-all
+
+      - name: Start PostgreSQL
+        run: |
+          sudo service postgresql start
+          sudo -u postgres createuser -s "$USER" || true
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Install extension
+        run: sudo make install
+
+      - name: PGXS regression tests
+        run: make installcheck
+
+      - name: Comprehensive SQL suite
+        run: psql -d postgres -v ON_ERROR_STOP=1 -f test_pg_zerialize.sql
+
+      - name: Quick isolated microbench sanity
+        run: RUNS=1 WARMUP=0 PROTOCOLS="msgpack" PGDATABASE=postgres ./bench/run_microbench_isolated.sh

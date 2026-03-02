@@ -1,0 +1,69 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+
+CREATE TYPE pgz_parity_narrow AS (
+    id int,
+    name text,
+    active bool
+);
+
+CREATE TYPE pgz_parity_wide AS (
+    i0 int,
+    i1 int,
+    i2 int,
+    i3 int,
+    t0 text,
+    t1 text,
+    b0 bool,
+    n0 numeric,
+    d0 date,
+    ts0 timestamp,
+    j0 jsonb,
+    ba0 bytea,
+    a0 int[]
+);
+
+SELECT row_to_msgpack(ROW(1, 'alice', true)::pgz_parity_narrow)
+       = row_to_msgpack_slow(ROW(1, 'alice', true)::pgz_parity_narrow) AS narrow_equal;
+
+SELECT row_to_msgpack(ROW(2, NULL::text, NULL::bool)::pgz_parity_narrow)
+       = row_to_msgpack_slow(ROW(2, NULL::text, NULL::bool)::pgz_parity_narrow) AS narrow_null_equal;
+
+SELECT row_to_msgpack(
+           ROW(10, 11, 12, 13,
+               't0', NULL::text,
+               true,
+               1234.567::numeric,
+               DATE '2025-01-15',
+               TIMESTAMP '2025-01-15 10:30:00',
+               '{"k":1}'::jsonb,
+               decode('DEADBEEF','hex')::bytea,
+               ARRAY[1,2,NULL,4]::int[]
+           )::pgz_parity_wide)
+       = row_to_msgpack_slow(
+           ROW(10, 11, 12, 13,
+               't0', NULL::text,
+               true,
+               1234.567::numeric,
+               DATE '2025-01-15',
+               TIMESTAMP '2025-01-15 10:30:00',
+               '{"k":1}'::jsonb,
+               decode('DEADBEEF','hex')::bytea,
+               ARRAY[1,2,NULL,4]::int[]
+           )::pgz_parity_wide) AS wide_equal;
+
+SELECT rows_to_msgpack(ARRAY[
+           ROW(1, 'a', true)::pgz_parity_narrow,
+           ROW(2, NULL::text, false)::pgz_parity_narrow,
+           NULL::pgz_parity_narrow
+       ])
+       = rows_to_msgpack_slow(ARRAY[
+           ROW(1, 'a', true)::pgz_parity_narrow,
+           ROW(2, NULL::text, false)::pgz_parity_narrow,
+           NULL::pgz_parity_narrow
+       ]) AS batch_equal;
+
+DROP TYPE pgz_parity_wide;
+DROP TYPE pgz_parity_narrow;
+DROP EXTENSION pg_zerialize;
