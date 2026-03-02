@@ -128,6 +128,7 @@ struct CachedColumn {
     int attnum;
     std::string name;
     std::vector<uint8_t> msgpack_key_encoded;
+    std::span<const uint8_t> msgpack_key_view;
     std::vector<uint8_t> zera_key_encoded;
     MsgpackScalarWriterFn msgpack_scalar_writer;
     MsgpackArrayElemWriterFn msgpack_array_elem_writer;
@@ -144,6 +145,7 @@ struct CachedColumn {
 struct CachedSchema {
     TupleDesc tupdesc;
     std::vector<CachedColumn> columns;
+    std::vector<uint8_t> msgpack_map_header_encoded;
     bool use_deform_access;
     bool msgpack_fast_supported;
     bool cbor_fast_supported;
@@ -155,6 +157,7 @@ static bool is_msgpack_fast_kind(ConverterKind kind);
 static bool is_msgpack_fast_array_element_kind(ConverterKind kind);
 static bool is_msgpack_fast_column(const CachedColumn& col);
 static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key);
+static std::vector<uint8_t> encode_msgpack_map_header(size_t n);
 static std::vector<uint8_t> encode_zera_key(std::string_view key);
 static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind);
 static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind kind);
@@ -304,6 +307,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         col.attnum = i + 1;
         col.name = std::string(NameStr(att->attname));
         col.msgpack_key_encoded = encode_msgpack_string_key(col.name);
+        col.msgpack_key_view = std::span<const uint8_t>();
         col.zera_key_encoded = encode_zera_key(col.name);
         col.msgpack_scalar_writer = nullptr;
         col.msgpack_array_elem_writer = nullptr;
@@ -342,8 +346,10 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         }
 
         schema.columns.push_back(std::move(col));
+        schema.columns.back().msgpack_key_view = schema.columns.back().msgpack_key_encoded;
     }
 
+    schema.msgpack_map_header_encoded = encode_msgpack_map_header(schema.columns.size());
     schema.use_deform_access = schema.columns.size() >= kHybridHeapDeformThreshold;
 
     auto [inserted_it, inserted] = schema_cache.emplace(key, std::move(schema));
@@ -696,6 +702,38 @@ static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key)
     return out;
 }
 
+static std::vector<uint8_t> encode_msgpack_map_header(size_t n)
+{
+    std::vector<uint8_t> out;
+    if (n <= 15u) {
+        out.reserve(1);
+        out.push_back(static_cast<uint8_t>(0x80u | static_cast<uint8_t>(n)));
+        return out;
+    }
+
+    if (n <= 0xFFFFu) {
+        out.reserve(3);
+        out.push_back(0xDEu);
+        out.push_back(static_cast<uint8_t>((n >> 8) & 0xFFu));
+        out.push_back(static_cast<uint8_t>(n & 0xFFu));
+        return out;
+    }
+
+    if (n <= 0xFFFFFFFFu) {
+        out.reserve(5);
+        out.push_back(0xDFu);
+        out.push_back(static_cast<uint8_t>((n >> 24) & 0xFFu));
+        out.push_back(static_cast<uint8_t>((n >> 16) & 0xFFu));
+        out.push_back(static_cast<uint8_t>((n >> 8) & 0xFFu));
+        out.push_back(static_cast<uint8_t>(n & 0xFFu));
+        return out;
+    }
+
+    ereport(ERROR,
+            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+             errmsg("map field count exceeds MessagePack limits")));
+}
+
 static std::vector<uint8_t> encode_zera_key(std::string_view key)
 {
     if (key.size() > 0xFFFFu) {
@@ -1028,12 +1066,16 @@ static inline void msgpack_write_record_map(
     tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
     tuple.t_data = rec;
 
-    writer.begin_map(schema.columns.size());
+    if (schema.columns.size() > 15) {
+        writer.begin_map_preencoded(schema.msgpack_map_header_encoded);
+    } else {
+        writer.begin_map(schema.columns.size());
+    }
     if (!schema.use_deform_access) {
         for (const CachedColumn& col : schema.columns) {
             bool isnull;
             Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-            writer.key_preencoded(col.msgpack_key_encoded);
+            writer.key_preencoded(col.msgpack_key_view);
             col.msgpack_scalar_writer(writer, col, value, isnull);
         }
     } else {
@@ -1042,7 +1084,7 @@ static inline void msgpack_write_record_map(
         heap_deform_tuple(&tuple, schema.tupdesc, scratch->values, scratch->nulls);
         for (const CachedColumn& col : schema.columns) {
             const int idx = col.attnum - 1;
-            writer.key_preencoded(col.msgpack_key_encoded);
+            writer.key_preencoded(col.msgpack_key_view);
             col.msgpack_scalar_writer(writer, col, scratch->values[idx], scratch->nulls[idx]);
         }
     }

@@ -552,6 +552,7 @@ public:
 
     void begin_map(std::size_t n)   { msgpack_pack_map(&pk_, n); }
     void end_map()                  { /* no-op */ }
+    void begin_map_preencoded(std::span<const uint8_t> encoded_header) { rs_->write_raw(encoded_header); }
 
     void key(std::string_view k)    { string(k); }
     void key_preencoded(std::span<const uint8_t> encoded_key) { rs_->write_raw(encoded_key); }
