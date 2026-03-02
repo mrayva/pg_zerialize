@@ -17,7 +17,9 @@ namespace flex {
 // ========================== Writer (Serializer) ===============================
 
 struct RootSerializer {
-    ::flexbuffers::Builder fbb;
+    // Disable key/string sharing to reduce per-key hash/pool overhead in
+    // high-throughput map serialization workloads.
+    ::flexbuffers::Builder fbb{256, ::flexbuffers::BUILDER_FLAG_NONE};
     bool finished_  = false;
     bool wrote_root_ = false;
 
