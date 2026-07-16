@@ -527,7 +527,7 @@ namespace debugging {
     }
 
     // Convenience overload for span (so you can pass k.buf() directly)
-    static void dump_flex(std::span<const uint8_t> bytes) {
+    [[maybe_unused]] static void dump_flex(std::span<const uint8_t> bytes) {
         dump_flex(bytes.data(), bytes.size());
     }
 

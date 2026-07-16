@@ -252,16 +252,19 @@ public:
     }
     bool isFloat() const { if (view_.empty()) return false; uint8_t m=view_[0]; return m==0xca||m==0xcb; }
     bool isString()const {
-        if (view_.empty()) return false; uint8_t m=view_[0];
+        if (view_.empty()) return false;
+        uint8_t m=view_[0];
         return ((m & 0xe0) == 0xa0) || m==0xd9 || m==0xda || m==0xdb;
     }
     bool isBlob()  const { if (view_.empty()) return false; uint8_t m=view_[0]; return m==0xc4||m==0xc5||m==0xc6; }
     bool isArray() const {
-        if (view_.empty()) return false; uint8_t m=view_[0];
+        if (view_.empty()) return false;
+        uint8_t m=view_[0];
         return ((m & 0xf0) == 0x90) || m==0xdc || m==0xdd;
     }
     bool isMap()   const {
-        if (view_.empty()) return false; uint8_t m=view_[0];
+        if (view_.empty()) return false;
+        uint8_t m=view_[0];
         return ((m & 0xf0) == 0x80) || m==0xde || m==0xdf;
     }
 

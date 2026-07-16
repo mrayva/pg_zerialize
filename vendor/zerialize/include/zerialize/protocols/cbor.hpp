@@ -409,7 +409,10 @@ public:
                         for(;;){ if(b[q]==0xFF) return q+1; q=skip(b,q); q=skip(b,q);} 
                     case 6: return skip(b,q);
                     case 7:
-                        if (h.addl==25) return q+2; if (h.addl==26) return q+4; if (h.addl==27) return q+8; return q;
+                        if (h.addl==25) return q+2;
+                        if (h.addl==26) return q+4;
+                        if (h.addl==27) return q+8;
+                        return q;
                 }
                 return q;
             }

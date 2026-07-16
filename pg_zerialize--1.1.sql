@@ -64,7 +64,6 @@ RETURNS bytea
 AS 'MODULE_PATHNAME', 'msgpack_object_agg_final'
 LANGUAGE C;
 
-DROP AGGREGATE IF EXISTS msgpack_agg(anyelement);
 CREATE AGGREGATE msgpack_agg(anyelement)
 (
     SFUNC = jsonb_agg_transfn,
@@ -75,7 +74,6 @@ CREATE AGGREGATE msgpack_agg(anyelement)
 COMMENT ON AGGREGATE msgpack_agg(anyelement) IS
 'Aggregate values into a MessagePack array (json_agg-style)';
 
-DROP AGGREGATE IF EXISTS msgpack_object_agg(text, anyelement);
 CREATE AGGREGATE msgpack_object_agg(text, anyelement)
 (
     SFUNC = jsonb_object_agg_transfn,

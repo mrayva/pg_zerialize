@@ -11,6 +11,7 @@ extern "C" {
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/array.h"
 #include "utils/date.h"
@@ -220,6 +221,9 @@ static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
 
 static inline void clear_tupdesc_cache()
 {
+    for (auto& entry : schema_cache) {
+        FreeTupleDesc(entry.second.tupdesc);
+    }
     schema_cache.clear();
 }
 
@@ -308,20 +312,22 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 
     // Not in cache, look it up
     TupleDesc tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
-    TupleDesc blessed = BlessTupleDesc(tupdesc);
+    MemoryContext old_context = MemoryContextSwitchTo(TopMemoryContext);
+    TupleDesc cached_tupdesc = CreateTupleDescCopy(tupdesc);
+    MemoryContextSwitchTo(old_context);
     ReleaseTupleDesc(tupdesc);
 
     CachedSchema schema;
-    schema.tupdesc = blessed;
+    schema.tupdesc = cached_tupdesc;
     schema.use_deform_access = false;
     schema.msgpack_fast_supported = true;
     schema.cbor_fast_supported = true;
     schema.zera_fast_supported = true;
     schema.flex_fast_supported = true;
-    schema.columns.reserve(blessed->natts);
+    schema.columns.reserve(cached_tupdesc->natts);
 
-    for (int i = 0; i < blessed->natts; i++) {
-        Form_pg_attribute att = TupleDescAttr(blessed, i);
+    for (int i = 0; i < cached_tupdesc->natts; i++) {
+        Form_pg_attribute att = TupleDescAttr(cached_tupdesc, i);
         if (att->attisdropped) {
             continue;
         }

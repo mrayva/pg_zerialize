@@ -1,4 +1,4 @@
--- pg_zerialize extension SQL definitions
+-- pg_zerialize extension SQL definitions, version 1.2
 
 -- Function to convert a row to FlexBuffers format
 CREATE OR REPLACE FUNCTION row_to_flexbuffers(record)
@@ -18,6 +18,7 @@ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION row_to_msgpack(record) IS
 'Convert a PostgreSQL row/record to MessagePack binary format';
 
+-- Test helper: force generic (slow) MessagePack path for parity validation
 CREATE OR REPLACE FUNCTION row_to_msgpack_slow(record)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'row_to_msgpack_slow'
@@ -26,6 +27,7 @@ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION row_to_msgpack_slow(record) IS
 'Convert a PostgreSQL row/record to MessagePack using generic slow path (test/parity helper)';
 
+-- Convert nested jsonb to nested MessagePack
 CREATE OR REPLACE FUNCTION msgpack_from_jsonb(jsonb)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'msgpack_from_jsonb'
@@ -34,6 +36,7 @@ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION msgpack_from_jsonb(jsonb) IS
 'Convert jsonb value (including nested objects/arrays) to MessagePack';
 
+-- SQL-builder style wrappers
 CREATE OR REPLACE FUNCTION msgpack_build_object(VARIADIC "any")
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'msgpack_build_object'
@@ -50,6 +53,7 @@ LANGUAGE C STABLE;
 COMMENT ON FUNCTION msgpack_build_array(VARIADIC "any") IS
 'Build a MessagePack array from variadic values (json_build_array-style)';
 
+-- Aggregate finalizers
 CREATE OR REPLACE FUNCTION msgpack_agg_final(internal)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'msgpack_agg_final'
@@ -118,6 +122,7 @@ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION rows_to_msgpack(anyarray) IS
 'Convert an array of PostgreSQL rows/records to MessagePack binary format (batch processing)';
 
+-- Test helper: force generic (slow) MessagePack batch path for parity validation
 CREATE OR REPLACE FUNCTION rows_to_msgpack_slow(anyarray)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'rows_to_msgpack_slow'

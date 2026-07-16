@@ -1,26 +1,27 @@
 # pg_zerialize
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12%2B-blue.svg)](https://www.postgresql.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18%20tested-blue.svg)](https://www.postgresql.org/)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 
 PostgreSQL extension for converting rows to efficient binary formats using the [zerialize](https://github.com/colinator/zerialize) library.
 
 **21% smaller than JSON** with MessagePack/CBOR formats.
 
-## Status: All Formats Complete! 🎉
+## Status
 
-✅ **FlexBuffers** - Fully implemented
-✅ **MessagePack** - Fully implemented
-✅ **CBOR** - Fully implemented
-✅ **ZERA** - Fully implemented
+Row and batch serialization are implemented for FlexBuffers, MessagePack,
+CBOR, and ZERA. MessagePack also provides JSONB-based nested builders and
+aggregates.
 
 ## Requirements
 
-- PostgreSQL 12+ (with development headers)
+- PostgreSQL 18 (tested); older supported PostgreSQL branches are intended but
+  are not currently exercised in CI
 - C++20 compatible compiler (GCC 10+, Clang 10+)
 - FlatBuffers library (`libflatbuffers-dev`)
-- zerialize library (header-only, included in `vendor/`)
+- zerialize library (header-only, included in `vendor/`; see
+  `vendor/zerialize/UPSTREAM.md` for provenance and local changes)
 
 ## Building
 
@@ -32,7 +33,7 @@ sudo make install
 ## Testing
 
 ```bash
-# PGXS regression tests (core/parity/cache/determinism)
+# PGXS regression tests (core/parity/cache/determinism/semantics/upgrade)
 make installcheck
 
 # Comprehensive manual suite
@@ -49,6 +50,23 @@ SQL-builder style MessagePack APIs are available:
 - `msgpack_build_array(VARIADIC "any")`
 - `msgpack_agg(anyelement)`
 - `msgpack_object_agg(text, anyelement)`
+
+## Wire Semantics And Current Limitations
+
+- Integral `numeric` values that fit in `int64` are encoded exactly. Other
+  `numeric` values are encoded as binary `float64` and can lose decimal
+  precision.
+- Date values use PostgreSQL days since 2000-01-01. Timestamp values use
+  PostgreSQL microseconds since 2000-01-01.
+- A JSONB column serialized through `row_to_*` is a binary PostgreSQL JSONB
+  payload, not a recursively converted protocol object. For portable nested
+  MessagePack, construct one JSONB tree and call `msgpack_from_jsonb`.
+- Passing the `bytea` result of one MessagePack builder into another builder
+  encodes it as a binary blob; it does not splice the inner MessagePack value.
+- Multidimensional PostgreSQL arrays are not represented as nested protocol
+  arrays. Batch serialization rejects them, while generic row serialization
+  falls back to PostgreSQL's text representation.
+- Deserialization functions are not yet provided.
 
 ## Microbenchmark
 
@@ -136,10 +154,11 @@ All major performance optimizations complete! **Combined speedup: ~3-5x faster t
 3. ✅ ~~Implement CBOR support~~
 4. ✅ ~~Implement ZERA support~~
 5. ✅ ~~Add array support for PostgreSQL arrays~~
-6. ✅ ~~Add proper NUMERIC/DECIMAL handling~~
+6. ✅ ~~Add native numeric encoding (int64/float64)~~
 7. ✅ ~~Schema caching optimization~~
 8. ✅ ~~Batch processing for multiple rows~~
 9. ✅ ~~Buffer pre-allocation optimization~~
 10. Add nested composite type support
-11. Add date/timestamp types
+11. ✅ ~~Add date/timestamp types~~
 12. Add deserialization functions
+13. Add an exact decimal wire representation for arbitrary `numeric` values

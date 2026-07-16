@@ -4,8 +4,9 @@ MODULE_big = pg_zerialize
 OBJS = pg_zerialize.o
 
 EXTENSION = pg_zerialize
-DATA = pg_zerialize--1.0.sql pg_zerialize--1.1.sql pg_zerialize--1.0--1.1.sql
-REGRESS = pg_zerialize pg_zerialize_core pg_zerialize_parity pg_zerialize_cache pg_zerialize_deterministic pg_zerialize_builders pg_zerialize_builders_semantics pg_zerialize_semantics_exhaustive
+DATA = pg_zerialize--1.0.sql pg_zerialize--1.1.sql pg_zerialize--1.2.sql \
+	pg_zerialize--1.0--1.1.sql pg_zerialize--1.1--1.2.sql
+REGRESS = pg_zerialize pg_zerialize_core pg_zerialize_parity pg_zerialize_cache pg_zerialize_deterministic pg_zerialize_builders pg_zerialize_builders_semantics pg_zerialize_semantics_exhaustive pg_zerialize_upgrade
 
 # C++ compilation flags
 PG_CPPFLAGS = -std=c++20 -fPIC -Ivendor/zerialize/include
@@ -15,16 +16,17 @@ SHLIB_LINK = -lstdc++ -lflatbuffers
 CC = g++
 CXX = g++
 
-# Override CFLAGS to remove gcc-specific flags that don't work with g++
-override CFLAGS :=
-
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-# Override the implicit rule to use C++ compiler
+# PGXS links MODULE_big with the C driver; avoid passing C-only warning flags
+# from PostgreSQL's build into that link. C++ compilation uses CXXFLAGS below.
+override CFLAGS :=
+
+# Compile C++ with PostgreSQL's release, warning, and hardening flags.
 %.o: %.cpp
-	$(CXX) $(PG_CPPFLAGS) $(CPPFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 .PHONY: bench bench-quick bench-isolated bench-isolated-quick
 
