@@ -28,6 +28,8 @@ override CFLAGS :=
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
+pg_zerialize.o pg_zerialize.bc: vendor/zerialize/include/zerialize/protocols/msgpack.hpp
+
 .PHONY: bench bench-quick bench-isolated bench-isolated-quick bench-numeric-float semantic-check
 
 semantic-check:

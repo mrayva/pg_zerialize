@@ -552,6 +552,19 @@ public:
 class MsgPackSerializer {
     msgpack_packer& pk_;
     MsgPackRootSerializer* rs_;
+
+    static void store_be16(uint8_t* out, uint16_t value) {
+        out[0] = static_cast<uint8_t>(value >> 8);
+        out[1] = static_cast<uint8_t>(value);
+    }
+
+    static void store_be32(uint8_t* out, uint32_t value) {
+        out[0] = static_cast<uint8_t>(value >> 24);
+        out[1] = static_cast<uint8_t>(value >> 16);
+        out[2] = static_cast<uint8_t>(value >> 8);
+        out[3] = static_cast<uint8_t>(value);
+    }
+
 public:
     explicit MsgPackSerializer(MsgPackRootSerializer& rs) : pk_(rs.pk), rs_(&rs) {}
 
@@ -562,13 +575,50 @@ public:
     void uint64(std::uint64_t v){ msgpack_pack_uint64(&pk_, v); }
     void double_(double v)      { msgpack_pack_double(&pk_, v); }
     void string(std::string_view sv) {
-        msgpack_pack_str(&pk_, sv.size());
-        msgpack_pack_str_body(&pk_, sv.data(), sv.size());
+        std::size_t len = sv.size();
+        uint8_t* begin = rs_->reserve_raw_append(len + 5);
+        uint8_t* out = begin;
+        if (len < 32) {
+            *out++ = static_cast<uint8_t>(0xa0 | len);
+        } else if (len < 256) {
+            *out++ = 0xd9;
+            *out++ = static_cast<uint8_t>(len);
+        } else if (len < 65536) {
+            *out++ = 0xda;
+            store_be16(out, static_cast<uint16_t>(len));
+            out += 2;
+        } else {
+            *out++ = 0xdb;
+            store_be32(out, static_cast<uint32_t>(len));
+            out += 4;
+        }
+        if (len > 0) {
+            std::memcpy(out, sv.data(), len);
+            out += len;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
     }
     void binary(std::span<const std::byte> b) {
-        auto p = reinterpret_cast<const char*>(b.data());
-        msgpack_pack_bin(&pk_, b.size());
-        msgpack_pack_bin_body(&pk_, p, b.size());
+        std::size_t len = b.size();
+        uint8_t* begin = rs_->reserve_raw_append(len + 5);
+        uint8_t* out = begin;
+        if (len < 256) {
+            *out++ = 0xc4;
+            *out++ = static_cast<uint8_t>(len);
+        } else if (len < 65536) {
+            *out++ = 0xc5;
+            store_be16(out, static_cast<uint16_t>(len));
+            out += 2;
+        } else {
+            *out++ = 0xc6;
+            store_be32(out, static_cast<uint32_t>(len));
+            out += 4;
+        }
+        if (len > 0) {
+            std::memcpy(out, b.data(), len);
+            out += len;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
     }
 
     // arrays/maps (MsgPack needs sizes up-front)
