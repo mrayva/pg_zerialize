@@ -26,8 +26,11 @@ CREATE TYPE pgz_parity_interval AS (
     values interval[]
 );
 CREATE TYPE pgz_parity_fixed_arrays AS (
+    smallints smallint[],
     ints integer[],
+    bigints bigint[],
     bools boolean[],
+    reals real[],
     floats double precision[],
     uuids uuid[],
     names name[],
@@ -113,7 +116,10 @@ BEGIN
     END LOOP;
 
     IF row_to_msgpack(ROW(
-           ARRAY[-2147483647, 0, 2147483647], ARRAY[false, true],
+           ARRAY['-32768'::smallint, 0, 32767],
+           ARRAY[-2147483647, 0, 2147483647],
+           ARRAY['-9223372036854775808'::bigint, 0, '9223372036854775807'::bigint],
+           ARRAY[false, true], ARRAY['-Infinity'::real, 0.0, 'Infinity'::real],
            ARRAY['-Infinity'::float8, 0.0, 'Infinity'::float8],
            ARRAY['00000000-0000-0000-0000-000000000000'::uuid,
                  'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid],
@@ -123,7 +129,10 @@ BEGIN
            ARRAY['-infinity'::interval, '0'::interval, 'infinity'::interval]
        )::pgz_parity_fixed_arrays)
        <> row_to_msgpack_slow(ROW(
-           ARRAY[-2147483647, 0, 2147483647], ARRAY[false, true],
+           ARRAY['-32768'::smallint, 0, 32767],
+           ARRAY[-2147483647, 0, 2147483647],
+           ARRAY['-9223372036854775808'::bigint, 0, '9223372036854775807'::bigint],
+           ARRAY[false, true], ARRAY['-Infinity'::real, 0.0, 'Infinity'::real],
            ARRAY['-Infinity'::float8, 0.0, 'Infinity'::float8],
            ARRAY['00000000-0000-0000-0000-000000000000'::uuid,
                  'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid],

@@ -50,6 +50,7 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <cmath>
 #include <system_error>
 #include <charconv>
+#include <bit>
 #include <fast_float/fast_float.h>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
@@ -1440,6 +1441,106 @@ static inline void msgpack_write_array_no_nulls(
     }
 }
 
+static inline void msgpack_store_be16(uint8_t* out, uint16_t value)
+{
+    out[0] = static_cast<uint8_t>(value >> 8);
+    out[1] = static_cast<uint8_t>(value);
+}
+
+static inline void msgpack_store_be32(uint8_t* out, uint32_t value)
+{
+    out[0] = static_cast<uint8_t>(value >> 24);
+    out[1] = static_cast<uint8_t>(value >> 16);
+    out[2] = static_cast<uint8_t>(value >> 8);
+    out[3] = static_cast<uint8_t>(value);
+}
+
+static inline void msgpack_store_be64(uint8_t* out, uint64_t value)
+{
+    msgpack_store_be32(out, static_cast<uint32_t>(value >> 32));
+    msgpack_store_be32(out + 4, static_cast<uint32_t>(value));
+}
+
+static inline uint8_t* msgpack_encode_int64(uint8_t* out, int64_t value)
+{
+    if (value >= 0) {
+        uint64_t unsigned_value = static_cast<uint64_t>(value);
+        if (unsigned_value <= 0x7f) {
+            *out++ = static_cast<uint8_t>(unsigned_value);
+        } else if (unsigned_value <= UINT8_MAX) {
+            *out++ = 0xcc;
+            *out++ = static_cast<uint8_t>(unsigned_value);
+        } else if (unsigned_value <= UINT16_MAX) {
+            *out++ = 0xcd;
+            msgpack_store_be16(out, static_cast<uint16_t>(unsigned_value));
+            out += 2;
+        } else if (unsigned_value <= UINT32_MAX) {
+            *out++ = 0xce;
+            msgpack_store_be32(out, static_cast<uint32_t>(unsigned_value));
+            out += 4;
+        } else {
+            *out++ = 0xcf;
+            msgpack_store_be64(out, unsigned_value);
+            out += 8;
+        }
+    } else if (value >= -32) {
+        *out++ = static_cast<uint8_t>(value);
+    } else if (value >= INT8_MIN) {
+        *out++ = 0xd0;
+        *out++ = static_cast<uint8_t>(value);
+    } else if (value >= INT16_MIN) {
+        *out++ = 0xd1;
+        msgpack_store_be16(out, static_cast<uint16_t>(value));
+        out += 2;
+    } else if (value >= INT32_MIN) {
+        *out++ = 0xd2;
+        msgpack_store_be32(out, static_cast<uint32_t>(value));
+        out += 4;
+    } else {
+        *out++ = 0xd3;
+        msgpack_store_be64(out, static_cast<uint64_t>(value));
+        out += 8;
+    }
+    return out;
+}
+
+template <typename ValueT>
+static inline void msgpack_write_int64_sequence(
+    z::MsgPackSerializer& writer, const ValueT* values, int nitems)
+{
+    uint8_t* begin = writer.reserve_raw_append(static_cast<size_t>(nitems) * 9);
+    uint8_t* out = begin;
+    for (int i = 0; i < nitems; i++) {
+        out = msgpack_encode_int64(out, static_cast<int64_t>(values[i]));
+    }
+    writer.commit_raw_append(static_cast<size_t>(out - begin));
+}
+
+template <typename ValueT>
+static inline void msgpack_write_double_sequence(
+    z::MsgPackSerializer& writer, const ValueT* values, int nitems)
+{
+    uint8_t* begin = writer.reserve_raw_append(static_cast<size_t>(nitems) * 9);
+    uint8_t* out = begin;
+    for (int i = 0; i < nitems; i++) {
+        *out++ = 0xcb;
+        uint64_t bits = std::bit_cast<uint64_t>(static_cast<double>(values[i]));
+        msgpack_store_be64(out, bits);
+        out += 8;
+    }
+    writer.commit_raw_append(static_cast<size_t>(out - begin));
+}
+
+static inline void msgpack_write_bool_sequence(
+    z::MsgPackSerializer& writer, const bool* values, int nitems)
+{
+    uint8_t* begin = writer.reserve_raw_append(static_cast<size_t>(nitems));
+    for (int i = 0; i < nitems; i++) {
+        begin[i] = values[i] ? 0xc3 : 0xc2;
+    }
+    writer.commit_raw_append(static_cast<size_t>(nitems));
+}
+
 static inline bool msgpack_write_fixed_array_no_nulls(
     z::MsgPackSerializer& writer,
     ConverterKind elem_kind,
@@ -1472,37 +1573,37 @@ static inline bool msgpack_write_fixed_array_no_nulls(
         case ConverterKind::Int2:
         {
             const int16* values = reinterpret_cast<const int16*>(data);
-            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            msgpack_write_int64_sequence(writer, values, nitems);
             break;
         }
         case ConverterKind::Int4:
         {
             const int32* values = reinterpret_cast<const int32*>(data);
-            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            msgpack_write_int64_sequence(writer, values, nitems);
             break;
         }
         case ConverterKind::Int8:
         {
             const int64* values = reinterpret_cast<const int64*>(data);
-            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            msgpack_write_int64_sequence(writer, values, nitems);
             break;
         }
         case ConverterKind::Float4:
         {
             const float4* values = reinterpret_cast<const float4*>(data);
-            for (int i = 0; i < nitems; i++) writer.double_(values[i]);
+            msgpack_write_double_sequence(writer, values, nitems);
             break;
         }
         case ConverterKind::Float8:
         {
             const float8* values = reinterpret_cast<const float8*>(data);
-            for (int i = 0; i < nitems; i++) writer.double_(values[i]);
+            msgpack_write_double_sequence(writer, values, nitems);
             break;
         }
         case ConverterKind::Bool:
         {
             const bool* values = reinterpret_cast<const bool*>(data);
-            for (int i = 0; i < nitems; i++) writer.boolean(values[i]);
+            msgpack_write_bool_sequence(writer, values, nitems);
             break;
         }
         case ConverterKind::Uuid:
@@ -1542,14 +1643,14 @@ static inline bool msgpack_write_fixed_array_no_nulls(
         case ConverterKind::Date:
         {
             const DateADT* values = reinterpret_cast<const DateADT*>(data);
-            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            msgpack_write_int64_sequence(writer, values, nitems);
             break;
         }
         case ConverterKind::Timestamp:
         case ConverterKind::Timestamptz:
         {
             const int64* values = reinterpret_cast<const int64*>(data);
-            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            msgpack_write_int64_sequence(writer, values, nitems);
             break;
         }
         default:

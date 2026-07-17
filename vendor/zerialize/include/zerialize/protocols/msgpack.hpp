@@ -518,11 +518,8 @@ public:
         return ZBuffer(d, n, ZBuffer::Deleters::Free);
     }
 
-    void write_raw(const uint8_t* data, std::size_t len) {
-        if (len == 0) return;
-
-        // Fast append path for frequent small key/header chunks.
-        std::size_t needed = sbuf.size + len;
+    uint8_t* reserve_raw_append(std::size_t max_len) {
+        std::size_t needed = sbuf.size + max_len;
         if (needed > sbuf.alloc) {
             std::size_t new_alloc = (sbuf.alloc > 0) ? sbuf.alloc : 256;
             while (new_alloc < needed) {
@@ -535,8 +532,16 @@ public:
             sbuf.data = new_data;
             sbuf.alloc = new_alloc;
         }
-        std::memcpy(sbuf.data + sbuf.size, data, len);
-        sbuf.size += len;
+        return reinterpret_cast<uint8_t*>(sbuf.data + sbuf.size);
+    }
+
+    void commit_raw_append(std::size_t len) { sbuf.size += len; }
+
+    void write_raw(const uint8_t* data, std::size_t len) {
+        if (len == 0) return;
+        uint8_t* out = reserve_raw_append(len);
+        std::memcpy(out, data, len);
+        commit_raw_append(len);
     }
 
     void write_raw(std::span<const uint8_t> bytes) {
@@ -578,6 +583,8 @@ public:
     void key(std::string_view k)    { string(k); }
     void key_preencoded(std::span<const uint8_t> encoded_key) { rs_->write_raw(encoded_key); }
     void key_preencoded(const uint8_t* data, std::size_t len) { rs_->write_raw(data, len); }
+    uint8_t* reserve_raw_append(std::size_t max_len) { return rs_->reserve_raw_append(max_len); }
+    void commit_raw_append(std::size_t len) { rs_->commit_raw_append(len); }
 };
 
 struct MsgPack {
