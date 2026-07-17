@@ -500,6 +500,20 @@ public:
 
 // ===== Writer (msgpack-c) =====================================================
 class MsgPackRootSerializer {
+    [[gnu::noinline]] void grow_raw_append(std::size_t max_len) {
+        std::size_t needed = sbuf.size + max_len;
+        std::size_t new_alloc = (sbuf.alloc > 0) ? sbuf.alloc : 256;
+        while (new_alloc < needed) {
+            new_alloc *= 2;
+        }
+        char* new_data = static_cast<char*>(std::realloc(sbuf.data, new_alloc));
+        if (new_data == nullptr) {
+            throw SerializationError("msgpack: failed to grow output buffer");
+        }
+        sbuf.data = new_data;
+        sbuf.alloc = new_alloc;
+    }
+
 public:
     msgpack_sbuffer sbuf{};
 
@@ -517,19 +531,9 @@ public:
         return ZBuffer(d, n, ZBuffer::Deleters::Free);
     }
 
-    uint8_t* reserve_raw_append(std::size_t max_len) {
-        std::size_t needed = sbuf.size + max_len;
-        if (needed > sbuf.alloc) {
-            std::size_t new_alloc = (sbuf.alloc > 0) ? sbuf.alloc : 256;
-            while (new_alloc < needed) {
-                new_alloc *= 2;
-            }
-            char* new_data = static_cast<char*>(std::realloc(sbuf.data, new_alloc));
-            if (new_data == nullptr) {
-                throw SerializationError("msgpack: failed to grow output buffer");
-            }
-            sbuf.data = new_data;
-            sbuf.alloc = new_alloc;
+    [[gnu::always_inline]] uint8_t* reserve_raw_append(std::size_t max_len) {
+        if (max_len > sbuf.alloc - sbuf.size) [[unlikely]] {
+            grow_raw_append(max_len);
         }
         return reinterpret_cast<uint8_t*>(sbuf.data + sbuf.size);
     }
