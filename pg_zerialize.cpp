@@ -1430,6 +1430,125 @@ static inline void msgpack_write_array_no_nulls(
     }
 }
 
+static inline bool msgpack_write_fixed_array_no_nulls(
+    z::MsgPackSerializer& writer,
+    ConverterKind elem_kind,
+    ArrayType* arr,
+    int nitems)
+{
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+        case ConverterKind::Int4:
+        case ConverterKind::Int8:
+        case ConverterKind::Float4:
+        case ConverterKind::Float8:
+        case ConverterKind::Bool:
+        case ConverterKind::Uuid:
+        case ConverterKind::NameText:
+        case ConverterKind::CharText:
+        case ConverterKind::EnumText:
+        case ConverterKind::IntervalText:
+        case ConverterKind::Date:
+        case ConverterKind::Timestamp:
+        case ConverterKind::Timestamptz:
+            break;
+        default:
+            return false;
+    }
+
+    const char* data = ARR_DATA_PTR(arr);
+    writer.begin_array(static_cast<size_t>(nitems));
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+        {
+            const int16* values = reinterpret_cast<const int16*>(data);
+            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            break;
+        }
+        case ConverterKind::Int4:
+        {
+            const int32* values = reinterpret_cast<const int32*>(data);
+            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            break;
+        }
+        case ConverterKind::Int8:
+        {
+            const int64* values = reinterpret_cast<const int64*>(data);
+            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            break;
+        }
+        case ConverterKind::Float4:
+        {
+            const float4* values = reinterpret_cast<const float4*>(data);
+            for (int i = 0; i < nitems; i++) writer.double_(values[i]);
+            break;
+        }
+        case ConverterKind::Float8:
+        {
+            const float8* values = reinterpret_cast<const float8*>(data);
+            for (int i = 0; i < nitems; i++) writer.double_(values[i]);
+            break;
+        }
+        case ConverterKind::Bool:
+        {
+            const bool* values = reinterpret_cast<const bool*>(data);
+            for (int i = 0; i < nitems; i++) writer.boolean(values[i]);
+            break;
+        }
+        case ConverterKind::Uuid:
+        {
+            const pg_uuid_t* values = reinterpret_cast<const pg_uuid_t*>(data);
+            for (int i = 0; i < nitems; i++) {
+                char out[36];
+                format_uuid(PointerGetDatum(&values[i]), out);
+                writer.string(std::string_view(out, sizeof(out)));
+            }
+            break;
+        }
+        case ConverterKind::NameText:
+        {
+            const NameData* values = reinterpret_cast<const NameData*>(data);
+            for (int i = 0; i < nitems; i++) writer.string(name_text_view(NameGetDatum(&values[i])));
+            break;
+        }
+        case ConverterKind::CharText:
+            for (int i = 0; i < nitems; i++) {
+                char ch = data[i];
+                writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            }
+            break;
+        case ConverterKind::EnumText:
+        {
+            const Oid* values = reinterpret_cast<const Oid*>(data);
+            for (int i = 0; i < nitems; i++) writer.string(enum_label_view(ObjectIdGetDatum(values[i])));
+            break;
+        }
+        case ConverterKind::IntervalText:
+        {
+            const Interval* values = reinterpret_cast<const Interval*>(data);
+            for (int i = 0; i < nitems; i++) write_interval_string(writer, PointerGetDatum(&values[i]));
+            break;
+        }
+        case ConverterKind::Date:
+        {
+            const DateADT* values = reinterpret_cast<const DateADT*>(data);
+            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            break;
+        }
+        case ConverterKind::Timestamp:
+        case ConverterKind::Timestamptz:
+        {
+            const int64* values = reinterpret_cast<const int64*>(data);
+            for (int i = 0; i < nitems; i++) writer.int64(values[i]);
+            break;
+        }
+        default:
+            pg_unreachable();
+    }
+    writer.end_array();
+    return true;
+}
+
 static inline void msgpack_write_array(
     z::MsgPackSerializer& writer,
     const CachedColumn& col,
@@ -1452,9 +1571,14 @@ static inline void msgpack_write_array(
         return;
     }
 
+    int nitems = ArrayGetNItems(ndim, ARR_DIMS(arr));
+    if (!ARR_HASNULL(arr) &&
+        msgpack_write_fixed_array_no_nulls(writer, col.array_element_kind, arr, nitems)) {
+        return;
+    }
+
     Datum* elements;
     bool* nulls;
-    int nitems;
     deconstruct_array(arr,
                       col.array_element_typid,
                       col.array_typlen,

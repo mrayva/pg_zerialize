@@ -25,6 +25,17 @@ CREATE TYPE pgz_parity_interval AS (
     value interval,
     values interval[]
 );
+CREATE TYPE pgz_parity_fixed_arrays AS (
+    ints integer[],
+    bools boolean[],
+    floats double precision[],
+    uuids uuid[],
+    names name[],
+    chars "char"[],
+    dates date[],
+    timestamps timestamp[],
+    intervals interval[]
+);
 SELECT row_to_msgpack(ROW(1, 'alice', true)::pgz_parity_narrow)
        = row_to_msgpack_slow(ROW(1, 'alice', true)::pgz_parity_narrow) AS narrow_equal;
  narrow_equal 
@@ -100,10 +111,34 @@ BEGIN
             END IF;
         END LOOP;
     END LOOP;
+
+    IF row_to_msgpack(ROW(
+           ARRAY[-2147483647, 0, 2147483647], ARRAY[false, true],
+           ARRAY['-Infinity'::float8, 0.0, 'Infinity'::float8],
+           ARRAY['00000000-0000-0000-0000-000000000000'::uuid,
+                 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid],
+           ARRAY['first'::name, 'second'::name], ARRAY['A'::"char", 'Z'::"char"],
+           ARRAY['2000-01-01'::date, '9999-12-31'::date],
+           ARRAY['2000-01-01'::timestamp, '2099-12-31 23:59:59.999999'::timestamp],
+           ARRAY['-infinity'::interval, '0'::interval, 'infinity'::interval]
+       )::pgz_parity_fixed_arrays)
+       <> row_to_msgpack_slow(ROW(
+           ARRAY[-2147483647, 0, 2147483647], ARRAY[false, true],
+           ARRAY['-Infinity'::float8, 0.0, 'Infinity'::float8],
+           ARRAY['00000000-0000-0000-0000-000000000000'::uuid,
+                 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid],
+           ARRAY['first'::name, 'second'::name], ARRAY['A'::"char", 'Z'::"char"],
+           ARRAY['2000-01-01'::date, '9999-12-31'::date],
+           ARRAY['2000-01-01'::timestamp, '2099-12-31 23:59:59.999999'::timestamp],
+           ARRAY['-infinity'::interval, '0'::interval, 'infinity'::interval]
+       )::pgz_parity_fixed_arrays) THEN
+        RAISE EXCEPTION 'fixed-width array fast/slow mismatch';
+    END IF;
 END
 $$;
 RESET intervalstyle;
 DROP TYPE pgz_parity_interval;
+DROP TYPE pgz_parity_fixed_arrays;
 DROP TYPE pgz_parity_wide;
 DROP TYPE pgz_parity_narrow;
 DROP EXTENSION pg_zerialize;
