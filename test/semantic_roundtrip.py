@@ -59,7 +59,24 @@ CREATE TYPE pg_temp.pgz_sem_arrays AS (
     ints integer[],
     texts text[],
     bools boolean[],
-    json_texts json[]
+    json_texts json[],
+    uuids uuid[],
+    statuses pg_temp.pgz_sem_status[],
+    names name[],
+    codes "char"[],
+    addresses inet[],
+    networks cidr[],
+    durations interval[]
+);
+
+CREATE TYPE pg_temp.pgz_sem_direct_arrays AS (
+    uuids uuid[],
+    statuses pg_temp.pgz_sem_status[],
+    names name[],
+    codes "char"[],
+    addresses inet[],
+    networks cidr[],
+    durations interval[]
 );
 
 CREATE TEMP TABLE pgz_sem_cases (
@@ -95,8 +112,25 @@ INSERT INTO pgz_sem_cases VALUES
             ARRAY[1, NULL, 3],
             ARRAY['a', NULL, U&'\03A9'],
             ARRAY[true, false, NULL],
-            ARRAY['{"id":1}'::json, NULL, '[true,false]'::json]
+            ARRAY['{"id":1}'::json, NULL, '[true,false]'::json],
+            ARRAY['123e4567-e89b-12d3-a456-426614174000'::uuid, NULL],
+            ARRAY['new'::pg_temp.pgz_sem_status, NULL, 'active'::pg_temp.pgz_sem_status],
+            ARRAY['first'::name, NULL, 'second'::name],
+            ARRAY['A'::"char", NULL, 'Z'::"char"],
+            ARRAY['192.0.2.1/24'::inet, NULL, '2001:db8::1/64'::inet],
+            ARRAY['192.0.2.0/24'::cidr, NULL, '2001:db8::/32'::cidr],
+            ARRAY['1 day 00:00:01'::interval, NULL, '00:00:00.000001'::interval]
         )::pg_temp.pgz_sem_arrays)),
+    ('direct_arrays_no_null', row_to_msgpack(
+        ROW(
+            ARRAY['123e4567-e89b-12d3-a456-426614174000'::uuid],
+            ARRAY['new'::pg_temp.pgz_sem_status, 'closed'::pg_temp.pgz_sem_status],
+            ARRAY['first'::name, 'second'::name],
+            ARRAY['A'::"char", 'Z'::"char"],
+            ARRAY['192.0.2.1/24'::inet, '2001:db8::1/64'::inet],
+            ARRAY['192.0.2.0/24'::cidr, '2001:db8::/32'::cidr],
+            ARRAY['1 day'::interval, '00:00:00.000001'::interval]
+        )::pg_temp.pgz_sem_direct_arrays)),
     ('batch_rows', rows_to_msgpack(ARRAY[
         ROW(1, 'one', true, 1.0, NULL)::pg_temp.pgz_sem_primitive,
         NULL::pg_temp.pgz_sem_primitive,
@@ -189,6 +223,7 @@ def main() -> None:
         "builder_array",
         "builder_binary_embedding",
         "builder_object",
+        "direct_arrays_no_null",
         "exact_numeric",
         "enum_renamed",
         "float_numeric",
@@ -220,6 +255,22 @@ def main() -> None:
         "texts": ["a", None, "\u03a9"],
         "bools": [True, False, None],
         "json_texts": ['{"id":1}', None, "[true,false]"],
+        "uuids": ["123e4567-e89b-12d3-a456-426614174000", None],
+        "statuses": ["new", None, "active"],
+        "names": ["first", None, "second"],
+        "codes": ["A", None, "Z"],
+        "addresses": ["192.0.2.1/24", None, "2001:db8::1/64"],
+        "networks": ["192.0.2.0/24", None, "2001:db8::/32"],
+        "durations": ["1 day 00:00:01", None, "00:00:00.000001"],
+    }
+    assert actual["direct_arrays_no_null"] == {
+        "uuids": ["123e4567-e89b-12d3-a456-426614174000"],
+        "statuses": ["new", "closed"],
+        "names": ["first", "second"],
+        "codes": ["A", "Z"],
+        "addresses": ["192.0.2.1/24", "2001:db8::1/64"],
+        "networks": ["192.0.2.0/24", "2001:db8::/32"],
+        "durations": ["1 day", "00:00:00.000001"],
     }
     assert actual["batch_rows"] == [
         {"id": 1, "name": "one", "active": True, "score": 1.0, "nullable": None},

@@ -181,6 +181,7 @@ struct CachedColumn {
     Oid typoutput;
     ConverterKind kind;
     Oid array_element_typid;
+    Oid array_element_typoutput;
     ConverterKind array_element_kind;
     int16 array_typlen;
     bool array_typbyval;
@@ -398,6 +399,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
         col.msgpack_scalar_writer = select_msgpack_scalar_writer(col.kind);
         col.typoutput = InvalidOid;
         col.array_element_typid = InvalidOid;
+        col.array_element_typoutput = InvalidOid;
         col.array_element_kind = ConverterKind::Fallback;
         col.array_typlen = 0;
         col.array_typbyval = false;
@@ -408,6 +410,10 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
             if (OidIsValid(col.array_element_typid)) {
                 col.array_element_kind = classify_type(col.array_element_typid);
                 col.msgpack_array_elem_writer = select_msgpack_array_elem_writer(col.array_element_kind);
+                bool element_typisvarlena;
+                getTypeOutputInfo(col.array_element_typid,
+                                  &col.array_element_typoutput,
+                                  &element_typisvarlena);
                 get_typlenbyvalalign(col.array_element_typid,
                                     &col.array_typlen,
                                     &col.array_typbyval,
@@ -718,6 +724,14 @@ static inline std::string_view enum_label_view(Datum value)
     return it->second;
 }
 
+template <typename WriterT>
+static inline void write_output_string(WriterT& writer, Oid typoutput, Datum value)
+{
+    char* str = OidOutputFunctionCall(typoutput, value);
+    writer.string(std::string_view(str));
+    pfree(str);
+}
+
 /*
  * Convert a PostgreSQL Datum to a zerialize dyn::Value
  */
@@ -926,12 +940,17 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
         case ConverterKind::Bool:
         case ConverterKind::Text:
         case ConverterKind::JsonText:
+        case ConverterKind::Uuid:
+        case ConverterKind::NameText:
+        case ConverterKind::CharText:
+        case ConverterKind::EnumText:
         case ConverterKind::Numeric:
         case ConverterKind::Date:
         case ConverterKind::Timestamp:
         case ConverterKind::Timestamptz:
         case ConverterKind::Jsonb:
         case ConverterKind::Bytea:
+        case ConverterKind::Fallback:
             return true;
         default:
             return false;
@@ -1095,6 +1114,33 @@ static inline void msgpack_array_elem_text(z::MsgPackSerializer& writer, Datum v
     msgpack_write_text(writer, value);
 }
 
+static inline void msgpack_array_elem_uuid(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    char out[36];
+    format_uuid(value, out);
+    writer.string(std::string_view(out, sizeof(out)));
+}
+
+static inline void msgpack_array_elem_name(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.string(name_text_view(value));
+}
+
+static inline void msgpack_array_elem_char(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    char ch = DatumGetChar(value);
+    writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+}
+
+static inline void msgpack_array_elem_enum(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.string(enum_label_view(value));
+}
+
 static inline void msgpack_array_elem_numeric(z::MsgPackSerializer& writer, Datum value, bool isnull)
 {
     if (isnull) { writer.null(); return; }
@@ -1143,6 +1189,10 @@ static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind k
         case ConverterKind::Text:
         case ConverterKind::JsonText:
             return &msgpack_array_elem_text;
+        case ConverterKind::Uuid: return &msgpack_array_elem_uuid;
+        case ConverterKind::NameText: return &msgpack_array_elem_name;
+        case ConverterKind::CharText: return &msgpack_array_elem_char;
+        case ConverterKind::EnumText: return &msgpack_array_elem_enum;
         case ConverterKind::Numeric: return &msgpack_array_elem_numeric;
         case ConverterKind::Date: return &msgpack_array_elem_date;
         case ConverterKind::Timestamp: return &msgpack_array_elem_timestamp;
@@ -1194,6 +1244,29 @@ static inline void msgpack_write_array_no_nulls(
         case ConverterKind::JsonText:
             for (int i = 0; i < nitems; i++) {
                 msgpack_write_text(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Uuid:
+            for (int i = 0; i < nitems; i++) {
+                char out[36];
+                format_uuid(elements[i], out);
+                writer.string(std::string_view(out, sizeof(out)));
+            }
+            return;
+        case ConverterKind::NameText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(name_text_view(elements[i]));
+            }
+            return;
+        case ConverterKind::CharText:
+            for (int i = 0; i < nitems; i++) {
+                char ch = DatumGetChar(elements[i]);
+                writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            }
+            return;
+        case ConverterKind::EnumText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(enum_label_view(elements[i]));
             }
             return;
         case ConverterKind::Numeric:
@@ -1273,7 +1346,15 @@ static inline void msgpack_write_array(
     }
 
     writer.begin_array(static_cast<size_t>(nitems));
-    if (!ARR_HASNULL(arr)) {
+    if (col.array_element_kind == ConverterKind::Fallback) {
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                write_output_string(writer, col.array_element_typoutput, elements[i]);
+            }
+        }
+    } else if (!ARR_HASNULL(arr)) {
         msgpack_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
     } else {
         for (int i = 0; i < nitems; i++) {
@@ -1665,6 +1746,18 @@ static inline void cbor_write_array_element(
             writer.string(std::string_view(out, sizeof(out)));
             return;
         }
+        case ConverterKind::NameText:
+            writer.string(name_text_view(value));
+            return;
+        case ConverterKind::CharText:
+        {
+            char ch = DatumGetChar(value);
+            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            return;
+        }
+        case ConverterKind::EnumText:
+            writer.string(enum_label_view(value));
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -1728,7 +1821,13 @@ static inline void cbor_write_array(
 
     writer.begin_array(static_cast<size_t>(nitems));
     for (int i = 0; i < nitems; i++) {
-        cbor_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
+        if (nulls[i]) {
+            writer.null();
+        } else if (col.array_element_kind == ConverterKind::Fallback) {
+            write_output_string(writer, col.array_element_typoutput, elements[i]);
+        } else {
+            cbor_write_array_element(writer, col.array_element_kind, elements[i], false);
+        }
     }
     writer.end_array();
 
@@ -2007,6 +2106,18 @@ static inline void zera_write_array_element(
             writer.string(std::string_view(out, sizeof(out)));
             return;
         }
+        case ConverterKind::NameText:
+            writer.string(name_text_view(value));
+            return;
+        case ConverterKind::CharText:
+        {
+            char ch = DatumGetChar(value);
+            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            return;
+        }
+        case ConverterKind::EnumText:
+            writer.string(enum_label_view(value));
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -2070,7 +2181,13 @@ static inline void zera_write_array(
 
     writer.begin_array(static_cast<size_t>(nitems));
     for (int i = 0; i < nitems; i++) {
-        zera_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
+        if (nulls[i]) {
+            writer.null();
+        } else if (col.array_element_kind == ConverterKind::Fallback) {
+            write_output_string(writer, col.array_element_typoutput, elements[i]);
+        } else {
+            zera_write_array_element(writer, col.array_element_kind, elements[i], false);
+        }
     }
     writer.end_array();
 
@@ -2349,6 +2466,18 @@ static inline void flex_write_array_element(
             writer.string(std::string_view(out, sizeof(out)));
             return;
         }
+        case ConverterKind::NameText:
+            writer.string(name_text_view(value));
+            return;
+        case ConverterKind::CharText:
+        {
+            char ch = DatumGetChar(value);
+            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            return;
+        }
+        case ConverterKind::EnumText:
+            writer.string(enum_label_view(value));
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -2412,7 +2541,13 @@ static inline void flex_write_array(
 
     writer.begin_array(static_cast<size_t>(nitems));
     for (int i = 0; i < nitems; i++) {
-        flex_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
+        if (nulls[i]) {
+            writer.null();
+        } else if (col.array_element_kind == ConverterKind::Fallback) {
+            write_output_string(writer, col.array_element_typoutput, elements[i]);
+        } else {
+            flex_write_array_element(writer, col.array_element_kind, elements[i], false);
+        }
     }
     writer.end_array();
 

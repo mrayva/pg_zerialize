@@ -71,7 +71,8 @@ SQL-builder style MessagePack APIs are available:
 - UUID, enum, `name`, and internal `"char"` values are emitted as their
   canonical PostgreSQL text strings. Other supported scalar fallbacks, such as
   inet/cidr and interval, use PostgreSQL's authoritative output function while
-  remaining on the protocol direct-writer path.
+  remaining on the protocol direct-writer path. One-dimensional arrays of
+  these types use the same direct element writers and preserve null elements.
 - Passing the `bytea` result of one MessagePack builder into another builder
   encodes it as a binary blob; it does not splice the inner MessagePack value.
 - Multidimensional PostgreSQL arrays are not represented as nested protocol
