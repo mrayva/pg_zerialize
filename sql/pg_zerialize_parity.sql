@@ -24,6 +24,11 @@ CREATE TYPE pgz_parity_wide AS (
     a0 int[]
 );
 
+CREATE TYPE pgz_parity_interval AS (
+    value interval,
+    values interval[]
+);
+
 SELECT row_to_msgpack(ROW(1, 'alice', true)::pgz_parity_narrow)
        = row_to_msgpack_slow(ROW(1, 'alice', true)::pgz_parity_narrow) AS narrow_equal;
 
@@ -64,6 +69,31 @@ SELECT rows_to_msgpack(ARRAY[
            NULL::pgz_parity_narrow
        ]) AS batch_equal;
 
+DO $$
+DECLARE
+    style text;
+    value interval;
+BEGIN
+    FOREACH style IN ARRAY ARRAY['postgres', 'postgres_verbose', 'sql_standard', 'iso_8601'] LOOP
+        PERFORM set_config('intervalstyle', style, false);
+        FOREACH value IN ARRAY ARRAY[
+            '0'::interval,
+            '1 mon -2 days 03:04:05.000006'::interval,
+            'infinity'::interval,
+            '-infinity'::interval
+        ] LOOP
+            IF row_to_msgpack(ROW(value, ARRAY[value, NULL, value])::pgz_parity_interval)
+               <> row_to_msgpack_slow(ROW(value, ARRAY[value, NULL, value])::pgz_parity_interval) THEN
+                RAISE EXCEPTION 'interval fast/slow mismatch for style % and value %', style, value;
+            END IF;
+        END LOOP;
+    END LOOP;
+END
+$$;
+
+RESET intervalstyle;
+
+DROP TYPE pgz_parity_interval;
 DROP TYPE pgz_parity_wide;
 DROP TYPE pgz_parity_narrow;
 DROP EXTENSION pg_zerialize;

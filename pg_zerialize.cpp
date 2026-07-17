@@ -6,6 +6,7 @@
 
 extern "C" {
 #include "postgres.h"
+#include "miscadmin.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "catalog/pg_type.h"
@@ -16,6 +17,7 @@ extern "C" {
 #include "utils/numeric.h"
 #include "utils/array.h"
 #include "utils/date.h"
+#include "utils/datetime.h"
 #include "utils/jsonb.h"
 #include "utils/timestamp.h"
 #include "access/tupdesc.h"
@@ -156,6 +158,7 @@ enum class ConverterKind {
     EnumText,
     InetText,
     CidrText,
+    IntervalText,
     Numeric,
     Date,
     Timestamp,
@@ -333,6 +336,8 @@ static ConverterKind classify_type(Oid typid)
             return ConverterKind::InetText;
         case CIDROID:
             return ConverterKind::CidrText;
+        case INTERVALOID:
+            return ConverterKind::IntervalText;
         case NUMERICOID:
             return ConverterKind::Numeric;
         case DATEOID:
@@ -765,6 +770,30 @@ static inline void write_network_string(WriterT& writer, Datum value, bool is_ci
     writer.string(network_text_view(value, is_cidr, out));
 }
 
+static inline std::string_view interval_text_view(
+    Datum value, char (&out)[MAXDATELEN + 1])
+{
+    Interval* span = DatumGetIntervalP(value);
+    if (INTERVAL_IS_NOBEGIN(span)) {
+        return std::string_view(EARLY, sizeof(EARLY) - 1);
+    }
+    if (INTERVAL_IS_NOEND(span)) {
+        return std::string_view(LATE, sizeof(LATE) - 1);
+    }
+
+    struct pg_itm itm;
+    interval2itm(*span, &itm);
+    EncodeInterval(&itm, IntervalStyle, out);
+    return std::string_view(out, strlen(out));
+}
+
+template <typename WriterT>
+static inline void write_interval_string(WriterT& writer, Datum value)
+{
+    char out[MAXDATELEN + 1];
+    writer.string(interval_text_view(value, out));
+}
+
 template <typename WriterT>
 static inline void write_output_string(WriterT& writer, Oid typoutput, Datum value)
 {
@@ -928,6 +957,11 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
             return z::dyn::Value(std::string(network_text_view(
                 value, col.kind == ConverterKind::CidrText, out)));
         }
+        case ConverterKind::IntervalText:
+        {
+            char out[MAXDATELEN + 1];
+            return z::dyn::Value(std::string(interval_text_view(value, out)));
+        }
         case ConverterKind::Numeric:
             return numeric_to_dynamic_fast(value);
         case ConverterKind::Date:
@@ -966,6 +1000,7 @@ static bool is_msgpack_fast_kind(ConverterKind kind)
         case ConverterKind::EnumText:
         case ConverterKind::InetText:
         case ConverterKind::CidrText:
+        case ConverterKind::IntervalText:
         case ConverterKind::Numeric:
         case ConverterKind::Date:
         case ConverterKind::Timestamp:
@@ -996,6 +1031,7 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
         case ConverterKind::EnumText:
         case ConverterKind::InetText:
         case ConverterKind::CidrText:
+        case ConverterKind::IntervalText:
         case ConverterKind::Numeric:
         case ConverterKind::Date:
         case ConverterKind::Timestamp:
@@ -1205,6 +1241,12 @@ static inline void msgpack_array_elem_cidr(z::MsgPackSerializer& writer, Datum v
     write_network_string(writer, value, true);
 }
 
+static inline void msgpack_array_elem_interval(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    write_interval_string(writer, value);
+}
+
 static inline void msgpack_array_elem_numeric(z::MsgPackSerializer& writer, Datum value, bool isnull)
 {
     if (isnull) { writer.null(); return; }
@@ -1259,6 +1301,7 @@ static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind k
         case ConverterKind::EnumText: return &msgpack_array_elem_enum;
         case ConverterKind::InetText: return &msgpack_array_elem_inet;
         case ConverterKind::CidrText: return &msgpack_array_elem_cidr;
+        case ConverterKind::IntervalText: return &msgpack_array_elem_interval;
         case ConverterKind::Numeric: return &msgpack_array_elem_numeric;
         case ConverterKind::Date: return &msgpack_array_elem_date;
         case ConverterKind::Timestamp: return &msgpack_array_elem_timestamp;
@@ -1343,6 +1386,11 @@ static inline void msgpack_write_array_no_nulls(
         case ConverterKind::CidrText:
             for (int i = 0; i < nitems; i++) {
                 write_network_string(writer, elements[i], true);
+            }
+            return;
+        case ConverterKind::IntervalText:
+            for (int i = 0; i < nitems; i++) {
+                write_interval_string(writer, elements[i]);
             }
             return;
         case ConverterKind::Numeric:
@@ -1610,6 +1658,13 @@ static inline void msgpack_scalar_cidr(
     write_network_string(writer, value, true);
 }
 
+static inline void msgpack_scalar_interval(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    write_interval_string(writer, value);
+}
+
 static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
 {
     switch (kind) {
@@ -1628,6 +1683,7 @@ static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
         case ConverterKind::EnumText: return &msgpack_scalar_enum;
         case ConverterKind::InetText: return &msgpack_scalar_inet;
         case ConverterKind::CidrText: return &msgpack_scalar_cidr;
+        case ConverterKind::IntervalText: return &msgpack_scalar_interval;
         case ConverterKind::Numeric: return &msgpack_scalar_numeric;
         case ConverterKind::Date: return &msgpack_scalar_date;
         case ConverterKind::Timestamp: return &msgpack_scalar_timestamp;
@@ -1856,6 +1912,9 @@ static inline void cbor_write_array_element(
         case ConverterKind::CidrText:
             write_network_string(writer, value, true);
             return;
+        case ConverterKind::IntervalText:
+            write_interval_string(writer, value);
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -1991,6 +2050,9 @@ static inline void cbor_write_scalar(
             return;
         case ConverterKind::CidrText:
             write_network_string(writer, value, true);
+            return;
+        case ConverterKind::IntervalText:
+            write_interval_string(writer, value);
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
@@ -2228,6 +2290,9 @@ static inline void zera_write_array_element(
         case ConverterKind::CidrText:
             write_network_string(writer, value, true);
             return;
+        case ConverterKind::IntervalText:
+            write_interval_string(writer, value);
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -2363,6 +2428,9 @@ static inline void zera_write_scalar(
             return;
         case ConverterKind::CidrText:
             write_network_string(writer, value, true);
+            return;
+        case ConverterKind::IntervalText:
+            write_interval_string(writer, value);
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
@@ -2600,6 +2668,9 @@ static inline void flex_write_array_element(
         case ConverterKind::CidrText:
             write_network_string(writer, value, true);
             return;
+        case ConverterKind::IntervalText:
+            write_interval_string(writer, value);
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -2735,6 +2806,9 @@ static inline void flex_write_scalar(
             return;
         case ConverterKind::CidrText:
             write_network_string(writer, value, true);
+            return;
+        case ConverterKind::IntervalText:
+            write_interval_string(writer, value);
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
