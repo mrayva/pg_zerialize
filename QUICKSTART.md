@@ -6,7 +6,7 @@
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get install postgresql-server-dev-all build-essential
+sudo apt-get install postgresql-server-dev-all build-essential libflatbuffers-dev libfast-float-dev
 
 # RedHat/CentOS
 sudo yum install postgresql-devel gcc-c++
@@ -118,9 +118,9 @@ for row in cur:
 ## Current Limitations
 
 - Nested composite types not yet supported
-- Date/timestamp values currently use text fallback serialization
-- JSON/JSONB values currently use text fallback serialization
-- NUMERIC is converted to `float8` (possible precision loss for high-precision decimals)
+- Multidimensional arrays use text fallback serialization
+- JSON text remains a protocol string; JSONB row fields remain binary payloads
+- Fractional or out-of-range `numeric` values use `float8` and can lose precision
 
 See ARCHITECTURE.md for roadmap.
 

@@ -21,6 +21,8 @@ jobs:
             lld \
             llvm-dev \
             libflatbuffers-dev \
+            libfast-float-dev \
+            python3-msgpack \
             postgresql \
             postgresql-server-dev-all
 
@@ -40,6 +42,9 @@ jobs:
 
       - name: Comprehensive SQL suite
         run: psql -d postgres -v ON_ERROR_STOP=1 -f test_pg_zerialize.sql
+
+      - name: Independent MessagePack semantics
+        run: make semantic-check
 
       - name: Quick isolated microbench sanity
         run: RUNS=1 WARMUP=0 PROTOCOLS="msgpack" PGDATABASE=postgres ./bench/run_microbench_isolated.sh

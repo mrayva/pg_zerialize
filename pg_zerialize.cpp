@@ -9,6 +9,7 @@ extern "C" {
 #include "fmgr.h"
 #include "funcapi.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_enum.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -22,6 +23,8 @@ extern "C" {
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "utils/inval.h"
+#include "utils/guc.h"
+#include "utils/uuid.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -42,6 +45,8 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <unordered_map>
 #include <type_traits>
 #include <cmath>
+#include <system_error>
+#include <fast_float/fast_float.h>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/msgpack.hpp>
@@ -50,6 +55,19 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <zerialize/dynamic.hpp>
 
 namespace z = zerialize;
+
+enum NumericFloatBackend {
+    NUMERIC_FLOAT_POSTGRES = 0,
+    NUMERIC_FLOAT_FAST_FLOAT = 1,
+};
+
+static int numeric_float_backend = NUMERIC_FLOAT_FAST_FLOAT;
+
+static const config_enum_entry numeric_float_backend_options[] = {
+    {"postgres", NUMERIC_FLOAT_POSTGRES, false},
+    {"fast_float", NUMERIC_FLOAT_FAST_FLOAT, false},
+    {nullptr, 0, false},
+};
 
 /*
  * Forward declarations
@@ -130,6 +148,11 @@ enum class ConverterKind {
     Float8,
     Bool,
     Text,
+    JsonText,
+    Uuid,
+    NameText,
+    CharText,
+    EnumText,
     Numeric,
     Date,
     Timestamp,
@@ -218,6 +241,7 @@ public:
 
 // Global cache for per-schema metadata and TupleDesc lookups.
 static std::unordered_map<TypeCacheKey, CachedSchema> schema_cache;
+static std::unordered_map<Oid, std::string> enum_label_cache;
 
 static inline void clear_tupdesc_cache()
 {
@@ -225,6 +249,7 @@ static inline void clear_tupdesc_cache()
         FreeTupleDesc(entry.second.tupdesc);
     }
     schema_cache.clear();
+    enum_label_cache.clear();
 }
 
 /*
@@ -249,9 +274,24 @@ static void tupdesc_relcache_callback(Datum arg, Oid relid)
 extern "C" void
 _PG_init(void)
 {
+    DefineCustomEnumVariable(
+        "pg_zerialize.numeric_float_backend",
+        "Selects the decimal-to-float parser used for non-integral numeric values.",
+        nullptr,
+        &numeric_float_backend,
+        NUMERIC_FLOAT_FAST_FLOAT,
+        numeric_float_backend_options,
+        PGC_USERSET,
+        GUC_NOT_IN_SAMPLE,
+        nullptr,
+        nullptr,
+        nullptr);
+    MarkGUCPrefixReserved("pg_zerialize");
+
     CacheRegisterSyscacheCallback(TYPEOID, tupdesc_syscache_callback, (Datum) 0);
     CacheRegisterSyscacheCallback(RELOID, tupdesc_syscache_callback, (Datum) 0);
     CacheRegisterSyscacheCallback(ATTNUM, tupdesc_syscache_callback, (Datum) 0);
+    CacheRegisterSyscacheCallback(ENUMOID, tupdesc_syscache_callback, (Datum) 0);
     CacheRegisterRelcacheCallback(tupdesc_relcache_callback, (Datum) 0);
 }
 
@@ -277,6 +317,14 @@ static ConverterKind classify_type(Oid typid)
         case VARCHAROID:
         case BPCHAROID:
             return ConverterKind::Text;
+        case JSONOID:
+            return ConverterKind::JsonText;
+        case UUIDOID:
+            return ConverterKind::Uuid;
+        case NAMEOID:
+            return ConverterKind::NameText;
+        case CHAROID:
+            return ConverterKind::CharText;
         case NUMERICOID:
             return ConverterKind::Numeric;
         case DATEOID:
@@ -292,6 +340,9 @@ static ConverterKind classify_type(Oid typid)
         default:
             if (OidIsValid(get_element_type(typid))) {
                 return ConverterKind::Array;
+            }
+            if (get_typtype(typid) == TYPTYPE_ENUM) {
+                return ConverterKind::EnumText;
             }
             return ConverterKind::Fallback;
     }
@@ -466,17 +517,43 @@ static z::dyn::Value array_to_dynamic(Datum value, Oid typid)
 static inline bool numeric_try_int64(Datum value, int64_t* out)
 {
     Numeric num = DatumGetNumeric(value);
+    if (numeric_is_nan(num) || numeric_is_inf(num)) {
+        return false;
+    }
+
+    // numeric_int8_opt_error rounds fractional values. min_scale() is the
+    // cheapest exact check that the value has no significant fractional part.
+    int32 min_scale = DatumGetInt32(DirectFunctionCall1(numeric_min_scale, value));
+    if (min_scale > 0) {
+        return false;
+    }
+
     bool have_error = false;
     int64 v = numeric_int8_opt_error(num, &have_error);
-    if (!have_error) {
-        *out = static_cast<int64_t>(v);
-        return true;
+    if (have_error) {
+        return false;
     }
-    return false;
+
+    *out = static_cast<int64_t>(v);
+    return true;
 }
 
 static inline double numeric_to_float8_fast(Datum value)
 {
+    if (numeric_float_backend == NUMERIC_FLOAT_FAST_FLOAT) {
+        char* text = DatumGetCString(DirectFunctionCall1(numeric_out, value));
+        const char* end = text + std::strlen(text);
+        double result;
+        auto parsed = fast_float::from_chars(text, end, result);
+        bool valid = parsed.ec == std::errc() && parsed.ptr == end;
+        pfree(text);
+
+        if (valid) {
+            return result;
+        }
+        // Preserve PostgreSQL's overflow and special-value behavior.
+    }
+
     Datum float_val = DirectFunctionCall1(numeric_float8, value);
     return DatumGetFloat8(float_val);
 }
@@ -581,6 +658,66 @@ static z::dyn::Value jsonb_to_dynamic(Jsonb* jb)
     return jsonb_token_to_dynamic(&it, tok, &v);
 }
 
+static inline std::string text_to_owned_string(Datum value)
+{
+    text* txt = DatumGetTextPP(value);
+    return std::string(VARDATA_ANY(txt), static_cast<size_t>(VARSIZE_ANY_EXHDR(txt)));
+}
+
+static inline void format_uuid(Datum value, char (&out)[36])
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    const pg_uuid_t* uuid = DatumGetUUIDP(value);
+    size_t pos = 0;
+    for (size_t i = 0; i < UUID_LEN; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            out[pos++] = '-';
+        }
+        out[pos++] = hex[uuid->data[i] >> 4];
+        out[pos++] = hex[uuid->data[i] & 0x0f];
+    }
+}
+
+static inline std::string uuid_to_owned_string(Datum value)
+{
+    char out[36];
+    format_uuid(value, out);
+    return std::string(out, sizeof(out));
+}
+
+static inline std::string_view name_text_view(Datum value)
+{
+    const char* name = NameStr(*DatumGetName(value));
+    return std::string_view(name, strnlen(name, NAMEDATALEN));
+}
+
+static inline std::string char_to_owned_string(Datum value)
+{
+    char ch = DatumGetChar(value);
+    return ch == '\0' ? std::string() : std::string(1, ch);
+}
+
+static inline std::string_view enum_label_view(Datum value)
+{
+    Oid enum_value = DatumGetObjectId(value);
+    auto cached = enum_label_cache.find(enum_value);
+    if (cached != enum_label_cache.end()) {
+        return cached->second;
+    }
+
+    HeapTuple tuple = SearchSysCache1(ENUMOID, ObjectIdGetDatum(enum_value));
+    if (!HeapTupleIsValid(tuple)) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid internal value for enum: %u", enum_value)));
+    }
+    Form_pg_enum entry = (Form_pg_enum) GETSTRUCT(tuple);
+    auto [it, inserted] = enum_label_cache.emplace(enum_value, NameStr(entry->enumlabel));
+    (void)inserted;
+    ReleaseSysCache(tuple);
+    return it->second;
+}
+
 /*
  * Convert a PostgreSQL Datum to a zerialize dyn::Value
  */
@@ -617,13 +754,17 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
         case TEXTOID:
         case VARCHAROID:
         case BPCHAROID:
+        case JSONOID:
         {
-            text* txt = DatumGetTextP(value);
-            char* str = text_to_cstring(txt);
-            std::string strval(str);
-            pfree(str);
-            return z::dyn::Value(strval);
+            return z::dyn::Value(text_to_owned_string(value));
         }
+
+        case UUIDOID:
+            return z::dyn::Value(uuid_to_owned_string(value));
+        case NAMEOID:
+            return z::dyn::Value(std::string(name_text_view(value)));
+        case CHAROID:
+            return z::dyn::Value(char_to_owned_string(value));
 
         case NUMERICOID:
             return numeric_to_dynamic_fast(value);
@@ -639,7 +780,7 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
             return z::dyn::Value::blob(datum_bytea_span(value));
 
         // TODO: Add support for more types:
-        // - JSONOID (nested JSON)
+        // - Recursively decoded JSON text
         // - Composite types (nested records)
 
         default:
@@ -713,13 +854,18 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
         case ConverterKind::Bool:
             return z::dyn::Value(DatumGetBool(value));
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
         {
-            text* txt = DatumGetTextP(value);
-            char* str = text_to_cstring(txt);
-            std::string strval(str);
-            pfree(str);
-            return z::dyn::Value(strval);
+            return z::dyn::Value(text_to_owned_string(value));
         }
+        case ConverterKind::Uuid:
+            return z::dyn::Value(uuid_to_owned_string(value));
+        case ConverterKind::NameText:
+            return z::dyn::Value(std::string(name_text_view(value)));
+        case ConverterKind::CharText:
+            return z::dyn::Value(char_to_owned_string(value));
+        case ConverterKind::EnumText:
+            return z::dyn::Value(std::string(enum_label_view(value)));
         case ConverterKind::Numeric:
             return numeric_to_dynamic_fast(value);
         case ConverterKind::Date:
@@ -751,12 +897,18 @@ static bool is_msgpack_fast_kind(ConverterKind kind)
         case ConverterKind::Float8:
         case ConverterKind::Bool:
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
+        case ConverterKind::Uuid:
+        case ConverterKind::NameText:
+        case ConverterKind::CharText:
+        case ConverterKind::EnumText:
         case ConverterKind::Numeric:
         case ConverterKind::Date:
         case ConverterKind::Timestamp:
         case ConverterKind::Timestamptz:
         case ConverterKind::Jsonb:
         case ConverterKind::Bytea:
+        case ConverterKind::Fallback:
             return true;
         default:
             return false;
@@ -773,6 +925,7 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
         case ConverterKind::Float8:
         case ConverterKind::Bool:
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
         case ConverterKind::Numeric:
         case ConverterKind::Date:
         case ConverterKind::Timestamp:
@@ -987,7 +1140,9 @@ static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind k
         case ConverterKind::Float4: return &msgpack_array_elem_float4;
         case ConverterKind::Float8: return &msgpack_array_elem_float8;
         case ConverterKind::Bool: return &msgpack_array_elem_bool;
-        case ConverterKind::Text: return &msgpack_array_elem_text;
+        case ConverterKind::Text:
+        case ConverterKind::JsonText:
+            return &msgpack_array_elem_text;
         case ConverterKind::Numeric: return &msgpack_array_elem_numeric;
         case ConverterKind::Date: return &msgpack_array_elem_date;
         case ConverterKind::Timestamp: return &msgpack_array_elem_timestamp;
@@ -1036,6 +1191,7 @@ static inline void msgpack_write_array_no_nulls(
             }
             return;
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
             for (int i = 0; i < nitems; i++) {
                 msgpack_write_text(writer, elements[i]);
             }
@@ -1145,6 +1301,15 @@ static inline void msgpack_scalar_unsupported(
              errdetail("column type OID %u", col.typid)));
 }
 
+static inline void msgpack_scalar_fallback(
+    z::MsgPackSerializer& writer, const CachedColumn& col, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    char* str = OidOutputFunctionCall(col.typoutput, value);
+    writer.string(std::string_view(str));
+    pfree(str);
+}
+
 static inline void msgpack_scalar_int2(
     z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
 {
@@ -1243,6 +1408,37 @@ static inline void msgpack_scalar_array(
     msgpack_write_array(writer, col, value);
 }
 
+static inline void msgpack_scalar_uuid(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    char out[36];
+    format_uuid(value, out);
+    writer.string(std::string_view(out, sizeof(out)));
+}
+
+static inline void msgpack_scalar_name(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.string(name_text_view(value));
+}
+
+static inline void msgpack_scalar_char(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    char ch = DatumGetChar(value);
+    writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+}
+
+static inline void msgpack_scalar_enum(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    writer.string(enum_label_view(value));
+}
+
 static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
 {
     switch (kind) {
@@ -1252,7 +1448,13 @@ static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
         case ConverterKind::Float4: return &msgpack_scalar_float4;
         case ConverterKind::Float8: return &msgpack_scalar_float8;
         case ConverterKind::Bool: return &msgpack_scalar_bool;
-        case ConverterKind::Text: return &msgpack_scalar_text;
+        case ConverterKind::Text:
+        case ConverterKind::JsonText:
+            return &msgpack_scalar_text;
+        case ConverterKind::Uuid: return &msgpack_scalar_uuid;
+        case ConverterKind::NameText: return &msgpack_scalar_name;
+        case ConverterKind::CharText: return &msgpack_scalar_char;
+        case ConverterKind::EnumText: return &msgpack_scalar_enum;
         case ConverterKind::Numeric: return &msgpack_scalar_numeric;
         case ConverterKind::Date: return &msgpack_scalar_date;
         case ConverterKind::Timestamp: return &msgpack_scalar_timestamp;
@@ -1260,7 +1462,7 @@ static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
         case ConverterKind::Jsonb: return &msgpack_scalar_jsonb;
         case ConverterKind::Bytea: return &msgpack_scalar_bytea;
         case ConverterKind::Array: return &msgpack_scalar_array;
-        case ConverterKind::Fallback: return &msgpack_scalar_unsupported;
+        case ConverterKind::Fallback: return &msgpack_scalar_fallback;
     }
     return &msgpack_scalar_unsupported;
 }
@@ -1453,8 +1655,16 @@ static inline void cbor_write_array_element(
             writer.boolean(DatumGetBool(value));
             return;
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
             cbor_write_text(writer, value);
             return;
+        case ConverterKind::Uuid:
+        {
+            char out[36];
+            format_uuid(value, out);
+            writer.string(std::string_view(out, sizeof(out)));
+            return;
+        }
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -1557,7 +1767,27 @@ static inline void cbor_write_scalar(
             writer.boolean(DatumGetBool(value));
             return;
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
             cbor_write_text(writer, value);
+            return;
+        case ConverterKind::Uuid:
+        {
+            char out[36];
+            format_uuid(value, out);
+            writer.string(std::string_view(out, sizeof(out)));
+            return;
+        }
+        case ConverterKind::NameText:
+            writer.string(name_text_view(value));
+            return;
+        case ConverterKind::CharText:
+        {
+            char ch = DatumGetChar(value);
+            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            return;
+        }
+        case ConverterKind::EnumText:
+            writer.string(enum_label_view(value));
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
@@ -1580,6 +1810,13 @@ static inline void cbor_write_scalar(
         case ConverterKind::Array:
             cbor_write_array(writer, col, value);
             return;
+        case ConverterKind::Fallback:
+        {
+            char* str = OidOutputFunctionCall(col.typoutput, value);
+            writer.string(std::string_view(str));
+            pfree(str);
+            return;
+        }
         default:
             break;
     }
@@ -1760,8 +1997,16 @@ static inline void zera_write_array_element(
             writer.boolean(DatumGetBool(value));
             return;
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
             zera_write_text(writer, value);
             return;
+        case ConverterKind::Uuid:
+        {
+            char out[36];
+            format_uuid(value, out);
+            writer.string(std::string_view(out, sizeof(out)));
+            return;
+        }
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -1864,7 +2109,27 @@ static inline void zera_write_scalar(
             writer.boolean(DatumGetBool(value));
             return;
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
             zera_write_text(writer, value);
+            return;
+        case ConverterKind::Uuid:
+        {
+            char out[36];
+            format_uuid(value, out);
+            writer.string(std::string_view(out, sizeof(out)));
+            return;
+        }
+        case ConverterKind::NameText:
+            writer.string(name_text_view(value));
+            return;
+        case ConverterKind::CharText:
+        {
+            char ch = DatumGetChar(value);
+            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            return;
+        }
+        case ConverterKind::EnumText:
+            writer.string(enum_label_view(value));
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
@@ -1887,6 +2152,13 @@ static inline void zera_write_scalar(
         case ConverterKind::Array:
             zera_write_array(writer, col, value);
             return;
+        case ConverterKind::Fallback:
+        {
+            char* str = OidOutputFunctionCall(col.typoutput, value);
+            writer.string(std::string_view(str));
+            pfree(str);
+            return;
+        }
         default:
             break;
     }
@@ -2067,8 +2339,16 @@ static inline void flex_write_array_element(
             writer.boolean(DatumGetBool(value));
             return;
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
             flex_write_text(writer, value);
             return;
+        case ConverterKind::Uuid:
+        {
+            char out[36];
+            format_uuid(value, out);
+            writer.string(std::string_view(out, sizeof(out)));
+            return;
+        }
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -2171,7 +2451,27 @@ static inline void flex_write_scalar(
             writer.boolean(DatumGetBool(value));
             return;
         case ConverterKind::Text:
+        case ConverterKind::JsonText:
             flex_write_text(writer, value);
+            return;
+        case ConverterKind::Uuid:
+        {
+            char out[36];
+            format_uuid(value, out);
+            writer.string(std::string_view(out, sizeof(out)));
+            return;
+        }
+        case ConverterKind::NameText:
+            writer.string(name_text_view(value));
+            return;
+        case ConverterKind::CharText:
+        {
+            char ch = DatumGetChar(value);
+            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            return;
+        }
+        case ConverterKind::EnumText:
+            writer.string(enum_label_view(value));
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
@@ -2194,6 +2494,13 @@ static inline void flex_write_scalar(
         case ConverterKind::Array:
             flex_write_array(writer, col, value);
             return;
+        case ConverterKind::Fallback:
+        {
+            char* str = OidOutputFunctionCall(col.typoutput, value);
+            writer.string(std::string_view(str));
+            pfree(str);
+            return;
+        }
         default:
             break;
     }

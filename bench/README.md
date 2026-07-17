@@ -57,3 +57,16 @@ Format per line:
 - Latest symlink: `results/microbench_latest.out`
 - Isolated run log: `results/microbench_isolated_YYYYmmdd_HHMMSS.out`
 - Isolated latest symlink: `results/microbench_isolated_latest.out`
+
+## Numeric conversion A/B benchmark
+
+Compare PostgreSQL's `numeric_float8()` conversion with the prototype
+`numeric_out()` + `fast_float` parser:
+
+```bash
+make bench-numeric-float
+```
+
+Set `RUNS` and `WARMUP` to override the defaults of 10 measured runs and 3
+warmups. The production default is fast_float; the PostgreSQL backend remains
+available for comparison and rollback.

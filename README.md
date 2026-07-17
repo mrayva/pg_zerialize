@@ -20,6 +20,7 @@ aggregates.
   are not currently exercised in CI
 - C++20 compatible compiler (GCC 10+, Clang 10+)
 - FlatBuffers library (`libflatbuffers-dev`)
+- fast_float library (`libfast-float-dev`)
 - zerialize library (header-only, included in `vendor/`; see
   `vendor/zerialize/UPSTREAM.md` for provenance and local changes)
 
@@ -38,6 +39,9 @@ make installcheck
 
 # Comprehensive manual suite
 psql -d postgres -f test_pg_zerialize.sql
+
+# Independent MessagePack decoder assertions (requires python3-msgpack)
+make semantic-check
 ```
 
 For MessagePack fast-path parity checks, test-only helper functions are available:
@@ -55,12 +59,19 @@ SQL-builder style MessagePack APIs are available:
 
 - Integral `numeric` values that fit in `int64` are encoded exactly. Other
   `numeric` values are encoded as binary `float64` and can lose decimal
-  precision.
+  precision. Decimal-to-float parsing uses fast_float by default; set
+  `pg_zerialize.numeric_float_backend = 'postgres'` for the PostgreSQL parser.
 - Date values use PostgreSQL days since 2000-01-01. Timestamp values use
   PostgreSQL microseconds since 2000-01-01.
 - A JSONB column serialized through `row_to_*` is a binary PostgreSQL JSONB
   payload, not a recursively converted protocol object. For portable nested
   MessagePack, construct one JSONB tree and call `msgpack_from_jsonb`.
+- A `json` column is serialized as its original JSON text string without
+  reparsing it. It is not emitted as a recursively nested protocol object.
+- UUID, enum, `name`, and internal `"char"` values are emitted as their
+  canonical PostgreSQL text strings. Other supported scalar fallbacks, such as
+  inet/cidr and interval, use PostgreSQL's authoritative output function while
+  remaining on the protocol direct-writer path.
 - Passing the `bytea` result of one MessagePack builder into another builder
   encodes it as a binary blob; it does not splice the inner MessagePack value.
 - Multidimensional PostgreSQL arrays are not represented as nested protocol

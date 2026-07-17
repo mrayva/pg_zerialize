@@ -28,7 +28,10 @@ override CFLAGS :=
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
-.PHONY: bench bench-quick bench-isolated bench-isolated-quick
+.PHONY: bench bench-quick bench-isolated bench-isolated-quick bench-numeric-float semantic-check
+
+semantic-check:
+	python3 test/semantic_roundtrip.py
 
 bench:
 	./bench/run_microbench.sh
@@ -41,3 +44,6 @@ bench-isolated:
 
 bench-isolated-quick:
 	RUNS=3 WARMUP=1 ./bench/run_microbench_isolated.sh
+
+bench-numeric-float:
+	./bench/run_numeric_float_bench.sh
