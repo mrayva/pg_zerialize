@@ -23,6 +23,7 @@ extern "C" {
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "utils/inval.h"
+#include "utils/inet.h"
 #include "utils/guc.h"
 #include "utils/uuid.h"
 
@@ -153,6 +154,8 @@ enum class ConverterKind {
     NameText,
     CharText,
     EnumText,
+    InetText,
+    CidrText,
     Numeric,
     Date,
     Timestamp,
@@ -326,6 +329,10 @@ static ConverterKind classify_type(Oid typid)
             return ConverterKind::NameText;
         case CHAROID:
             return ConverterKind::CharText;
+        case INETOID:
+            return ConverterKind::InetText;
+        case CIDROID:
+            return ConverterKind::CidrText;
         case NUMERICOID:
             return ConverterKind::Numeric;
         case DATEOID:
@@ -724,6 +731,40 @@ static inline std::string_view enum_label_view(Datum value)
     return it->second;
 }
 
+static constexpr size_t kNetworkTextCapacity =
+    sizeof("xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:255.255.255.255/128");
+
+static inline std::string_view network_text_view(
+    Datum value, bool is_cidr, char (&out)[kNetworkTextCapacity])
+{
+    inet* src = DatumGetInetPP(value);
+    if (pg_inet_net_ntop(ip_family(src), ip_addr(src), ip_bits(src),
+                         out, sizeof(out)) == nullptr) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("could not format inet value")));
+    }
+
+    size_t len = strlen(out);
+    if (is_cidr && strchr(out, '/') == nullptr) {
+        int written = snprintf(out + len, sizeof(out) - len, "/%u", ip_bits(src));
+        if (written < 0 || static_cast<size_t>(written) >= sizeof(out) - len) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("formatted cidr value exceeds buffer")));
+        }
+        len += static_cast<size_t>(written);
+    }
+    return std::string_view(out, len);
+}
+
+template <typename WriterT>
+static inline void write_network_string(WriterT& writer, Datum value, bool is_cidr)
+{
+    char out[kNetworkTextCapacity];
+    writer.string(network_text_view(value, is_cidr, out));
+}
+
 template <typename WriterT>
 static inline void write_output_string(WriterT& writer, Oid typoutput, Datum value)
 {
@@ -880,6 +921,13 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
             return z::dyn::Value(char_to_owned_string(value));
         case ConverterKind::EnumText:
             return z::dyn::Value(std::string(enum_label_view(value)));
+        case ConverterKind::InetText:
+        case ConverterKind::CidrText:
+        {
+            char out[kNetworkTextCapacity];
+            return z::dyn::Value(std::string(network_text_view(
+                value, col.kind == ConverterKind::CidrText, out)));
+        }
         case ConverterKind::Numeric:
             return numeric_to_dynamic_fast(value);
         case ConverterKind::Date:
@@ -916,6 +964,8 @@ static bool is_msgpack_fast_kind(ConverterKind kind)
         case ConverterKind::NameText:
         case ConverterKind::CharText:
         case ConverterKind::EnumText:
+        case ConverterKind::InetText:
+        case ConverterKind::CidrText:
         case ConverterKind::Numeric:
         case ConverterKind::Date:
         case ConverterKind::Timestamp:
@@ -944,6 +994,8 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
         case ConverterKind::NameText:
         case ConverterKind::CharText:
         case ConverterKind::EnumText:
+        case ConverterKind::InetText:
+        case ConverterKind::CidrText:
         case ConverterKind::Numeric:
         case ConverterKind::Date:
         case ConverterKind::Timestamp:
@@ -1141,6 +1193,18 @@ static inline void msgpack_array_elem_enum(z::MsgPackSerializer& writer, Datum v
     writer.string(enum_label_view(value));
 }
 
+static inline void msgpack_array_elem_inet(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    write_network_string(writer, value, false);
+}
+
+static inline void msgpack_array_elem_cidr(z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    write_network_string(writer, value, true);
+}
+
 static inline void msgpack_array_elem_numeric(z::MsgPackSerializer& writer, Datum value, bool isnull)
 {
     if (isnull) { writer.null(); return; }
@@ -1193,6 +1257,8 @@ static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind k
         case ConverterKind::NameText: return &msgpack_array_elem_name;
         case ConverterKind::CharText: return &msgpack_array_elem_char;
         case ConverterKind::EnumText: return &msgpack_array_elem_enum;
+        case ConverterKind::InetText: return &msgpack_array_elem_inet;
+        case ConverterKind::CidrText: return &msgpack_array_elem_cidr;
         case ConverterKind::Numeric: return &msgpack_array_elem_numeric;
         case ConverterKind::Date: return &msgpack_array_elem_date;
         case ConverterKind::Timestamp: return &msgpack_array_elem_timestamp;
@@ -1267,6 +1333,16 @@ static inline void msgpack_write_array_no_nulls(
         case ConverterKind::EnumText:
             for (int i = 0; i < nitems; i++) {
                 writer.string(enum_label_view(elements[i]));
+            }
+            return;
+        case ConverterKind::InetText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], false);
+            }
+            return;
+        case ConverterKind::CidrText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], true);
             }
             return;
         case ConverterKind::Numeric:
@@ -1520,6 +1596,20 @@ static inline void msgpack_scalar_enum(
     writer.string(enum_label_view(value));
 }
 
+static inline void msgpack_scalar_inet(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    write_network_string(writer, value, false);
+}
+
+static inline void msgpack_scalar_cidr(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    write_network_string(writer, value, true);
+}
+
 static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
 {
     switch (kind) {
@@ -1536,6 +1626,8 @@ static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
         case ConverterKind::NameText: return &msgpack_scalar_name;
         case ConverterKind::CharText: return &msgpack_scalar_char;
         case ConverterKind::EnumText: return &msgpack_scalar_enum;
+        case ConverterKind::InetText: return &msgpack_scalar_inet;
+        case ConverterKind::CidrText: return &msgpack_scalar_cidr;
         case ConverterKind::Numeric: return &msgpack_scalar_numeric;
         case ConverterKind::Date: return &msgpack_scalar_date;
         case ConverterKind::Timestamp: return &msgpack_scalar_timestamp;
@@ -1758,6 +1850,12 @@ static inline void cbor_write_array_element(
         case ConverterKind::EnumText:
             writer.string(enum_label_view(value));
             return;
+        case ConverterKind::InetText:
+            write_network_string(writer, value, false);
+            return;
+        case ConverterKind::CidrText:
+            write_network_string(writer, value, true);
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -1887,6 +1985,12 @@ static inline void cbor_write_scalar(
         }
         case ConverterKind::EnumText:
             writer.string(enum_label_view(value));
+            return;
+        case ConverterKind::InetText:
+            write_network_string(writer, value, false);
+            return;
+        case ConverterKind::CidrText:
+            write_network_string(writer, value, true);
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
@@ -2118,6 +2222,12 @@ static inline void zera_write_array_element(
         case ConverterKind::EnumText:
             writer.string(enum_label_view(value));
             return;
+        case ConverterKind::InetText:
+            write_network_string(writer, value, false);
+            return;
+        case ConverterKind::CidrText:
+            write_network_string(writer, value, true);
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -2247,6 +2357,12 @@ static inline void zera_write_scalar(
         }
         case ConverterKind::EnumText:
             writer.string(enum_label_view(value));
+            return;
+        case ConverterKind::InetText:
+            write_network_string(writer, value, false);
+            return;
+        case ConverterKind::CidrText:
+            write_network_string(writer, value, true);
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
@@ -2478,6 +2594,12 @@ static inline void flex_write_array_element(
         case ConverterKind::EnumText:
             writer.string(enum_label_view(value));
             return;
+        case ConverterKind::InetText:
+            write_network_string(writer, value, false);
+            return;
+        case ConverterKind::CidrText:
+            write_network_string(writer, value, true);
+            return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
             return;
@@ -2607,6 +2729,12 @@ static inline void flex_write_scalar(
         }
         case ConverterKind::EnumText:
             writer.string(enum_label_view(value));
+            return;
+        case ConverterKind::InetText:
+            write_network_string(writer, value, false);
+            return;
+        case ConverterKind::CidrText:
+            write_network_string(writer, value, true);
             return;
         case ConverterKind::Numeric:
             numeric_write_fast(writer, value);
