@@ -6,6 +6,8 @@ SET max_parallel_workers_per_gather = 0;
 
 CREATE EXTENSION IF NOT EXISTS pg_zerialize;
 
+-- Batch benchmark experiments may retain an array dependency on bench_wide.
+DROP TABLE IF EXISTS bench_msgpack_batches;
 DROP TABLE IF EXISTS bench_narrow;
 CREATE TABLE bench_narrow AS
 SELECT

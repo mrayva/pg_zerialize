@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <bit>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -501,11 +502,9 @@ public:
 class MsgPackRootSerializer {
 public:
     msgpack_sbuffer sbuf{};
-    msgpack_packer  pk{};
 
     MsgPackRootSerializer() {
         msgpack_sbuffer_init(&sbuf);
-        msgpack_packer_init(&pk, &sbuf, msgpack_sbuffer_write);
     }
     ~MsgPackRootSerializer() { msgpack_sbuffer_destroy(&sbuf); }
 
@@ -550,7 +549,6 @@ public:
 };
 
 class MsgPackSerializer {
-    msgpack_packer& pk_;
     MsgPackRootSerializer* rs_;
 
     static void store_be16(uint8_t* out, uint16_t value) {
@@ -565,15 +563,87 @@ class MsgPackSerializer {
         out[3] = static_cast<uint8_t>(value);
     }
 
+    static void store_be64(uint8_t* out, uint64_t value) {
+        store_be32(out, static_cast<uint32_t>(value >> 32));
+        store_be32(out + 4, static_cast<uint32_t>(value));
+    }
+
+    static uint8_t* encode_uint64(uint8_t* out, uint64_t value) {
+        if (value <= UINT8_C(0x7f)) {
+            *out++ = static_cast<uint8_t>(value);
+        } else if (value <= UINT8_MAX) {
+            *out++ = 0xcc;
+            *out++ = static_cast<uint8_t>(value);
+        } else if (value <= UINT16_MAX) {
+            *out++ = 0xcd;
+            store_be16(out, static_cast<uint16_t>(value));
+            out += 2;
+        } else if (value <= UINT32_MAX) {
+            *out++ = 0xce;
+            store_be32(out, static_cast<uint32_t>(value));
+            out += 4;
+        } else {
+            *out++ = 0xcf;
+            store_be64(out, value);
+            out += 8;
+        }
+        return out;
+    }
+
+    uint8_t* begin_scalar() { return rs_->reserve_raw_append(9); }
+    void end_scalar(uint8_t* begin, uint8_t* out) {
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
+
 public:
-    explicit MsgPackSerializer(MsgPackRootSerializer& rs) : pk_(rs.pk), rs_(&rs) {}
+    explicit MsgPackSerializer(MsgPackRootSerializer& rs) : rs_(&rs) {}
 
     // primitives
-    void null()                 { msgpack_pack_nil(&pk_); }
-    void boolean(bool v)        { v ? msgpack_pack_true(&pk_) : msgpack_pack_false(&pk_); }
-    void int64(std::int64_t v)  { msgpack_pack_int64(&pk_, v); }
-    void uint64(std::uint64_t v){ msgpack_pack_uint64(&pk_, v); }
-    void double_(double v)      { msgpack_pack_double(&pk_, v); }
+    void null() {
+        uint8_t* out = rs_->reserve_raw_append(1);
+        *out = 0xc0;
+        rs_->commit_raw_append(1);
+    }
+    void boolean(bool v) {
+        uint8_t* out = rs_->reserve_raw_append(1);
+        *out = v ? 0xc3 : 0xc2;
+        rs_->commit_raw_append(1);
+    }
+    void int64(std::int64_t v) {
+        uint8_t* begin = begin_scalar();
+        uint8_t* out = begin;
+        if (v >= 0) {
+            out = encode_uint64(out, static_cast<uint64_t>(v));
+        } else if (v >= -32) {
+            *out++ = static_cast<uint8_t>(v);
+        } else if (v >= INT8_MIN) {
+            *out++ = 0xd0;
+            *out++ = static_cast<uint8_t>(v);
+        } else if (v >= INT16_MIN) {
+            *out++ = 0xd1;
+            store_be16(out, static_cast<uint16_t>(v));
+            out += 2;
+        } else if (v >= INT32_MIN) {
+            *out++ = 0xd2;
+            store_be32(out, static_cast<uint32_t>(v));
+            out += 4;
+        } else {
+            *out++ = 0xd3;
+            store_be64(out, static_cast<uint64_t>(v));
+            out += 8;
+        }
+        end_scalar(begin, out);
+    }
+    void uint64(std::uint64_t v) {
+        uint8_t* begin = begin_scalar();
+        end_scalar(begin, encode_uint64(begin, v));
+    }
+    void double_(double v) {
+        uint8_t* begin = begin_scalar();
+        begin[0] = 0xcb;
+        store_be64(begin + 1, std::bit_cast<uint64_t>(v));
+        rs_->commit_raw_append(9);
+    }
     void string(std::string_view sv) {
         std::size_t len = sv.size();
         uint8_t* begin = rs_->reserve_raw_append(len + 5);
@@ -622,10 +692,40 @@ public:
     }
 
     // arrays/maps (MsgPack needs sizes up-front)
-    void begin_array(std::size_t n) { msgpack_pack_array(&pk_, n); }
+    void begin_array(std::size_t n) {
+        uint8_t* begin = rs_->reserve_raw_append(5);
+        uint8_t* out = begin;
+        if (n < 16) {
+            *out++ = static_cast<uint8_t>(0x90 | n);
+        } else if (n < 65536) {
+            *out++ = 0xdc;
+            store_be16(out, static_cast<uint16_t>(n));
+            out += 2;
+        } else {
+            *out++ = 0xdd;
+            store_be32(out, static_cast<uint32_t>(n));
+            out += 4;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
     void end_array()                { /* no-op */ }
 
-    void begin_map(std::size_t n)   { msgpack_pack_map(&pk_, n); }
+    void begin_map(std::size_t n) {
+        uint8_t* begin = rs_->reserve_raw_append(5);
+        uint8_t* out = begin;
+        if (n < 16) {
+            *out++ = static_cast<uint8_t>(0x80 | n);
+        } else if (n < 65536) {
+            *out++ = 0xde;
+            store_be16(out, static_cast<uint16_t>(n));
+            out += 2;
+        } else {
+            *out++ = 0xdf;
+            store_be32(out, static_cast<uint32_t>(n));
+            out += 4;
+        }
+        rs_->commit_raw_append(static_cast<std::size_t>(out - begin));
+    }
     void end_map()                  { /* no-op */ }
     void begin_map_preencoded(std::span<const uint8_t> encoded_header) { rs_->write_raw(encoded_header); }
     void begin_map_preencoded(const uint8_t* data, std::size_t len) { rs_->write_raw(data, len); }
