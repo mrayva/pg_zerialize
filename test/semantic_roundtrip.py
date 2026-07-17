@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import os
 import subprocess
 import sys
@@ -79,6 +80,14 @@ CREATE TYPE pg_temp.pgz_sem_direct_arrays AS (
     durations interval[]
 );
 
+CREATE TYPE pg_temp.pgz_sem_numeric_edges AS (
+    trailing_zero numeric,
+    min_i64 numeric,
+    max_i64 numeric,
+    overflow_i64 numeric,
+    values numeric[]
+);
+
 CREATE TEMP TABLE pgz_sem_cases (
     label text PRIMARY KEY,
     payload bytea NOT NULL
@@ -131,6 +140,14 @@ INSERT INTO pgz_sem_cases VALUES
             ARRAY['192.0.2.0/24'::cidr, '2001:db8::/32'::cidr],
             ARRAY['1 day'::interval, '00:00:00.000001'::interval]
         )::pg_temp.pgz_sem_direct_arrays)),
+    ('numeric_edges', row_to_msgpack(
+        ROW(
+            '-0.000'::numeric,
+            '-9223372036854775808'::numeric,
+            '9223372036854775807'::numeric,
+            '9223372036854775808'::numeric,
+            ARRAY['1.25'::numeric, 'NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric]
+        )::pg_temp.pgz_sem_numeric_edges)),
     ('batch_rows', rows_to_msgpack(ARRAY[
         ROW(1, 'one', true, 1.0, NULL)::pg_temp.pgz_sem_primitive,
         NULL::pg_temp.pgz_sem_primitive,
@@ -229,6 +246,7 @@ def main() -> None:
         "float_numeric",
         "native_row",
         "nested_jsonb",
+        "numeric_edges",
         "object_aggregate",
         "primitive_row",
         "unicode_row",
@@ -294,6 +312,18 @@ def main() -> None:
     assert actual["object_aggregate"] == {"one": 1, "two": 2}
     assert actual["enum_renamed"] == {"status": "enabled"}
     assert actual["exact_numeric"] == [9223372036854775807]
+
+    numeric_edges = actual["numeric_edges"]
+    assert numeric_edges["trailing_zero"] == 0
+    assert isinstance(numeric_edges["trailing_zero"], int)
+    assert numeric_edges["min_i64"] == -9223372036854775808
+    assert numeric_edges["max_i64"] == 9223372036854775807
+    assert numeric_edges["overflow_i64"] == float(Decimal("9223372036854775808"))
+    assert isinstance(numeric_edges["overflow_i64"], float)
+    assert numeric_edges["values"][0] == 1.25
+    assert math.isnan(numeric_edges["values"][1])
+    assert numeric_edges["values"][2] == math.inf
+    assert numeric_edges["values"][3] == -math.inf
 
     lossy_source = Decimal("12345678901234567890.123456789")
     assert actual["float_numeric"] == [float(lossy_source)]

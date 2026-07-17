@@ -49,6 +49,7 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <type_traits>
 #include <cmath>
 #include <system_error>
+#include <charconv>
 #include <fast_float/fast_float.h>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
@@ -532,68 +533,77 @@ static z::dyn::Value array_to_dynamic(Datum value, Oid typid)
     return z::dyn::Value::array(std::move(result_array));
 }
 
-static inline bool numeric_try_int64(Datum value, int64_t* out)
+struct NumericFastValue {
+    bool is_int64;
+    int64_t int64_value;
+    double float8_value;
+};
+
+static inline bool numeric_text_try_int64(
+    const char* begin, const char* end, int64_t* out)
 {
-    Numeric num = DatumGetNumeric(value);
-    if (numeric_is_nan(num) || numeric_is_inf(num)) {
-        return false;
+    const char* integer_end = end;
+    const char* decimal = static_cast<const char*>(
+        std::memchr(begin, '.', static_cast<size_t>(end - begin)));
+    if (decimal != nullptr) {
+        for (const char* p = decimal + 1; p < end; p++) {
+            if (*p != '0') {
+                return false;
+            }
+        }
+        integer_end = decimal;
     }
 
-    // numeric_int8_opt_error rounds fractional values. min_scale() is the
-    // cheapest exact check that the value has no significant fractional part.
-    int32 min_scale = DatumGetInt32(DirectFunctionCall1(numeric_min_scale, value));
-    if (min_scale > 0) {
-        return false;
-    }
-
-    bool have_error = false;
-    int64 v = numeric_int8_opt_error(num, &have_error);
-    if (have_error) {
-        return false;
-    }
-
-    *out = static_cast<int64_t>(v);
-    return true;
+    auto parsed = std::from_chars(begin, integer_end, *out);
+    return parsed.ec == std::errc() && parsed.ptr == integer_end;
 }
 
-static inline double numeric_to_float8_fast(Datum value)
+static inline NumericFastValue numeric_parse_fast(Datum value)
 {
+    char* text = DatumGetCString(DirectFunctionCall1(numeric_out, value));
+    const char* end = text + std::strlen(text);
+    int64_t int64_value;
+    if (numeric_text_try_int64(text, end, &int64_value)) {
+        pfree(text);
+        return NumericFastValue{true, int64_value, 0.0};
+    }
+
     if (numeric_float_backend == NUMERIC_FLOAT_FAST_FLOAT) {
-        char* text = DatumGetCString(DirectFunctionCall1(numeric_out, value));
-        const char* end = text + std::strlen(text);
         double result;
         auto parsed = fast_float::from_chars(text, end, result);
         bool valid = parsed.ec == std::errc() && parsed.ptr == end;
         pfree(text);
 
         if (valid) {
-            return result;
+            return NumericFastValue{false, 0, result};
         }
         // Preserve PostgreSQL's overflow and special-value behavior.
+    } else {
+        pfree(text);
     }
 
     Datum float_val = DirectFunctionCall1(numeric_float8, value);
-    return DatumGetFloat8(float_val);
+    return NumericFastValue{false, 0, DatumGetFloat8(float_val)};
 }
 
 template <typename WriterT>
 static inline void numeric_write_fast(WriterT& writer, Datum value)
 {
-    int64_t i64;
-    if (numeric_try_int64(value, &i64)) {
-        writer.int64(i64);
+    NumericFastValue parsed = numeric_parse_fast(value);
+    if (parsed.is_int64) {
+        writer.int64(parsed.int64_value);
     } else {
-        writer.double_(numeric_to_float8_fast(value));
+        writer.double_(parsed.float8_value);
     }
 }
 
 static inline z::dyn::Value numeric_to_dynamic_fast(Datum value)
 {
-    int64_t i64;
-    if (numeric_try_int64(value, &i64)) {
-        return z::dyn::Value(i64);
+    NumericFastValue parsed = numeric_parse_fast(value);
+    if (parsed.is_int64) {
+        return z::dyn::Value(parsed.int64_value);
     }
-    return z::dyn::Value(numeric_to_float8_fast(value));
+    return z::dyn::Value(parsed.float8_value);
 }
 
 static z::dyn::Value jsonb_token_to_dynamic(JsonbIterator** it, JsonbIteratorToken tok, JsonbValue* v);
