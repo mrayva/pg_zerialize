@@ -127,6 +127,12 @@ is parsed with `std::from_chars`; other values use fast_float by default and
 fall back to `numeric_float8` for special or rejected values. The GUC
 `pg_zerialize.numeric_float_backend` selects `fast_float` or `postgres`.
 
+The default `pg_zerialize.numeric_encoding = 'float64'` retains this behavior.
+The opt-in `tagged_decimal` mode emits every `numeric` as
+`["~n","<numeric_out text>","decimal"]` across all protocols, preserving
+precision, display scale, and special values without changing default wire
+compatibility.
+
 ## Memory Management
 
 - Returned `bytea` values use PostgreSQL `palloc`.
@@ -152,5 +158,4 @@ to avoid cross-protocol cache and allocator effects. See `bench/README.md`.
 
 ## Remaining Work
 
-- An explicit exact-decimal wire policy
 - Optional direct recursive writers if real nested workloads justify them

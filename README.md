@@ -109,6 +109,9 @@ spliced into one nested MessagePack document.
 - `float4` and `float8` are protocol floating-point values.
 - Integral `numeric` values fitting in signed 64 bits are exact integers. Other
   `numeric` values are `float64` and may lose decimal precision.
+- Set `pg_zerialize.numeric_encoding = 'tagged_decimal'` to preserve every
+  `numeric` exactly as `["~n", "<canonical text>", "decimal"]` in all four
+  protocols. The default is `float64` for wire compatibility.
 - The default decimal-to-float parser is fast_float. Set
   `pg_zerialize.numeric_float_backend = 'postgres'` to use PostgreSQL's parser.
 - Date values are PostgreSQL days since 2000-01-01.
@@ -164,7 +167,8 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 - Deserialization currently targets JSONB and is available for all four binary
   protocols.
-- Arbitrary-precision decimal values do not have an exact portable wire type.
+- Exact decimals use an opt-in tagged-array convention rather than a native
+  protocol scalar, so non-pg_zerialize consumers must interpret that tag.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON
   semantics are required.
 

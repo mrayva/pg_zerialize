@@ -70,11 +70,23 @@ enum NumericFloatBackend {
     NUMERIC_FLOAT_FAST_FLOAT = 1,
 };
 
+enum NumericEncoding {
+    NUMERIC_ENCODING_FLOAT64 = 0,
+    NUMERIC_ENCODING_TAGGED_DECIMAL = 1,
+};
+
 static int numeric_float_backend = NUMERIC_FLOAT_FAST_FLOAT;
+static int numeric_encoding = NUMERIC_ENCODING_FLOAT64;
 
 static const config_enum_entry numeric_float_backend_options[] = {
     {"postgres", NUMERIC_FLOAT_POSTGRES, false},
     {"fast_float", NUMERIC_FLOAT_FAST_FLOAT, false},
+    {nullptr, 0, false},
+};
+
+static const config_enum_entry numeric_encoding_options[] = {
+    {"float64", NUMERIC_ENCODING_FLOAT64, false},
+    {"tagged_decimal", NUMERIC_ENCODING_TAGGED_DECIMAL, false},
     {nullptr, 0, false},
 };
 
@@ -303,6 +315,18 @@ _PG_init(void)
         &numeric_float_backend,
         NUMERIC_FLOAT_FAST_FLOAT,
         numeric_float_backend_options,
+        PGC_USERSET,
+        GUC_NOT_IN_SAMPLE,
+        nullptr,
+        nullptr,
+        nullptr);
+    DefineCustomEnumVariable(
+        "pg_zerialize.numeric_encoding",
+        "Selects the cross-protocol wire representation for numeric values.",
+        nullptr,
+        &numeric_encoding,
+        NUMERIC_ENCODING_FLOAT64,
+        numeric_encoding_options,
         PGC_USERSET,
         GUC_NOT_IN_SAMPLE,
         nullptr,
@@ -615,6 +639,17 @@ static inline NumericFastValue numeric_parse_fast(Datum value)
 template <typename WriterT>
 static inline void numeric_write_fast(WriterT& writer, Datum value)
 {
+    if (numeric_encoding == NUMERIC_ENCODING_TAGGED_DECIMAL) {
+        char* text = DatumGetCString(DirectFunctionCall1(numeric_out, value));
+        writer.begin_array(3);
+        writer.string("~n");
+        writer.string(std::string_view(text));
+        writer.string("decimal");
+        writer.end_array();
+        pfree(text);
+        return;
+    }
+
     NumericFastValue parsed = numeric_parse_fast(value);
     if (parsed.is_int64) {
         writer.int64(parsed.int64_value);
@@ -625,6 +660,17 @@ static inline void numeric_write_fast(WriterT& writer, Datum value)
 
 static inline z::dyn::Value numeric_to_dynamic_fast(Datum value)
 {
+    if (numeric_encoding == NUMERIC_ENCODING_TAGGED_DECIMAL) {
+        char* text = DatumGetCString(DirectFunctionCall1(numeric_out, value));
+        z::dyn::Value::Array tagged;
+        tagged.reserve(3);
+        tagged.emplace_back("~n");
+        tagged.emplace_back(std::string(text));
+        tagged.emplace_back("decimal");
+        pfree(text);
+        return z::dyn::Value::array(std::move(tagged));
+    }
+
     NumericFastValue parsed = numeric_parse_fast(value);
     if (parsed.is_int64) {
         return z::dyn::Value(parsed.int64_value);
