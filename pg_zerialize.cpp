@@ -90,6 +90,7 @@ extern "C" {
     Datum row_to_msgpack_slow(PG_FUNCTION_ARGS);
     Datum msgpack_from_jsonb(PG_FUNCTION_ARGS);
     Datum msgpack_to_jsonb(PG_FUNCTION_ARGS);
+    Datum flexbuffers_to_jsonb(PG_FUNCTION_ARGS);
     Datum msgpack_build_object(PG_FUNCTION_ARGS);
     Datum msgpack_build_array(PG_FUNCTION_ARGS);
     Datum msgpack_agg_final(PG_FUNCTION_ARGS);
@@ -109,6 +110,7 @@ extern "C" {
     PG_FUNCTION_INFO_V1(row_to_msgpack_slow);
     PG_FUNCTION_INFO_V1(msgpack_from_jsonb);
     PG_FUNCTION_INFO_V1(msgpack_to_jsonb);
+    PG_FUNCTION_INFO_V1(flexbuffers_to_jsonb);
     PG_FUNCTION_INFO_V1(msgpack_build_object);
     PG_FUNCTION_INFO_V1(msgpack_build_array);
     PG_FUNCTION_INFO_V1(msgpack_agg_final);
@@ -941,6 +943,79 @@ static void msgpack_reader_to_json(
         out.push_back('}');
     } else {
         throw z::DeserializationError("unsupported MessagePack value");
+    }
+}
+
+static void flex_reference_to_json(
+    const ::flexbuffers::Reference& value, std::string& out)
+{
+    check_stack_depth();
+    if (value.IsNull()) {
+        out += "null";
+    } else if (value.IsBool()) {
+        out += value.AsBool() ? "true" : "false";
+    } else if (value.IsUInt()) {
+        append_json_number(out, value.AsUInt64());
+    } else if (value.IsInt()) {
+        append_json_number(out, value.AsInt64());
+    } else if (value.IsFloat()) {
+        const double number = value.AsDouble();
+        if (std::isfinite(number)) {
+            append_json_number(out, number);
+        } else if (std::isnan(number)) {
+            append_json_string(out, "NaN");
+        } else {
+            append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
+        }
+    } else if (value.IsString()) {
+        auto string_value = value.AsString();
+        append_json_string(
+            out, std::string_view(string_value.c_str(), string_value.size()));
+    } else if (value.IsBlob()) {
+        auto blob = value.AsBlob();
+        auto bytes = std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(blob.data()), blob.size());
+        out += "[\"~b\",";
+        append_json_string(out, z::base64Encode(bytes));
+        out += ",\"base64\"]";
+    } else if (value.IsMap()) {
+        auto map = value.AsMap();
+        auto keys = map.Keys();
+        auto values = map.Values();
+        std::unordered_set<std::string_view> seen_keys;
+
+        out.push_back('{');
+        for (size_t i = 0; i < keys.size(); i++) {
+            if (i > 0) out.push_back(',');
+            auto key_value = keys[i].AsString();
+            std::string_view key(key_value.c_str(), key_value.size());
+            if (!seen_keys.insert(key).second) {
+                throw z::DeserializationError("duplicate FlexBuffer map key");
+            }
+            append_json_string(out, key);
+            out.push_back(':');
+            flex_reference_to_json(values[i], out);
+        }
+        out.push_back('}');
+    } else if (value.IsAnyVector()) {
+        auto append_vector = [&](const auto& vector) {
+            out.push_back('[');
+            for (size_t i = 0; i < vector.size(); i++) {
+                if (i > 0) out.push_back(',');
+                flex_reference_to_json(vector[i], out);
+            }
+            out.push_back(']');
+        };
+
+        if (value.IsTypedVector()) {
+            append_vector(value.AsTypedVector());
+        } else if (value.IsFixedTypedVector()) {
+            append_vector(value.AsFixedTypedVector());
+        } else {
+            append_vector(value.AsVector());
+        }
+    } else {
+        throw z::DeserializationError("unsupported FlexBuffer value");
     }
 }
 
@@ -3934,6 +4009,44 @@ msgpack_to_jsonb(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
                  errmsg("invalid MessagePack input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * flexbuffers_to_jsonb - Verify and decode one FlexBuffer value to jsonb.
+ */
+extern "C" Datum
+flexbuffers_to_jsonb(PG_FUNCTION_ARGS)
+{
+    bytea* input = PG_GETARG_BYTEA_PP(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+
+    try {
+        if (!::flexbuffers::VerifyBuffer(bytes, length)) {
+            throw z::DeserializationError("FlexBuffer verification failed");
+        }
+
+        ::flexbuffers::Reference root = ::flexbuffers::GetRoot(bytes, length);
+        std::string json;
+        json.reserve(length + 32);
+        flex_reference_to_json(root, json);
+        PG_FREE_IF_COPY(input, 0);
+
+        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        PG_RETURN_DATUM(result);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid FlexBuffer input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid FlexBuffer input"),
                  errdetail("unknown decoding error")));
     }
 

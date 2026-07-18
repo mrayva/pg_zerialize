@@ -94,6 +94,7 @@ SELECT msgpack_build_array(1, 'two', NULL, 3.5::numeric);
 SELECT msgpack_agg(value ORDER BY id) FROM items;
 SELECT msgpack_object_agg(key, value ORDER BY key) FROM items;
 SELECT msgpack_to_jsonb(msgpack_build_object('id', 7, 'active', true));
+SELECT flexbuffers_to_jsonb(row_to_flexbuffers(users.*)) FROM users;
 ```
 
 Passing a builder's `bytea` result into another builder encodes that result as a
@@ -124,6 +125,8 @@ spliced into one nested MessagePack document.
 - SQL decoding accepts one complete MessagePack value with unique string map
   keys. Extension markers, duplicate/non-string keys, NUL strings, malformed
   input, and trailing bytes are rejected.
+- `flexbuffers_to_jsonb` verifies the complete FlexBuffer before decoding.
+  Blobs and non-finite floats use the same JSONB conventions as MessagePack.
 
 ## Fast Paths
 
@@ -151,8 +154,8 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 ## Current Limitations
 
-- Deserialization currently targets JSONB and is available for MessagePack;
-  FlexBuffer, CBOR, and ZERA decoding are not yet exposed to SQL.
+- Deserialization currently targets JSONB and is available for MessagePack and
+  FlexBuffer; CBOR and ZERA decoding are not yet exposed to SQL.
 - Arbitrary-precision decimal values do not have an exact portable wire type.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON
   semantics are required.

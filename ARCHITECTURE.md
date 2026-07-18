@@ -108,6 +108,10 @@ objects, arrays, scalars, and nulls into MessagePack.
 vendored reader, then recursively maps it to JSONB. MessagePack binary values
 use zerialize's tagged base64 JSON convention.
 
+`flexbuffers_to_jsonb` applies FlatBuffers' recursive FlexBuffer verifier before
+walking raw references by index. This avoids unchecked offsets and does not
+depend on binary-search lookup for hostile map key ordering.
+
 ## Numeric Conversion
 
 `numeric_out` produces PostgreSQL's canonical decimal text once. Integral text
@@ -140,6 +144,6 @@ to avoid cross-protocol cache and allocator effects. See `bench/README.md`.
 
 ## Remaining Work
 
-- FlexBuffer, CBOR, and ZERA JSONB deserialization APIs
+- CBOR and ZERA JSONB deserialization APIs
 - An explicit exact-decimal wire policy
 - Optional direct recursive writers if real nested workloads justify them

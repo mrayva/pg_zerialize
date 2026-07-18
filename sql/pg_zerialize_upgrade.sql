@@ -23,4 +23,12 @@ SELECT to_regprocedure('msgpack_to_jsonb(bytea)') IS NOT NULL AS decoder_present
 SELECT msgpack_to_jsonb(msgpack_from_jsonb('{"upgrade":true}'::jsonb)) =
        '{"upgrade":true}'::jsonb AS decoder_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.4';
+SELECT extversion = '1.4' AS upgraded_to_1_4
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('flexbuffers_to_jsonb(bytea)') IS NOT NULL AS flex_decoder_present;
+SELECT flexbuffers_to_jsonb(row_to_flexbuffers(ROW(1, 'upgrade-ok'))) =
+       '{"f1":1,"f2":"upgrade-ok"}'::jsonb AS flex_decoder_works;
+
 DROP EXTENSION pg_zerialize;
