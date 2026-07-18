@@ -91,6 +91,7 @@ extern "C" {
     Datum msgpack_from_jsonb(PG_FUNCTION_ARGS);
     Datum msgpack_to_jsonb(PG_FUNCTION_ARGS);
     Datum flexbuffers_to_jsonb(PG_FUNCTION_ARGS);
+    Datum cbor_to_jsonb(PG_FUNCTION_ARGS);
     Datum msgpack_build_object(PG_FUNCTION_ARGS);
     Datum msgpack_build_array(PG_FUNCTION_ARGS);
     Datum msgpack_agg_final(PG_FUNCTION_ARGS);
@@ -111,6 +112,7 @@ extern "C" {
     PG_FUNCTION_INFO_V1(msgpack_from_jsonb);
     PG_FUNCTION_INFO_V1(msgpack_to_jsonb);
     PG_FUNCTION_INFO_V1(flexbuffers_to_jsonb);
+    PG_FUNCTION_INFO_V1(cbor_to_jsonb);
     PG_FUNCTION_INFO_V1(msgpack_build_object);
     PG_FUNCTION_INFO_V1(msgpack_build_array);
     PG_FUNCTION_INFO_V1(msgpack_agg_final);
@@ -847,11 +849,11 @@ static size_t msgpack_validate_value(std::span<const uint8_t> data, size_t pos)
 static void append_json_string(std::string& out, std::string_view value)
 {
     if (value.find('\0') != std::string_view::npos) {
-        throw z::DeserializationError("MessagePack string contains NUL");
+        throw z::DeserializationError("decoded string contains NUL");
     }
     if (!pg_verify_mbstr(GetDatabaseEncoding(), value.data(), value.size(), true)) {
         throw z::DeserializationError(
-            "MessagePack string is invalid in the database encoding");
+            "decoded string is invalid in the database encoding");
     }
     static constexpr char hex[] = "0123456789abcdef";
     out.push_back('"');
@@ -890,7 +892,7 @@ static void append_json_number(std::string& out, Number value)
         converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
     }
     if (converted.ec != std::errc()) {
-        throw z::DeserializationError("failed to format MessagePack number");
+        throw z::DeserializationError("failed to format decoded number");
     }
     out.append(buffer.data(), converted.ptr);
 }
@@ -1016,6 +1018,296 @@ static void flex_reference_to_json(
         }
     } else {
         throw z::DeserializationError("unsupported FlexBuffer value");
+    }
+}
+
+struct CborHead {
+    uint8_t major;
+    uint8_t additional;
+    uint64_t value;
+    size_t next;
+    bool indefinite;
+};
+
+static inline void cbor_require_bytes(
+    std::span<const uint8_t> data, size_t pos, size_t count)
+{
+    if (pos > data.size() || count > data.size() - pos) {
+        throw z::DeserializationError("truncated CBOR value");
+    }
+}
+
+static CborHead cbor_read_head(std::span<const uint8_t> data, size_t pos)
+{
+    cbor_require_bytes(data, pos, 1);
+    const uint8_t initial = data[pos++];
+    CborHead head{static_cast<uint8_t>(initial >> 5),
+                  static_cast<uint8_t>(initial & 0x1f), 0, pos, false};
+
+    if (head.additional < 24) {
+        head.value = head.additional;
+        return head;
+    }
+    if (head.additional == 31) {
+        head.indefinite = true;
+        return head;
+    }
+    if (head.additional >= 28) {
+        throw z::DeserializationError("reserved CBOR additional information");
+    }
+
+    const size_t width = size_t{1} << (head.additional - 24);
+    cbor_require_bytes(data, pos, width);
+    for (size_t i = 0; i < width; i++) {
+        head.value = (head.value << 8) | data[pos + i];
+    }
+    head.next = pos + width;
+    return head;
+}
+
+static size_t cbor_parse_text(
+    std::span<const uint8_t> data, size_t pos, std::string* result)
+{
+    CborHead head = cbor_read_head(data, pos);
+    if (head.major != 3) {
+        throw z::DeserializationError("CBOR map key is not a text string");
+    }
+
+    if (!head.indefinite) {
+        if (head.value > std::numeric_limits<size_t>::max()) {
+            throw z::DeserializationError("CBOR text string is too large");
+        }
+        const size_t length = static_cast<size_t>(head.value);
+        cbor_require_bytes(data, head.next, length);
+        result->assign(reinterpret_cast<const char*>(data.data() + head.next), length);
+        return head.next + length;
+    }
+
+    result->clear();
+    pos = head.next;
+    for (;;) {
+        cbor_require_bytes(data, pos, 1);
+        if (data[pos] == 0xff) {
+            return pos + 1;
+        }
+        CborHead chunk = cbor_read_head(data, pos);
+        if (chunk.major != 3 || chunk.indefinite) {
+            throw z::DeserializationError("invalid CBOR text string chunk");
+        }
+        if (chunk.value > std::numeric_limits<size_t>::max()) {
+            throw z::DeserializationError("CBOR text string chunk is too large");
+        }
+        const size_t length = static_cast<size_t>(chunk.value);
+        cbor_require_bytes(data, chunk.next, length);
+        result->append(
+            reinterpret_cast<const char*>(data.data() + chunk.next), length);
+        pos = chunk.next + length;
+    }
+}
+
+static size_t cbor_parse_bytes(
+    std::span<const uint8_t> data, size_t pos, std::vector<std::byte>* result)
+{
+    CborHead head = cbor_read_head(data, pos);
+    if (head.major != 2) {
+        throw z::DeserializationError("CBOR value is not a byte string");
+    }
+
+    result->clear();
+    if (!head.indefinite) {
+        if (head.value > std::numeric_limits<size_t>::max()) {
+            throw z::DeserializationError("CBOR byte string is too large");
+        }
+        const size_t length = static_cast<size_t>(head.value);
+        cbor_require_bytes(data, head.next, length);
+        const auto* begin = reinterpret_cast<const std::byte*>(
+            data.data() + head.next);
+        result->assign(begin, begin + length);
+        return head.next + length;
+    }
+
+    pos = head.next;
+    for (;;) {
+        cbor_require_bytes(data, pos, 1);
+        if (data[pos] == 0xff) {
+            return pos + 1;
+        }
+        CborHead chunk = cbor_read_head(data, pos);
+        if (chunk.major != 2 || chunk.indefinite) {
+            throw z::DeserializationError("invalid CBOR byte string chunk");
+        }
+        if (chunk.value > std::numeric_limits<size_t>::max()) {
+            throw z::DeserializationError("CBOR byte string chunk is too large");
+        }
+        const size_t length = static_cast<size_t>(chunk.value);
+        cbor_require_bytes(data, chunk.next, length);
+        const auto* begin = reinterpret_cast<const std::byte*>(
+            data.data() + chunk.next);
+        result->insert(result->end(), begin, begin + length);
+        pos = chunk.next + length;
+    }
+}
+
+static double cbor_decode_half(uint16_t bits)
+{
+    const bool negative = (bits & 0x8000) != 0;
+    const uint16_t exponent = (bits >> 10) & 0x1f;
+    const uint16_t fraction = bits & 0x03ff;
+
+    if (exponent == 0) {
+        if (fraction == 0) return negative ? -0.0 : 0.0;
+        const double value = std::ldexp(static_cast<double>(fraction), -24);
+        return negative ? -value : value;
+    }
+    if (exponent == 0x1f) {
+        if (fraction != 0) return std::numeric_limits<double>::quiet_NaN();
+        return negative ? -std::numeric_limits<double>::infinity()
+                        : std::numeric_limits<double>::infinity();
+    }
+
+    const double mantissa = 1.0 + static_cast<double>(fraction) / 1024.0;
+    const double value = std::ldexp(mantissa, static_cast<int>(exponent) - 15);
+    return negative ? -value : value;
+}
+
+static void append_cbor_float(std::string& out, double number)
+{
+    if (std::isfinite(number)) {
+        append_json_number(out, number);
+    } else if (std::isnan(number)) {
+        append_json_string(out, "NaN");
+    } else {
+        append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
+    }
+}
+
+static size_t cbor_value_to_json(
+    std::span<const uint8_t> data, size_t pos, std::string& out)
+{
+    check_stack_depth();
+    CborHead head = cbor_read_head(data, pos);
+
+    if (head.major <= 1 && head.indefinite) {
+        throw z::DeserializationError("indefinite CBOR integer");
+    }
+
+    switch (head.major) {
+        case 0:
+            append_json_number(out, head.value);
+            return head.next;
+        case 1:
+            if (head.value <= static_cast<uint64_t>(INT64_MAX)) {
+                const int64_t value = -1 - static_cast<int64_t>(head.value);
+                append_json_number(out, value);
+            } else if (head.value == UINT64_MAX) {
+                out += "-18446744073709551616";
+            } else {
+                out.push_back('-');
+                append_json_number(out, head.value + 1);
+            }
+            return head.next;
+        case 2:
+        {
+            std::vector<std::byte> bytes;
+            const size_t next = cbor_parse_bytes(data, pos, &bytes);
+            out += "[\"~b\",";
+            append_json_string(out, z::base64Encode(bytes));
+            out += ",\"base64\"]";
+            return next;
+        }
+        case 3:
+        {
+            std::string text_value;
+            const size_t next = cbor_parse_text(data, pos, &text_value);
+            append_json_string(out, text_value);
+            return next;
+        }
+        case 4:
+        {
+            out.push_back('[');
+            size_t cursor = head.next;
+            uint64_t index = 0;
+            if (head.indefinite) {
+                while (true) {
+                    cbor_require_bytes(data, cursor, 1);
+                    if (data[cursor] == 0xff) {
+                        cursor++;
+                        break;
+                    }
+                    if (index++ > 0) out.push_back(',');
+                    cursor = cbor_value_to_json(data, cursor, out);
+                }
+            } else {
+                for (; index < head.value; index++) {
+                    if (index > 0) out.push_back(',');
+                    cursor = cbor_value_to_json(data, cursor, out);
+                }
+            }
+            out.push_back(']');
+            return cursor;
+        }
+        case 5:
+        {
+            out.push_back('{');
+            size_t cursor = head.next;
+            uint64_t index = 0;
+            std::unordered_set<std::string> keys;
+            auto append_entry = [&]() {
+                std::string key;
+                cursor = cbor_parse_text(data, cursor, &key);
+                if (!keys.insert(key).second) {
+                    throw z::DeserializationError("duplicate CBOR map key");
+                }
+                if (index++ > 0) out.push_back(',');
+                append_json_string(out, key);
+                out.push_back(':');
+                cursor = cbor_value_to_json(data, cursor, out);
+            };
+
+            if (head.indefinite) {
+                while (true) {
+                    cbor_require_bytes(data, cursor, 1);
+                    if (data[cursor] == 0xff) {
+                        cursor++;
+                        break;
+                    }
+                    append_entry();
+                }
+            } else {
+                while (index < head.value) append_entry();
+            }
+            out.push_back('}');
+            return cursor;
+        }
+        case 6:
+            throw z::DeserializationError("CBOR semantic tags are not supported");
+        case 7:
+            if (head.indefinite) {
+                throw z::DeserializationError("unexpected CBOR break marker");
+            }
+            if (head.additional == 20 || head.additional == 21) {
+                out += head.additional == 21 ? "true" : "false";
+                return head.next;
+            }
+            if (head.additional == 22) {
+                out += "null";
+                return head.next;
+            }
+            if (head.additional == 25) {
+                append_cbor_float(out, cbor_decode_half(static_cast<uint16_t>(head.value)));
+                return head.next;
+            }
+            if (head.additional == 26) {
+                append_cbor_float(out, std::bit_cast<float>(static_cast<uint32_t>(head.value)));
+                return head.next;
+            }
+            if (head.additional == 27) {
+                append_cbor_float(out, std::bit_cast<double>(head.value));
+                return head.next;
+            }
+            throw z::DeserializationError("unsupported CBOR simple value");
+        default:
+            pg_unreachable();
     }
 }
 
@@ -4047,6 +4339,43 @@ flexbuffers_to_jsonb(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
                  errmsg("invalid FlexBuffer input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * cbor_to_jsonb - Strictly parse one complete CBOR value to jsonb.
+ */
+extern "C" Datum
+cbor_to_jsonb(PG_FUNCTION_ARGS)
+{
+    bytea* input = PG_GETARG_BYTEA_PP(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json;
+        json.reserve(length + 32);
+        const size_t consumed = cbor_value_to_json(data, 0, json);
+        if (consumed != data.size()) {
+            throw z::DeserializationError("trailing bytes after CBOR value");
+        }
+        PG_FREE_IF_COPY(input, 0);
+
+        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        PG_RETURN_DATUM(result);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid CBOR input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid CBOR input"),
                  errdetail("unknown decoding error")));
     }
 

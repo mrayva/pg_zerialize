@@ -112,6 +112,10 @@ use zerialize's tagged base64 JSON convention.
 walking raw references by index. This avoids unchecked offsets and does not
 depend on binary-search lookup for hostile map key ordering.
 
+`cbor_to_jsonb` uses a bounded recursive CBOR parser instead of the vendored
+reader's unchecked iterator helpers. It accepts definite and indefinite
+containers but rejects semantic tags because their JSONB mapping is ambiguous.
+
 ## Numeric Conversion
 
 `numeric_out` produces PostgreSQL's canonical decimal text once. Integral text
@@ -144,6 +148,6 @@ to avoid cross-protocol cache and allocator effects. See `bench/README.md`.
 
 ## Remaining Work
 
-- CBOR and ZERA JSONB deserialization APIs
+- ZERA JSONB deserialization API
 - An explicit exact-decimal wire policy
 - Optional direct recursive writers if real nested workloads justify them

@@ -31,4 +31,12 @@ SELECT to_regprocedure('flexbuffers_to_jsonb(bytea)') IS NOT NULL AS flex_decode
 SELECT flexbuffers_to_jsonb(row_to_flexbuffers(ROW(1, 'upgrade-ok'))) =
        '{"f1":1,"f2":"upgrade-ok"}'::jsonb AS flex_decoder_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.5';
+SELECT extversion = '1.5' AS upgraded_to_1_5
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('cbor_to_jsonb(bytea)') IS NOT NULL AS cbor_decoder_present;
+SELECT cbor_to_jsonb(row_to_cbor(ROW(1, 'upgrade-ok'))) =
+       '{"f1":1,"f2":"upgrade-ok"}'::jsonb AS cbor_decoder_works;
+
 DROP EXTENSION pg_zerialize;
