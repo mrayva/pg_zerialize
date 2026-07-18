@@ -39,4 +39,12 @@ SELECT to_regprocedure('cbor_to_jsonb(bytea)') IS NOT NULL AS cbor_decoder_prese
 SELECT cbor_to_jsonb(row_to_cbor(ROW(1, 'upgrade-ok'))) =
        '{"f1":1,"f2":"upgrade-ok"}'::jsonb AS cbor_decoder_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.6';
+SELECT extversion = '1.6' AS upgraded_to_1_6
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('zera_to_jsonb(bytea)') IS NOT NULL AS zera_decoder_present;
+SELECT zera_to_jsonb(row_to_zera(ROW(1, 'upgrade-ok'))) =
+       '{"f1":1,"f2":"upgrade-ok"}'::jsonb AS zera_decoder_works;
+
 DROP EXTENSION pg_zerialize;

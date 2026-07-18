@@ -92,6 +92,7 @@ extern "C" {
     Datum msgpack_to_jsonb(PG_FUNCTION_ARGS);
     Datum flexbuffers_to_jsonb(PG_FUNCTION_ARGS);
     Datum cbor_to_jsonb(PG_FUNCTION_ARGS);
+    Datum zera_to_jsonb(PG_FUNCTION_ARGS);
     Datum msgpack_build_object(PG_FUNCTION_ARGS);
     Datum msgpack_build_array(PG_FUNCTION_ARGS);
     Datum msgpack_agg_final(PG_FUNCTION_ARGS);
@@ -113,6 +114,7 @@ extern "C" {
     PG_FUNCTION_INFO_V1(msgpack_to_jsonb);
     PG_FUNCTION_INFO_V1(flexbuffers_to_jsonb);
     PG_FUNCTION_INFO_V1(cbor_to_jsonb);
+    PG_FUNCTION_INFO_V1(zera_to_jsonb);
     PG_FUNCTION_INFO_V1(msgpack_build_object);
     PG_FUNCTION_INFO_V1(msgpack_build_array);
     PG_FUNCTION_INFO_V1(msgpack_agg_final);
@@ -1309,6 +1311,195 @@ static size_t cbor_value_to_json(
         default:
             pg_unreachable();
     }
+}
+
+struct ZeraDecodeContext {
+    std::span<const uint8_t> envelope;
+    std::span<const uint8_t> arena;
+    std::unordered_set<uint32_t> active_refs;
+};
+
+static inline void zera_require_span(
+    std::span<const uint8_t> data, size_t offset, size_t length,
+    const char* message)
+{
+    if (offset > data.size() || length > data.size() - offset) {
+        throw z::DeserializationError(message);
+    }
+}
+
+static size_t zera_value_to_json(
+    ZeraDecodeContext& context, uint32_t ref_offset, std::string& out,
+    size_t depth)
+{
+    if (depth > 64) {
+        throw z::DeserializationError("ZERA nesting depth exceeds 64");
+    }
+    zera_require_span(
+        context.envelope, ref_offset, 16, "ZERA ValueRef is out of bounds");
+    if (!context.active_refs.insert(ref_offset).second) {
+        throw z::DeserializationError("cyclic ZERA envelope reference");
+    }
+
+    const uint8_t* ref = context.envelope.data() + ref_offset;
+    const auto tag = static_cast<z::zera::Tag>(ref[0]);
+    const uint8_t flags = ref[1];
+    const uint16_t aux = z::zera::read_u16_le(ref + 2);
+    const uint32_t a = z::zera::read_u32_le(ref + 4);
+    const uint32_t b = z::zera::read_u32_le(ref + 8);
+    const uint32_t c = z::zera::read_u32_le(ref + 12);
+
+    auto require_no_flags = [&]() {
+        if (flags != 0) {
+            throw z::DeserializationError("non-string ZERA value has flags");
+        }
+    };
+
+    switch (tag) {
+        case z::zera::Tag::Null:
+            require_no_flags();
+            out += "null";
+            break;
+        case z::zera::Tag::Bool:
+            require_no_flags();
+            if (aux > 1) throw z::DeserializationError("invalid ZERA boolean");
+            out += aux == 1 ? "true" : "false";
+            break;
+        case z::zera::Tag::I64:
+        {
+            require_no_flags();
+            const uint64_t bits = static_cast<uint64_t>(a) |
+                                  (static_cast<uint64_t>(b) << 32);
+            append_json_number(out, static_cast<int64_t>(bits));
+            break;
+        }
+        case z::zera::Tag::U64:
+        {
+            require_no_flags();
+            const uint64_t value = static_cast<uint64_t>(a) |
+                                   (static_cast<uint64_t>(b) << 32);
+            append_json_number(out, value);
+            break;
+        }
+        case z::zera::Tag::F64:
+        {
+            require_no_flags();
+            const uint64_t bits = static_cast<uint64_t>(a) |
+                                  (static_cast<uint64_t>(b) << 32);
+            append_cbor_float(out, std::bit_cast<double>(bits));
+            break;
+        }
+        case z::zera::Tag::String:
+        {
+            if ((flags & ~uint8_t{1}) != 0) {
+                throw z::DeserializationError("unknown ZERA string flags");
+            }
+            std::string_view value;
+            if ((flags & 1) != 0) {
+                if (aux > z::zera::InlineMax) {
+                    throw z::DeserializationError("ZERA inline string is too long");
+                }
+                value = std::string_view(
+                    reinterpret_cast<const char*>(ref + 4), aux);
+            } else {
+                zera_require_span(
+                    context.arena, a, b, "ZERA string arena span is out of bounds");
+                value = std::string_view(
+                    reinterpret_cast<const char*>(context.arena.data() + a), b);
+            }
+            append_json_string(out, value);
+            break;
+        }
+        case z::zera::Tag::Array:
+        {
+            require_no_flags();
+            zera_require_span(
+                context.envelope, a, 4, "ZERA array payload is out of bounds");
+            const uint32_t count = z::zera::read_u32_le(context.envelope.data() + a);
+            const size_t values_offset = static_cast<size_t>(a) + 4;
+            if (static_cast<size_t>(count) >
+                (context.envelope.size() - values_offset) / 16) {
+                throw z::DeserializationError("ZERA array values are out of bounds");
+            }
+            out.push_back('[');
+            for (uint32_t i = 0; i < count; i++) {
+                if (i > 0) out.push_back(',');
+                zera_value_to_json(
+                    context,
+                    static_cast<uint32_t>(values_offset + 16 * static_cast<size_t>(i)),
+                    out, depth + 1);
+            }
+            out.push_back(']');
+            break;
+        }
+        case z::zera::Tag::Object:
+        {
+            require_no_flags();
+            zera_require_span(
+                context.envelope, a, 4, "ZERA object payload is out of bounds");
+            const uint32_t count = z::zera::read_u32_le(context.envelope.data() + a);
+            size_t cursor = static_cast<size_t>(a) + 4;
+            std::unordered_set<std::string> keys;
+            out.push_back('{');
+            for (uint32_t i = 0; i < count; i++) {
+                zera_require_span(
+                    context.envelope, cursor, 4, "ZERA object entry is truncated");
+                const uint8_t* entry = context.envelope.data() + cursor;
+                const uint16_t key_length = z::zera::read_u16_le(entry);
+                const uint16_t reserved = z::zera::read_u16_le(entry + 2);
+                if (reserved != 0) {
+                    throw z::DeserializationError("ZERA object reserved field is nonzero");
+                }
+                cursor += 4;
+                zera_require_span(
+                    context.envelope, cursor, static_cast<size_t>(key_length) + 16,
+                    "ZERA object key/value is truncated");
+                std::string key(
+                    reinterpret_cast<const char*>(context.envelope.data() + cursor),
+                    key_length);
+                if (!keys.insert(key).second) {
+                    throw z::DeserializationError("duplicate ZERA object key");
+                }
+                if (i > 0) out.push_back(',');
+                append_json_string(out, key);
+                out.push_back(':');
+                cursor += key_length;
+                zera_value_to_json(
+                    context, static_cast<uint32_t>(cursor), out, depth + 1);
+                cursor += 16;
+            }
+            out.push_back('}');
+            break;
+        }
+        case z::zera::Tag::TypedArray:
+        {
+            require_no_flags();
+            if (aux != static_cast<uint16_t>(z::zera::DType::U8)) {
+                throw z::DeserializationError(
+                    "non-U8 ZERA typed arrays are not supported");
+            }
+            zera_require_span(
+                context.arena, a, b, "ZERA blob arena span is out of bounds");
+            zera_require_span(
+                context.envelope, c, 12, "ZERA blob shape is out of bounds");
+            const uint8_t* shape = context.envelope.data() + c;
+            if (z::zera::read_u32_le(shape) != 1 ||
+                z::zera::read_u64_le(shape + 4) != b) {
+                throw z::DeserializationError("invalid ZERA blob shape");
+            }
+            auto bytes = std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(context.arena.data() + a), b);
+            out += "[\"~b\",";
+            append_json_string(out, z::base64Encode(bytes));
+            out += ",\"base64\"]";
+            break;
+        }
+        default:
+            throw z::DeserializationError("unknown ZERA value tag");
+    }
+
+    context.active_refs.erase(ref_offset);
+    return ref_offset + 16;
 }
 
 static z::dyn::Value jsonb_to_dynamic(Jsonb* jb)
@@ -4376,6 +4567,76 @@ cbor_to_jsonb(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
                  errmsg("invalid CBOR input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * zera_to_jsonb - Validate and decode one ZERA v1 document to jsonb.
+ */
+extern "C" Datum
+zera_to_jsonb(PG_FUNCTION_ARGS)
+{
+    bytea* input = PG_GETARG_BYTEA_PP(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        if (data.size() < z::zera::HeaderSize) {
+            throw z::DeserializationError("truncated ZERA header");
+        }
+        const z::zera::HeaderView header = z::zera::parse_header(data);
+        if (header.magic != z::zera::Magic) {
+            throw z::DeserializationError("invalid ZERA magic");
+        }
+        if (header.version != z::zera::Version) {
+            throw z::DeserializationError("unsupported ZERA version");
+        }
+        if (header.flags != 1) {
+            throw z::DeserializationError("invalid ZERA header flags");
+        }
+        if (header.env_size < 16 ||
+            header.env_size > data.size() - z::zera::HeaderSize) {
+            throw z::DeserializationError("invalid ZERA envelope size");
+        }
+        if (header.root_ofs > header.env_size - 16) {
+            throw z::DeserializationError("ZERA root ValueRef is out of bounds");
+        }
+        const size_t envelope_end =
+            z::zera::HeaderSize + static_cast<size_t>(header.env_size);
+        if (header.arena_ofs < envelope_end || header.arena_ofs > data.size() ||
+            header.arena_ofs % z::zera::ArenaBaseAlign != 0) {
+            throw z::DeserializationError("invalid ZERA arena offset");
+        }
+        for (size_t i = envelope_end; i < header.arena_ofs; i++) {
+            if (data[i] != 0) {
+                throw z::DeserializationError("nonzero ZERA envelope padding");
+            }
+        }
+
+        ZeraDecodeContext context{
+            data.subspan(z::zera::HeaderSize, header.env_size),
+            data.subspan(header.arena_ofs),
+            {}};
+        std::string json;
+        json.reserve(length + 32);
+        zera_value_to_json(context, header.root_ofs, json, 0);
+        PG_FREE_IF_COPY(input, 0);
+
+        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        PG_RETURN_DATUM(result);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid ZERA input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid ZERA input"),
                  errdetail("unknown decoding error")));
     }
 

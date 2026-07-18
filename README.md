@@ -96,6 +96,7 @@ SELECT msgpack_object_agg(key, value ORDER BY key) FROM items;
 SELECT msgpack_to_jsonb(msgpack_build_object('id', 7, 'active', true));
 SELECT flexbuffers_to_jsonb(row_to_flexbuffers(users.*)) FROM users;
 SELECT cbor_to_jsonb(row_to_cbor(users.*)) FROM users;
+SELECT zera_to_jsonb(row_to_zera(users.*)) FROM users;
 ```
 
 Passing a builder's `bytea` result into another builder encodes that result as a
@@ -131,6 +132,9 @@ spliced into one nested MessagePack document.
 - `cbor_to_jsonb` strictly parses definite and indefinite CBOR containers.
   Semantic tags, duplicate/non-string map keys, unsupported simple values,
   malformed input, and trailing bytes are rejected.
+- `zera_to_jsonb` validates the ZERA v1 header and recursively validates every
+  referenced value. Cycles, duplicate keys, corrupt offsets/shapes, and non-U8
+  typed arrays are rejected.
 
 ## Fast Paths
 
@@ -158,8 +162,8 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 ## Current Limitations
 
-- Deserialization currently targets JSONB and is available for MessagePack,
-  FlexBuffer, and CBOR; ZERA decoding is not yet exposed to SQL.
+- Deserialization currently targets JSONB and is available for all four binary
+  protocols.
 - Arbitrary-precision decimal values do not have an exact portable wire type.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON
   semantics are required.

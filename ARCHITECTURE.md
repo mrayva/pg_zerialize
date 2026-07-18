@@ -116,6 +116,10 @@ depend on binary-search lookup for hostile map key ordering.
 reader's unchecked iterator helpers. It accepts definite and indefinite
 containers but rejects semantic tags because their JSONB mapping is ambiguous.
 
+`zera_to_jsonb` validates the v1 header, zero padding, envelope graph, arena
+spans, map metadata, and U8 blob shapes. Active-reference tracking rejects
+cycles before recursive decoding.
+
 ## Numeric Conversion
 
 `numeric_out` produces PostgreSQL's canonical decimal text once. Integral text
@@ -148,6 +152,5 @@ to avoid cross-protocol cache and allocator effects. See `bench/README.md`.
 
 ## Remaining Work
 
-- ZERA JSONB deserialization API
 - An explicit exact-decimal wire policy
 - Optional direct recursive writers if real nested workloads justify them
