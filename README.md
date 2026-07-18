@@ -93,6 +93,7 @@ SELECT msgpack_build_object('id', 7, 'active', true);
 SELECT msgpack_build_array(1, 'two', NULL, 3.5::numeric);
 SELECT msgpack_agg(value ORDER BY id) FROM items;
 SELECT msgpack_object_agg(key, value ORDER BY key) FROM items;
+SELECT msgpack_to_jsonb(msgpack_build_object('id', 7, 'active', true));
 ```
 
 Passing a builder's `bytea` result into another builder encodes that result as a
@@ -117,6 +118,12 @@ spliced into one nested MessagePack document.
   null elements. PostgreSQL lower bounds are not represented on the wire.
 - Batch serialization still rejects multidimensional outer arrays because its
   outer array is reserved for rows.
+- `msgpack_to_jsonb` preserves JSON-compatible structure and exact unsigned
+  integers. Binary values become `["~b", "<base64>", "base64"]`; non-finite
+  floats become `"NaN"`, `"Infinity"`, or `"-Infinity"`.
+- SQL decoding accepts one complete MessagePack value with unique string map
+  keys. Extension markers, duplicate/non-string keys, NUL strings, malformed
+  input, and trailing bytes are rejected.
 
 ## Fast Paths
 
@@ -144,7 +151,8 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 ## Current Limitations
 
-- Deserialization functions are not provided.
+- Deserialization currently targets JSONB and is available for MessagePack;
+  FlexBuffer, CBOR, and ZERA decoding are not yet exposed to SQL.
 - Arbitrary-precision decimal values do not have an exact portable wire type.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON
   semantics are required.

@@ -28,6 +28,7 @@ extern "C" {
 #include "utils/inet.h"
 #include "utils/guc.h"
 #include "utils/uuid.h"
+#include "mb/pg_wchar.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -46,11 +47,13 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <exception>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <type_traits>
 #include <cmath>
 #include <system_error>
 #include <charconv>
 #include <bit>
+#include <limits>
 #include <fast_float/fast_float.h>
 #include <zerialize/zerialize.hpp>
 #include <zerialize/protocols/flex.hpp>
@@ -58,6 +61,7 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <zerialize/protocols/cbor.hpp>
 #include <zerialize/protocols/zera.hpp>
 #include <zerialize/dynamic.hpp>
+#include <zerialize/internals/base64.hpp>
 
 namespace z = zerialize;
 
@@ -85,6 +89,7 @@ extern "C" {
     Datum row_to_msgpack(PG_FUNCTION_ARGS);
     Datum row_to_msgpack_slow(PG_FUNCTION_ARGS);
     Datum msgpack_from_jsonb(PG_FUNCTION_ARGS);
+    Datum msgpack_to_jsonb(PG_FUNCTION_ARGS);
     Datum msgpack_build_object(PG_FUNCTION_ARGS);
     Datum msgpack_build_array(PG_FUNCTION_ARGS);
     Datum msgpack_agg_final(PG_FUNCTION_ARGS);
@@ -103,6 +108,7 @@ extern "C" {
     PG_FUNCTION_INFO_V1(row_to_msgpack);
     PG_FUNCTION_INFO_V1(row_to_msgpack_slow);
     PG_FUNCTION_INFO_V1(msgpack_from_jsonb);
+    PG_FUNCTION_INFO_V1(msgpack_to_jsonb);
     PG_FUNCTION_INFO_V1(msgpack_build_object);
     PG_FUNCTION_INFO_V1(msgpack_build_array);
     PG_FUNCTION_INFO_V1(msgpack_agg_final);
@@ -676,6 +682,266 @@ static z::dyn::Value jsonb_token_to_dynamic(JsonbIterator** it, JsonbIteratorTok
     ereport(ERROR,
             (errcode(ERRCODE_DATA_CORRUPTED),
              errmsg("invalid jsonb token for conversion")));
+}
+
+static inline void msgpack_require_bytes(
+    std::span<const uint8_t> data, size_t pos, size_t count)
+{
+    if (pos > data.size() || count > data.size() - pos) {
+        throw z::DeserializationError("truncated MessagePack value");
+    }
+}
+
+static inline uint16_t msgpack_read_u16(std::span<const uint8_t> data, size_t pos)
+{
+    msgpack_require_bytes(data, pos, 2);
+    return static_cast<uint16_t>(
+        (static_cast<uint16_t>(data[pos]) << 8) | data[pos + 1]);
+}
+
+static inline uint32_t msgpack_read_u32(std::span<const uint8_t> data, size_t pos)
+{
+    msgpack_require_bytes(data, pos, 4);
+    return (static_cast<uint32_t>(data[pos]) << 24) |
+           (static_cast<uint32_t>(data[pos + 1]) << 16) |
+           (static_cast<uint32_t>(data[pos + 2]) << 8) |
+           static_cast<uint32_t>(data[pos + 3]);
+}
+
+static inline bool msgpack_marker_is_string(uint8_t marker)
+{
+    return (marker & 0xe0) == 0xa0 || marker == 0xd9 ||
+           marker == 0xda || marker == 0xdb;
+}
+
+static size_t msgpack_validate_value(std::span<const uint8_t> data, size_t pos)
+{
+    check_stack_depth();
+    msgpack_require_bytes(data, pos, 1);
+    const uint8_t marker = data[pos++];
+
+    if (marker <= 0x7f || marker >= 0xe0 || marker == 0xc0 ||
+        marker == 0xc2 || marker == 0xc3) {
+        return pos;
+    }
+
+    uint64_t count = 0;
+    if ((marker & 0xe0) == 0xa0) {
+        count = marker & 0x1f;
+        msgpack_require_bytes(data, pos, static_cast<size_t>(count));
+        return pos + static_cast<size_t>(count);
+    }
+    if ((marker & 0xf0) == 0x90) {
+        count = marker & 0x0f;
+        for (uint64_t i = 0; i < count; i++) {
+            pos = msgpack_validate_value(data, pos);
+        }
+        return pos;
+    }
+    if ((marker & 0xf0) == 0x80) {
+        count = marker & 0x0f;
+        std::unordered_set<std::string_view> keys;
+        for (uint64_t i = 0; i < count; i++) {
+            msgpack_require_bytes(data, pos, 1);
+            if (!msgpack_marker_is_string(data[pos])) {
+                throw z::DeserializationError("MessagePack map key is not a string");
+            }
+            const size_t key_start = pos;
+            pos = msgpack_validate_value(data, pos);
+            z::MsgPackDeserializer key_reader(
+                data.subspan(key_start, pos - key_start));
+            if (!keys.insert(key_reader.asStringView()).second) {
+                throw z::DeserializationError("duplicate MessagePack map key");
+            }
+            pos = msgpack_validate_value(data, pos);
+        }
+        return pos;
+    }
+
+    size_t payload_size = 0;
+    switch (marker) {
+        case 0xc4:
+        case 0xd9:
+            msgpack_require_bytes(data, pos, 1);
+            payload_size = data[pos++];
+            break;
+        case 0xc5:
+        case 0xda:
+            payload_size = msgpack_read_u16(data, pos);
+            pos += 2;
+            break;
+        case 0xc6:
+        case 0xdb:
+            payload_size = msgpack_read_u32(data, pos);
+            pos += 4;
+            break;
+        case 0xca:
+        case 0xce:
+        case 0xd2:
+            payload_size = 4;
+            break;
+        case 0xcb:
+        case 0xcf:
+        case 0xd3:
+            payload_size = 8;
+            break;
+        case 0xcc:
+        case 0xd0:
+            payload_size = 1;
+            break;
+        case 0xcd:
+        case 0xd1:
+            payload_size = 2;
+            break;
+        case 0xdc:
+            count = msgpack_read_u16(data, pos);
+            pos += 2;
+            for (uint64_t i = 0; i < count; i++) {
+                pos = msgpack_validate_value(data, pos);
+            }
+            return pos;
+        case 0xdd:
+            count = msgpack_read_u32(data, pos);
+            pos += 4;
+            for (uint64_t i = 0; i < count; i++) {
+                pos = msgpack_validate_value(data, pos);
+            }
+            return pos;
+        case 0xde:
+        case 0xdf:
+            if (marker == 0xde) {
+                count = msgpack_read_u16(data, pos);
+                pos += 2;
+            } else {
+                count = msgpack_read_u32(data, pos);
+                pos += 4;
+            }
+            {
+                std::unordered_set<std::string_view> keys;
+                for (uint64_t i = 0; i < count; i++) {
+                    msgpack_require_bytes(data, pos, 1);
+                    if (!msgpack_marker_is_string(data[pos])) {
+                        throw z::DeserializationError("MessagePack map key is not a string");
+                    }
+                    const size_t key_start = pos;
+                    pos = msgpack_validate_value(data, pos);
+                    z::MsgPackDeserializer key_reader(
+                        data.subspan(key_start, pos - key_start));
+                    if (!keys.insert(key_reader.asStringView()).second) {
+                        throw z::DeserializationError("duplicate MessagePack map key");
+                    }
+                    pos = msgpack_validate_value(data, pos);
+                }
+            }
+            return pos;
+        default:
+            throw z::DeserializationError("unsupported or reserved MessagePack marker");
+    }
+
+    msgpack_require_bytes(data, pos, payload_size);
+    return pos + payload_size;
+}
+
+static void append_json_string(std::string& out, std::string_view value)
+{
+    if (value.find('\0') != std::string_view::npos) {
+        throw z::DeserializationError("MessagePack string contains NUL");
+    }
+    if (!pg_verify_mbstr(GetDatabaseEncoding(), value.data(), value.size(), true)) {
+        throw z::DeserializationError(
+            "MessagePack string is invalid in the database encoding");
+    }
+    static constexpr char hex[] = "0123456789abcdef";
+    out.push_back('"');
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    out += "\\u00";
+                    out.push_back(hex[ch >> 4]);
+                    out.push_back(hex[ch & 0x0f]);
+                } else {
+                    out.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    out.push_back('"');
+}
+
+template<typename Number>
+static void append_json_number(std::string& out, Number value)
+{
+    std::array<char, 64> buffer;
+    std::to_chars_result converted;
+    if constexpr (std::is_floating_point_v<Number>) {
+        converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
+                                  std::chars_format::general,
+                                  std::numeric_limits<Number>::max_digits10);
+    } else {
+        converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+    }
+    if (converted.ec != std::errc()) {
+        throw z::DeserializationError("failed to format MessagePack number");
+    }
+    out.append(buffer.data(), converted.ptr);
+}
+
+static void msgpack_reader_to_json(
+    const z::MsgPackDeserializer& value, std::string& out)
+{
+    check_stack_depth();
+    if (value.isNull()) {
+        out += "null";
+    } else if (value.isBool()) {
+        out += value.asBool() ? "true" : "false";
+    } else if (value.isUInt()) {
+        append_json_number(out, value.asUInt64());
+    } else if (value.isInt()) {
+        append_json_number(out, value.asInt64());
+    } else if (value.isFloat()) {
+        const double number = value.asDouble();
+        if (std::isfinite(number)) {
+            append_json_number(out, number);
+        } else if (std::isnan(number)) {
+            append_json_string(out, "NaN");
+        } else {
+            append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
+        }
+    } else if (value.isString()) {
+        append_json_string(out, value.asStringView());
+    } else if (value.isBlob()) {
+        out += "[\"~b\",";
+        append_json_string(out, z::base64Encode(value.asBlob()));
+        out += ",\"base64\"]";
+    } else if (value.isArray()) {
+        out.push_back('[');
+        const size_t count = value.arraySize();
+        for (size_t i = 0; i < count; i++) {
+            if (i > 0) out.push_back(',');
+            msgpack_reader_to_json(value[i], out);
+        }
+        out.push_back(']');
+    } else if (value.isMap()) {
+        out.push_back('{');
+        bool first = true;
+        for (std::string_view key : value.mapKeys()) {
+            if (!first) out.push_back(',');
+            first = false;
+            append_json_string(out, key);
+            out.push_back(':');
+            msgpack_reader_to_json(value[key], out);
+        }
+        out.push_back('}');
+    } else {
+        throw z::DeserializationError("unsupported MessagePack value");
+    }
 }
 
 static z::dyn::Value jsonb_to_dynamic(Jsonb* jb)
@@ -3632,6 +3898,46 @@ msgpack_from_jsonb(PG_FUNCTION_ARGS)
     z::dyn::Value v = jsonb_to_dynamic(jb);
     bytea* result = dynamic_to_msgpack_binary(v);
     PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * msgpack_to_jsonb - Safely decode one complete MessagePack value to jsonb.
+ */
+extern "C" Datum
+msgpack_to_jsonb(PG_FUNCTION_ARGS)
+{
+    bytea* input = PG_GETARG_BYTEA_PP(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        const size_t consumed = msgpack_validate_value(data, 0);
+        if (consumed != data.size()) {
+            throw z::DeserializationError("trailing bytes after MessagePack value");
+        }
+
+        z::MsgPackDeserializer reader(data);
+        std::string json;
+        json.reserve(length + 32);
+        msgpack_reader_to_json(reader, json);
+        PG_FREE_IF_COPY(input, 0);
+
+        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        PG_RETURN_DATUM(result);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid MessagePack input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid MessagePack input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
 }
 
 /*

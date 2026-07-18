@@ -15,4 +15,12 @@ SELECT to_regprocedure('msgpack_from_jsonb(jsonb)') IS NOT NULL AS nested_api_pr
 SELECT to_regprocedure('msgpack_build_object("any")') IS NOT NULL AS object_builder_present;
 SELECT row_to_msgpack(ROW(1, 'upgrade-ok')) IS NOT NULL AS serialization_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.3';
+SELECT extversion = '1.3' AS upgraded_to_1_3
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('msgpack_to_jsonb(bytea)') IS NOT NULL AS decoder_present;
+SELECT msgpack_to_jsonb(msgpack_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS decoder_works;
+
 DROP EXTENSION pg_zerialize;

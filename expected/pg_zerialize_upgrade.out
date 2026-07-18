@@ -36,4 +36,26 @@ SELECT row_to_msgpack(ROW(1, 'upgrade-ok')) IS NOT NULL AS serialization_works;
  t
 (1 row)
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.3';
+SELECT extversion = '1.3' AS upgraded_to_1_3
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+ upgraded_to_1_3 
+-----------------
+ t
+(1 row)
+
+SELECT to_regprocedure('msgpack_to_jsonb(bytea)') IS NOT NULL AS decoder_present;
+ decoder_present 
+-----------------
+ t
+(1 row)
+
+SELECT msgpack_to_jsonb(msgpack_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS decoder_works;
+ decoder_works 
+---------------
+ t
+(1 row)
+
 DROP EXTENSION pg_zerialize;

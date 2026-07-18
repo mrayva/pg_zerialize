@@ -104,6 +104,10 @@ Row-level `jsonb` remains an opaque PostgreSQL binary payload for compatibility.
 `msgpack_from_jsonb` is a separate semantic API that recursively maps JSONB
 objects, arrays, scalars, and nulls into MessagePack.
 
+`msgpack_to_jsonb` validates one complete MessagePack value before invoking the
+vendored reader, then recursively maps it to JSONB. MessagePack binary values
+use zerialize's tagged base64 JSON convention.
+
 ## Numeric Conversion
 
 `numeric_out` produces PostgreSQL's canonical decimal text once. Integral text
@@ -136,6 +140,6 @@ to avoid cross-protocol cache and allocator effects. See `bench/README.md`.
 
 ## Remaining Work
 
-- Deserialization APIs
+- FlexBuffer, CBOR, and ZERA JSONB deserialization APIs
 - An explicit exact-decimal wire policy
 - Optional direct recursive writers if real nested workloads justify them
