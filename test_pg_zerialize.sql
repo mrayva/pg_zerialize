@@ -654,16 +654,16 @@ BEGIN
 END $$;
 
 -- ============================================================
--- 32. NESTED ARRAYS (array of arrays falls back to text)
+-- 32. NESTED ARRAYS
 -- ============================================================
 DO $$
 DECLARE b bytea;
 BEGIN
-    -- 2D array should fall through to text representation
+    -- 2D arrays serialize as nested protocol arrays.
     SELECT row_to_msgpack(ROW(ARRAY[[1,2],[3,4]])) INTO b;
-    PERFORM assert_nonempty(b, '2D array fallback');
+    PERFORM assert_nonempty(b, '2D nested array');
 
-    RAISE NOTICE 'PASS: 32. 2D array (text fallback)';
+    RAISE NOTICE 'PASS: 32. 2D nested array';
 END $$;
 
 -- ============================================================

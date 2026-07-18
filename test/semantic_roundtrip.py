@@ -107,6 +107,13 @@ CREATE TYPE pg_temp.pgz_sem_customer AS (
     billing pg_temp.pgz_sem_address
 );
 
+CREATE TYPE pg_temp.pgz_sem_multidim AS (
+    int_grid integer[],
+    text_cube text[],
+    lower_bound_grid integer[],
+    address_grid pg_temp.pgz_sem_address[]
+);
+
 CREATE TEMP TABLE pgz_sem_cases (
     label text PRIMARY KEY,
     payload bytea NOT NULL
@@ -201,6 +208,18 @@ INSERT INTO pgz_sem_cases VALUES
         )::pg_temp.pgz_sem_customer,
         NULL::pg_temp.pgz_sem_customer
     ])),
+    ('multidimensional_arrays', row_to_msgpack(
+        ROW(
+            ARRAY[[1, NULL], [3, 4]],
+            ARRAY[[['a', 'b'], ['c', NULL]], [['d', 'e'], ['f', 'g']]],
+            '[0:1][5:6]={{10,20},{30,40}}'::integer[],
+            ARRAY[
+                [ROW('Paris', '75001', NULL)::pg_temp.pgz_sem_address,
+                 NULL::pg_temp.pgz_sem_address],
+                [ROW('Rome', '00100', NULL)::pg_temp.pgz_sem_address,
+                 ROW('Oslo', NULL, NULL)::pg_temp.pgz_sem_address]
+            ]
+        )::pg_temp.pgz_sem_multidim)),
     ('nested_jsonb', msgpack_from_jsonb(
         '{"dept":{"id":10,"name":"engineering"},"staff":[{"id":1,"roles":["dev","review"]},{"id":2,"roles":[]}],"open":true}'::jsonb)),
     ('builder_array', msgpack_build_array(1, 'x', true, NULL, 2.5::numeric)),
@@ -326,6 +345,7 @@ def main() -> None:
         "nested_composite_ddl",
         "nested_composite_dropped",
         "nested_jsonb",
+        "multidimensional_arrays",
         "numeric_edges",
         "object_aggregate",
         "primitive_row",
@@ -415,6 +435,24 @@ def main() -> None:
         },
         None,
     ]
+    assert actual["multidimensional_arrays"] == {
+        "int_grid": [[1, None], [3, 4]],
+        "text_cube": [
+            [["a", "b"], ["c", None]],
+            [["d", "e"], ["f", "g"]],
+        ],
+        "lower_bound_grid": [[10, 20], [30, 40]],
+        "address_grid": [
+            [
+                {"city": "Paris", "postal_code": "75001", "coordinates": None},
+                None,
+            ],
+            [
+                {"city": "Rome", "postal_code": "00100", "coordinates": None},
+                {"city": "Oslo", "postal_code": None, "coordinates": None},
+            ],
+        ],
+    }
     assert actual["builder_composite"] == [
         {"city": "Rome", "postal_code": "00100", "coordinates": None}
     ]

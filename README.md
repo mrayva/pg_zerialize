@@ -113,10 +113,10 @@ spliced into one nested MessagePack document.
 - A `json` value remains its original JSON text string.
 - UUID, enum, `name`, internal `"char"`, inet/cidr, and interval values use
   canonical PostgreSQL-compatible text representations.
-- One-dimensional PostgreSQL arrays become protocol arrays and preserve null
-  elements.
-- Multidimensional arrays currently use text fallback in row serialization and
-  are rejected by batch serialization.
+- PostgreSQL arrays become nested protocol arrays and preserve dimensions and
+  null elements. PostgreSQL lower bounds are not represented on the wire.
+- Batch serialization still rejects multidimensional outer arrays because its
+  outer array is reserved for rows.
 
 ## Fast Paths
 
@@ -144,7 +144,6 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 ## Current Limitations
 
-- Multidimensional arrays do not yet produce nested protocol arrays.
 - Deserialization functions are not provided.
 - Arbitrary-precision decimal values do not have an exact portable wire type.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON

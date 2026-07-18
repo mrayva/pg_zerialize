@@ -90,12 +90,13 @@ maps with the nested type's attribute names.
 | timestamp/timestamptz | microseconds since PostgreSQL epoch |
 | `bytea`, row-level `jsonb` | binary payload |
 | UUID, enum, name, char, inet/cidr, interval | canonical text |
-| one-dimensional array | protocol array |
+| PostgreSQL array | nested protocol arrays (lower bounds discarded) |
 | named composite | protocol map |
 | null | protocol null |
 
-Multidimensional row arrays currently fall back to PostgreSQL text. Batch APIs
-reject multidimensional arrays because their outer array is reserved for rows.
+Multidimensional row fields preserve their shape as nested protocol arrays.
+Batch APIs reject multidimensional outer arrays because that array is reserved
+for rows.
 
 ## Nested JSONB
 
@@ -135,7 +136,6 @@ to avoid cross-protocol cache and allocator effects. See `bench/README.md`.
 
 ## Remaining Work
 
-- Nested protocol arrays for multidimensional PostgreSQL arrays
 - Deserialization APIs
 - An explicit exact-decimal wire policy
 - Optional direct recursive writers if real nested workloads justify them

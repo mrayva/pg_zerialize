@@ -481,32 +481,45 @@ static bytea* try_serialize_zera_array_fast(Datum* elements, bool* nulls, int ni
 static bytea* try_serialize_flex_row_fast(HeapTupleHeader rec);
 static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int nitems);
 
+static z::dyn::Value array_level_to_dynamic(
+    Datum* elements,
+    bool* nulls,
+    Oid element_type,
+    const int* dims,
+    int ndim,
+    int depth,
+    int* offset)
+{
+    z::dyn::Value::Array result;
+    result.reserve(dims[depth]);
+
+    if (depth == ndim - 1) {
+        for (int i = 0; i < dims[depth]; i++, (*offset)++) {
+            result.push_back(datum_to_dynamic(
+                elements[*offset], element_type, nulls[*offset]));
+        }
+    } else {
+        for (int i = 0; i < dims[depth]; i++) {
+            result.push_back(array_level_to_dynamic(
+                elements, nulls, element_type, dims, ndim, depth + 1, offset));
+        }
+    }
+
+    return z::dyn::Value::array(std::move(result));
+}
+
 /*
  * Convert a PostgreSQL array to a zerialize dyn::Value array
  */
 static z::dyn::Value array_to_dynamic(Datum value, Oid typid)
 {
+    (void) typid;
     ArrayType* arr = DatumGetArrayTypeP(value);
     int ndim = ARR_NDIM(arr);
 
     // Handle empty arrays
     if (ndim == 0 || ArrayGetNItems(ndim, ARR_DIMS(arr)) == 0) {
         return z::dyn::Value::array(z::dyn::Value::Array());
-    }
-
-    // For now, handle 1D arrays (covers 90% of use cases)
-    // Multi-dimensional arrays could be added later
-    if (ndim > 1) {
-        // Fall back to text representation for multi-dimensional arrays
-        Oid typoutput;
-        bool typIsVarlena;
-        char* str;
-
-        getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
-        str = OidOutputFunctionCall(typoutput, value);
-        std::string strval(str);
-        pfree(str);
-        return z::dyn::Value(strval);
     }
 
     // Get array element type and info
@@ -524,18 +537,14 @@ static z::dyn::Value array_to_dynamic(Datum value, Oid typid)
     deconstruct_array(arr, element_type, typlen, typbyval, typalign,
                      &elements, &nulls, &nitems);
 
-    // Build dyn::Value::Array
-    z::dyn::Value::Array result_array;
-    result_array.reserve(nitems);
-
-    for (int i = 0; i < nitems; i++) {
-        result_array.push_back(datum_to_dynamic(elements[i], element_type, nulls[i]));
-    }
+    int offset = 0;
+    z::dyn::Value result = array_level_to_dynamic(
+        elements, nulls, element_type, ARR_DIMS(arr), ndim, 0, &offset);
 
     pfree(elements);
     pfree(nulls);
 
-    return z::dyn::Value::array(std::move(result_array));
+    return result;
 }
 
 struct NumericFastValue {
@@ -1683,10 +1692,7 @@ static inline void msgpack_write_array(
     }
 
     if (ndim != 1) {
-        // Preserve existing behavior: multidimensional arrays fall back to text.
-        char* str = OidOutputFunctionCall(col.typoutput, value);
-        writer.string(std::string_view(str));
-        pfree(str);
+        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
         return;
     }
 
@@ -2201,10 +2207,7 @@ static inline void cbor_write_array(
     }
 
     if (ndim != 1) {
-        // Preserve existing behavior: multidimensional arrays fall back to text.
-        char* str = OidOutputFunctionCall(col.typoutput, value);
-        writer.string(std::string_view(str));
-        pfree(str);
+        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
         return;
     }
 
@@ -2579,10 +2582,7 @@ static inline void zera_write_array(
     }
 
     if (ndim != 1) {
-        // Preserve existing behavior: multidimensional arrays fall back to text.
-        char* str = OidOutputFunctionCall(col.typoutput, value);
-        writer.string(std::string_view(str));
-        pfree(str);
+        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
         return;
     }
 
@@ -2957,10 +2957,7 @@ static inline void flex_write_array(
     }
 
     if (ndim != 1) {
-        // Preserve existing behavior: multidimensional arrays fall back to text.
-        char* str = OidOutputFunctionCall(col.typoutput, value);
-        writer.string(std::string_view(str));
-        pfree(str);
+        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
         return;
     }
 
