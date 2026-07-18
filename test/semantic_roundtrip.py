@@ -88,6 +88,25 @@ CREATE TYPE pg_temp.pgz_sem_numeric_edges AS (
     values numeric[]
 );
 
+CREATE TYPE pg_temp.pgz_sem_coordinates AS (
+    latitude double precision,
+    longitude double precision
+);
+
+CREATE TYPE pg_temp.pgz_sem_address AS (
+    city text,
+    postal_code text,
+    coordinates pg_temp.pgz_sem_coordinates
+);
+
+CREATE TYPE pg_temp.pgz_sem_customer AS (
+    id integer,
+    name text,
+    shipping pg_temp.pgz_sem_address,
+    previous_addresses pg_temp.pgz_sem_address[],
+    billing pg_temp.pgz_sem_address
+);
+
 CREATE TEMP TABLE pgz_sem_cases (
     label text PRIMARY KEY,
     payload bytea NOT NULL
@@ -153,12 +172,44 @@ INSERT INTO pgz_sem_cases VALUES
         NULL::pg_temp.pgz_sem_primitive,
         ROW(2, 'two', false, 2.5, 'set')::pg_temp.pgz_sem_primitive
     ])),
+    ('nested_composite', row_to_msgpack(
+        ROW(
+            7,
+            'Ada',
+            ROW(
+                'London',
+                'SW1A',
+                ROW(51.501, -0.142)::pg_temp.pgz_sem_coordinates
+            )::pg_temp.pgz_sem_address,
+            ARRAY[
+                ROW(
+                    'Paris',
+                    '75001',
+                    ROW(48.861, 2.335)::pg_temp.pgz_sem_coordinates
+                )::pg_temp.pgz_sem_address,
+                NULL::pg_temp.pgz_sem_address
+            ],
+            NULL::pg_temp.pgz_sem_address
+        )::pg_temp.pgz_sem_customer)),
+    ('nested_composite_batch', rows_to_msgpack(ARRAY[
+        ROW(
+            8,
+            'Grace',
+            ROW('Arlington', '22201', NULL)::pg_temp.pgz_sem_address,
+            ARRAY[]::pg_temp.pgz_sem_address[],
+            NULL::pg_temp.pgz_sem_address
+        )::pg_temp.pgz_sem_customer,
+        NULL::pg_temp.pgz_sem_customer
+    ])),
     ('nested_jsonb', msgpack_from_jsonb(
         '{"dept":{"id":10,"name":"engineering"},"staff":[{"id":1,"roles":["dev","review"]},{"id":2,"roles":[]}],"open":true}'::jsonb)),
     ('builder_array', msgpack_build_array(1, 'x', true, NULL, 2.5::numeric)),
     ('builder_object', msgpack_build_object('id', 9, 'name', 'nine', 'active', false)),
     ('exact_numeric', msgpack_build_array(9223372036854775807::numeric)),
     ('float_numeric', msgpack_build_array(12345678901234567890.123456789::numeric)),
+    ('builder_composite', msgpack_build_array(
+        ROW('Rome', '00100', NULL)::pg_temp.pgz_sem_address)),
+    ('builder_anonymous_composite', msgpack_build_array(ROW(11, 'anonymous'))),
     ('builder_binary_embedding', msgpack_build_array(msgpack_build_object('a', 1)));
 
 CREATE TEMP TABLE pgz_sem_people(id integer, name text);
@@ -178,6 +229,29 @@ ALTER TYPE pg_temp.pgz_sem_status RENAME VALUE 'active' TO 'enabled';
 INSERT INTO pgz_sem_cases VALUES
     ('enum_renamed', row_to_msgpack(
         ROW('enabled'::pg_temp.pgz_sem_status)::pg_temp.pgz_sem_enum_holder));
+
+-- Verify recursive schema-cache invalidation at data-semantics level.
+ALTER TYPE pg_temp.pgz_sem_address ADD ATTRIBUTE country text;
+INSERT INTO pgz_sem_cases VALUES
+    ('nested_composite_ddl', row_to_msgpack(
+        ROW(
+            12,
+            'Dorothy',
+            ROW('Nashville', '37201', NULL, 'US')::pg_temp.pgz_sem_address,
+            ARRAY[]::pg_temp.pgz_sem_address[],
+            NULL::pg_temp.pgz_sem_address
+        )::pg_temp.pgz_sem_customer));
+
+ALTER TYPE pg_temp.pgz_sem_address DROP ATTRIBUTE postal_code;
+INSERT INTO pgz_sem_cases VALUES
+    ('nested_composite_dropped', row_to_msgpack(
+        ROW(
+            13,
+            'Mary',
+            ROW('New York', NULL, 'US')::pg_temp.pgz_sem_address,
+            ARRAY[]::pg_temp.pgz_sem_address[],
+            NULL::pg_temp.pgz_sem_address
+        )::pg_temp.pgz_sem_customer));
 
 COPY (
     SELECT label, encode(payload, 'hex')
@@ -238,13 +312,19 @@ def main() -> None:
         "array_row",
         "batch_rows",
         "builder_array",
+        "builder_anonymous_composite",
         "builder_binary_embedding",
+        "builder_composite",
         "builder_object",
         "direct_arrays_no_null",
         "exact_numeric",
         "enum_renamed",
         "float_numeric",
         "native_row",
+        "nested_composite",
+        "nested_composite_batch",
+        "nested_composite_ddl",
+        "nested_composite_dropped",
         "nested_jsonb",
         "numeric_edges",
         "object_aggregate",
@@ -302,6 +382,67 @@ def main() -> None:
             {"id": 1, "roles": ["dev", "review"]},
             {"id": 2, "roles": []},
         ],
+    }
+    assert actual["nested_composite"] == {
+        "id": 7,
+        "name": "Ada",
+        "shipping": {
+            "city": "London",
+            "postal_code": "SW1A",
+            "coordinates": {"latitude": 51.501, "longitude": -0.142},
+        },
+        "previous_addresses": [
+            {
+                "city": "Paris",
+                "postal_code": "75001",
+                "coordinates": {"latitude": 48.861, "longitude": 2.335},
+            },
+            None,
+        ],
+        "billing": None,
+    }
+    assert actual["nested_composite_batch"] == [
+        {
+            "id": 8,
+            "name": "Grace",
+            "shipping": {
+                "city": "Arlington",
+                "postal_code": "22201",
+                "coordinates": None,
+            },
+            "previous_addresses": [],
+            "billing": None,
+        },
+        None,
+    ]
+    assert actual["builder_composite"] == [
+        {"city": "Rome", "postal_code": "00100", "coordinates": None}
+    ]
+    assert actual["builder_anonymous_composite"] == [
+        {"f1": 11, "f2": "anonymous"}
+    ]
+    assert actual["nested_composite_ddl"] == {
+        "id": 12,
+        "name": "Dorothy",
+        "shipping": {
+            "city": "Nashville",
+            "postal_code": "37201",
+            "coordinates": None,
+            "country": "US",
+        },
+        "previous_addresses": [],
+        "billing": None,
+    }
+    assert actual["nested_composite_dropped"] == {
+        "id": 13,
+        "name": "Mary",
+        "shipping": {
+            "city": "New York",
+            "coordinates": None,
+            "country": "US",
+        },
+        "previous_addresses": [],
+        "billing": None,
     }
     assert actual["builder_array"] == [1, "x", True, None, 2.5]
     assert actual["builder_object"] == {"id": 9, "name": "nine", "active": False}

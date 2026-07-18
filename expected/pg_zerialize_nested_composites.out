@@ -1,0 +1,135 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+BEGIN;
+CREATE TYPE pg_temp.pgz_nested_coordinates AS (
+    latitude double precision,
+    longitude double precision
+);
+CREATE TYPE pg_temp.pgz_nested_address AS (
+    city text,
+    postal_code text,
+    coordinates pg_temp.pgz_nested_coordinates
+);
+CREATE TYPE pg_temp.pgz_nested_customer AS (
+    id integer,
+    name text,
+    shipping pg_temp.pgz_nested_address,
+    previous_addresses pg_temp.pgz_nested_address[],
+    billing pg_temp.pgz_nested_address
+);
+CREATE TEMP TABLE pgz_nested_values AS
+SELECT ROW(
+    7,
+    'Ada',
+    ROW(
+        'London',
+        'SW1A',
+        ROW(51.501, -0.142)::pg_temp.pgz_nested_coordinates
+    )::pg_temp.pgz_nested_address,
+    ARRAY[
+        ROW(
+            'Paris',
+            '75001',
+            ROW(48.861, 2.335)::pg_temp.pgz_nested_coordinates
+        )::pg_temp.pgz_nested_address,
+        NULL::pg_temp.pgz_nested_address
+    ],
+    NULL::pg_temp.pgz_nested_address
+)::pg_temp.pgz_nested_customer AS value;
+-- MessagePack's generic path is the reference representation for composites.
+SELECT row_to_msgpack(value) = row_to_msgpack_slow(value) AS msgpack_nested_parity
+FROM pgz_nested_values;
+ msgpack_nested_parity 
+-----------------------
+ t
+(1 row)
+
+-- Every protocol must accept the same recursively nested value.
+SELECT octet_length(row_to_msgpack(value)) > 0 AS msgpack_nested,
+       octet_length(row_to_cbor(value)) > 0 AS cbor_nested,
+       octet_length(row_to_zera(value)) > 0 AS zera_nested,
+       octet_length(row_to_flexbuffers(value)) > 0 AS flex_nested
+FROM pgz_nested_values;
+ msgpack_nested | cbor_nested | zera_nested | flex_nested 
+----------------+-------------+-------------+-------------
+ t              | t           | t           | t
+(1 row)
+
+-- Batch conversion preserves nested composites and null outer records.
+SELECT octet_length(rows_to_msgpack(ARRAY[value, NULL::pg_temp.pgz_nested_customer])) > 0 AS msgpack_batch_nested,
+       octet_length(rows_to_cbor(ARRAY[value, NULL::pg_temp.pgz_nested_customer])) > 0 AS cbor_batch_nested,
+       octet_length(rows_to_zera(ARRAY[value, NULL::pg_temp.pgz_nested_customer])) > 0 AS zera_batch_nested,
+       octet_length(rows_to_flexbuffers(ARRAY[value, NULL::pg_temp.pgz_nested_customer])) > 0 AS flex_batch_nested
+FROM pgz_nested_values;
+ msgpack_batch_nested | cbor_batch_nested | zera_batch_nested | flex_batch_nested 
+----------------------+-------------------+-------------------+-------------------
+ t                    | t                 | t                 | t
+(1 row)
+
+-- Composite values supplied to SQL builders are nested maps, not text.
+SELECT msgpack_build_array(
+           ROW('Rome', '00100', NULL)::pg_temp.pgz_nested_address
+       ) IS NOT NULL AS builder_composite;
+ builder_composite 
+-------------------
+ t
+(1 row)
+
+-- Nested type DDL invalidates cached outer and inner descriptors.
+SELECT row_to_msgpack(value) IS NOT NULL AS cache_warmed
+FROM pgz_nested_values;
+ cache_warmed 
+--------------
+ t
+(1 row)
+
+ALTER TYPE pg_temp.pgz_nested_address ADD ATTRIBUTE country text;
+SELECT row_to_msgpack(
+    ROW(
+        8,
+        'Grace',
+        ROW('Arlington', '22201', NULL, 'US')::pg_temp.pgz_nested_address,
+        ARRAY[]::pg_temp.pgz_nested_address[],
+        NULL::pg_temp.pgz_nested_address
+    )::pg_temp.pgz_nested_customer
+) = row_to_msgpack_slow(
+    ROW(
+        8,
+        'Grace',
+        ROW('Arlington', '22201', NULL, 'US')::pg_temp.pgz_nested_address,
+        ARRAY[]::pg_temp.pgz_nested_address[],
+        NULL::pg_temp.pgz_nested_address
+    )::pg_temp.pgz_nested_customer
+) AS nested_ddl_parity;
+ nested_ddl_parity 
+-------------------
+ t
+(1 row)
+
+-- Dropped attributes are omitted from recursively serialized maps.
+ALTER TYPE pg_temp.pgz_nested_address DROP ATTRIBUTE postal_code;
+SELECT row_to_msgpack(
+    ROW(
+        9,
+        'Katherine',
+        ROW('Hampton', NULL, 'US')::pg_temp.pgz_nested_address,
+        ARRAY[]::pg_temp.pgz_nested_address[],
+        NULL::pg_temp.pgz_nested_address
+    )::pg_temp.pgz_nested_customer
+) = row_to_msgpack_slow(
+    ROW(
+        9,
+        'Katherine',
+        ROW('Hampton', NULL, 'US')::pg_temp.pgz_nested_address,
+        ARRAY[]::pg_temp.pgz_nested_address[],
+        NULL::pg_temp.pgz_nested_address
+    )::pg_temp.pgz_nested_customer
+) AS dropped_nested_attribute_parity;
+ dropped_nested_attribute_parity 
+---------------------------------
+ t
+(1 row)
+
+ROLLBACK;
+DROP EXTENSION pg_zerialize;

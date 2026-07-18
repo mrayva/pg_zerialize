@@ -1,185 +1,127 @@
-# Quick Start Guide
+# Quick Start
 
-## Installation
+## Install Dependencies
 
-### 1. Prerequisites
+Ubuntu/Debian example for PostgreSQL 18:
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install postgresql-server-dev-all build-essential libflatbuffers-dev libfast-float-dev
-
-# RedHat/CentOS
-sudo yum install postgresql-devel gcc-c++
-
-# macOS
-brew install postgresql
+sudo apt-get install \
+  build-essential \
+  postgresql-18 \
+  postgresql-server-dev-18 \
+  libflatbuffers-dev \
+  libfast-float-dev \
+  python3-msgpack
 ```
 
-### 2. Build and Install
+Use matching `postgresql-<major>` and `postgresql-server-dev-<major>` packages
+for PostgreSQL 16 or 17.
+
+## Build And Enable
 
 ```bash
-cd pg_zerialize
-./build.sh
+make -j"$(nproc)"
 sudo make install
+psql -d postgres -c 'CREATE EXTENSION pg_zerialize'
 ```
 
-### 3. Enable Extension
+## Serialize Rows
 
 ```sql
-psql -d your_database
-CREATE EXTENSION pg_zerialize;
-```
-
-## Basic Usage
-
-### Convert a row to binary formats
-
-```sql
--- Anonymous record
-SELECT row_to_flexbuffers(ROW('Alice', 30, true));
-SELECT row_to_msgpack(ROW('Alice', 30, true));
-SELECT row_to_cbor(ROW('Alice', 30, true));
-SELECT row_to_zera(ROW('Alice', 30, true));
-
--- Named type
-CREATE TYPE person AS (name text, age int, active bool);
-SELECT row_to_flexbuffers(ROW('Bob', 25, false)::person);
-
--- From existing table
-SELECT id, row_to_flexbuffers(users.*) FROM users;
-```
-
-### Working with Output
-
-FlexBuffers output is binary (`bytea`):
-
-```sql
--- View as hex
-SELECT encode(row_to_flexbuffers(ROW('test', 123)), 'hex');
-
--- Check size
-SELECT octet_length(row_to_flexbuffers(ROW('test', 123))) as bytes;
-
--- Store in table
-CREATE TABLE cached_data (
-    id serial PRIMARY KEY,
-    flex_data bytea
+CREATE TYPE person AS (
+  name text,
+  age integer,
+  active boolean
 );
 
-INSERT INTO cached_data (flex_data)
-SELECT row_to_flexbuffers(users.*) FROM users;
+SELECT row_to_msgpack(ROW('Ada', 37, true)::person);
+SELECT row_to_cbor(ROW('Ada', 37, true)::person);
+SELECT row_to_zera(ROW('Ada', 37, true)::person);
+SELECT row_to_flexbuffers(ROW('Ada', 37, true)::person);
 ```
 
-## Use Cases
-
-### 1. Efficient API Responses
-
-Instead of JSON, use FlexBuffers for smaller, faster responses:
+Serialize table rows individually:
 
 ```sql
--- Before (JSON)
-SELECT json_agg(row_to_json(users.*)) FROM users;
-
--- After (FlexBuffers) - more compact
-SELECT row_to_flexbuffers(users.*) FROM users;
-```
-
-### 2. Caching
-
-Store pre-serialized data:
-
-```sql
-CREATE MATERIALIZED VIEW user_cache AS
-SELECT
-    user_id,
-    row_to_flexbuffers(users.*) as flex_data
+SELECT id, row_to_msgpack(users.*)
 FROM users;
 ```
 
-### 3. Efficient Data Transfer
-
-Send binary data over the wire:
-
-```python
-import psycopg2
-from flatbuffers import flexbuffers
-
-conn = psycopg2.connect("dbname=mydb")
-cur = conn.cursor()
-cur.execute("SELECT row_to_flexbuffers(users.*) FROM users")
-
-for row in cur:
-    flex_data = bytes(row[0])
-    # Deserialize with FlexBuffers library
-    root = flexbuffers.GetRoot(flex_data)
-    print(root['name'].AsString())
-```
-
-## Current Limitations
-
-- Nested composite types not yet supported
-- Multidimensional arrays use text fallback serialization
-- JSON text remains a protocol string; JSONB row fields remain binary payloads
-- Fractional or out-of-range `numeric` values use `float8` and can lose precision
-
-See ARCHITECTURE.md for roadmap.
-
-## Troubleshooting
-
-### Extension not found after install
-
-```bash
-# Check PostgreSQL extension directory
-pg_config --sharedir
-
-# Verify files installed
-ls $(pg_config --sharedir)/extension/pg_zerialize*
-```
-
-### Build errors
-
-```bash
-# Check PostgreSQL development headers
-pg_config --includedir-server
-
-# Verify C++20 support
-g++ --version  # Need GCC 10+ or Clang 10+
-```
-
-### Function not found
+Serialize a set as one protocol array:
 
 ```sql
--- Verify extension loaded
-\dx pg_zerialize
-
--- Check function exists
-\df row_to_flexbuffers
-```
-
-## Next Steps
-
-1. Read ARCHITECTURE.md for detailed design info
-2. Run `make installcheck` for PGXS regression tests
-3. Run `psql -d postgres -f test_pg_zerialize.sql` for the full test suite
-4. Experiment with your own data types
-5. Report issues or contribute improvements
-
-## Performance Tips
-
-1. **Batch operations**: Process multiple rows at once when possible
-2. **Materialize**: Pre-compute for frequently accessed data
-3. **Index**: Use GIN/GiST indexes on bytea columns if searching
-4. **Compare sizes**: Check FlexBuffers vs JSON size difference
-
-```sql
--- Compare sizes
-SELECT
-    'JSON' as format,
-    avg(octet_length(row_to_json(users.*)::text::bytea)) as avg_bytes
-FROM users
-UNION ALL
-SELECT
-    'FlexBuffers' as format,
-    avg(octet_length(row_to_flexbuffers(users.*))) as avg_bytes
+SELECT rows_to_msgpack(array_agg(users.* ORDER BY id))
 FROM users;
 ```
+
+## Serialize Nested Composites
+
+```sql
+CREATE TYPE address AS (
+  city text,
+  postal_code text
+);
+
+CREATE TYPE customer AS (
+  id integer,
+  name text,
+  shipping address
+);
+
+SELECT row_to_msgpack(
+  ROW(7, 'Ada', ROW('London', 'SW1A')::address)::customer
+);
+```
+
+The `shipping` field is a nested map, not PostgreSQL composite text.
+
+For nested MessagePack assembled from joins, build one JSONB tree:
+
+```sql
+SELECT msgpack_from_jsonb(
+  jsonb_build_object(
+    'id', d.id,
+    'name', d.name,
+    'employees', COALESCE(e.items, '[]'::jsonb)
+  )
+)
+FROM departments d
+LEFT JOIN (
+  SELECT department_id,
+         jsonb_agg(jsonb_build_object('id', id, 'name', name) ORDER BY id) AS items
+  FROM employees
+  GROUP BY department_id
+) e ON e.department_id = d.id;
+```
+
+## Verify Output
+
+```sql
+SELECT encode(row_to_msgpack(ROW(1, 'one')), 'hex');
+SELECT octet_length(row_to_msgpack(ROW(1, 'one')));
+```
+
+Run repository tests after installation:
+
+```bash
+make installcheck
+make semantic-check
+```
+
+## Connection Troubleshooting
+
+The benchmark harness defaults to:
+
+```text
+host=127.0.0.1 port=5432 database=postgres user=postgres password=postgres
+```
+
+Override `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, or `PGPASSWORD` when your
+local PostgreSQL configuration differs.
+
+## Limitations
+
+- Multidimensional arrays are not emitted as nested arrays.
+- Fractional or out-of-range `numeric` values use lossy `float64`.
+- Deserialization APIs are not implemented.
+- A `json` value remains text; use JSONB builders for recursive JSON objects.

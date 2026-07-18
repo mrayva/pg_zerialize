@@ -1,176 +1,159 @@
 # pg_zerialize
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18%20tested-blue.svg)](https://www.postgresql.org/)
-[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+PostgreSQL extension for serializing rows and batches of rows to MessagePack,
+CBOR, ZERA, and FlexBuffers. MessagePack also includes SQL builders and
+aggregates for constructing nested binary values.
 
-PostgreSQL extension for converting rows to efficient binary formats using the [zerialize](https://github.com/colinator/zerialize) library.
+## Support
 
-**21% smaller than JSON** with MessagePack/CBOR formats.
+- PostgreSQL 16, 17, and 18
+- C++20 compiler
+- Linux/PGXS build environment
 
-## Status
-
-Row and batch serialization are implemented for FlexBuffers, MessagePack,
-CBOR, and ZERA. MessagePack also provides JSONB-based nested builders and
-aggregates.
+CI builds and tests every supported PostgreSQL major version. Local development
+and performance work use PostgreSQL 18.
 
 ## Requirements
 
-- PostgreSQL 18 (tested); older supported PostgreSQL branches are intended but
-  are not currently exercised in CI
-- C++20 compatible compiler (GCC 10+, Clang 10+)
-- FlatBuffers library (`libflatbuffers-dev`)
-- fast_float library (`libfast-float-dev`)
-- zerialize library (header-only, included in `vendor/`; see
-  `vendor/zerialize/UPSTREAM.md` for provenance and local changes)
+- PostgreSQL server development package (`postgresql-server-dev-<major>`)
+- C++20 compiler (GCC 10+ or Clang 10+)
+- FlatBuffers development package (`libflatbuffers-dev`)
+- fast_float development package (`libfast-float-dev`)
+- Python `msgpack` package for independent MessagePack semantic tests
 
-## Building
+The zerialize headers are vendored under `vendor/`. See
+[`vendor/zerialize/UPSTREAM.md`](vendor/zerialize/UPSTREAM.md) for provenance
+and local changes.
+
+## Build And Test
 
 ```bash
-make
+make -j"$(nproc)"
 sudo make install
-```
 
-## Testing
-
-```bash
-# PGXS regression tests (core/parity/cache/determinism/semantics/upgrade)
 make installcheck
-
-# Comprehensive manual suite
-psql -d postgres -f test_pg_zerialize.sql
-
-# Independent MessagePack decoder assertions (requires python3-msgpack)
 make semantic-check
 ```
 
-For MessagePack fast-path parity checks, test-only helper functions are available:
-- `row_to_msgpack_slow(record)`
-- `rows_to_msgpack_slow(anyarray)`
-
-SQL-builder style MessagePack APIs are available:
-- `msgpack_from_jsonb(jsonb)`
-- `msgpack_build_object(VARIADIC "any")`
-- `msgpack_build_array(VARIADIC "any")`
-- `msgpack_agg(anyelement)`
-- `msgpack_object_agg(text, anyelement)`
-
-## Wire Semantics And Current Limitations
-
-- Integral `numeric` values that fit in `int64` are encoded exactly. Other
-  `numeric` values are encoded as binary `float64` and can lose decimal
-  precision. Decimal-to-float parsing uses fast_float by default; set
-  `pg_zerialize.numeric_float_backend = 'postgres'` for the PostgreSQL parser.
-- Date values use PostgreSQL days since 2000-01-01. Timestamp values use
-  PostgreSQL microseconds since 2000-01-01.
-- A JSONB column serialized through `row_to_*` is a binary PostgreSQL JSONB
-  payload, not a recursively converted protocol object. For portable nested
-  MessagePack, construct one JSONB tree and call `msgpack_from_jsonb`.
-- A `json` column is serialized as its original JSON text string without
-  reparsing it. It is not emitted as a recursively nested protocol object.
-- UUID, enum, `name`, and internal `"char"` values are emitted as their
-  canonical PostgreSQL text strings. Other supported scalar fallbacks, such as
-  inet/cidr and interval, use PostgreSQL's authoritative output function while
-  remaining on the protocol direct-writer path. One-dimensional arrays of
-  these types use the same direct element writers and preserve null elements.
-- Passing the `bytea` result of one MessagePack builder into another builder
-  encodes it as a binary blob; it does not splice the inner MessagePack value.
-- Multidimensional PostgreSQL arrays are not represented as nested protocol
-  arrays. Batch serialization rejects them, while generic row serialization
-  falls back to PostgreSQL's text representation.
-- Deserialization functions are not yet provided.
-
-## Microbenchmark
-
-Run the repeatable in-repo microbenchmark harness:
+The full manual SQL suite is available when needed:
 
 ```bash
-make bench
+psql -v ON_ERROR_STOP=1 -d postgres -f test_pg_zerialize.sql
 ```
 
-Quick/short run:
-
-```bash
-make bench-quick
-```
-
-Benchmark docs and output format:
-- `bench/README.md`
-- output logs in `results/microbench_*.out`
-
-## Usage
-
-### Single Record Serialization
+## Row Serialization
 
 ```sql
 CREATE EXTENSION pg_zerialize;
 
--- Convert a single row to any of the four binary formats
-SELECT row_to_msgpack(ROW('John', 25, true));
-SELECT row_to_cbor(ROW('John', 25, true));
-SELECT row_to_zera(ROW('John', 25, true));
-SELECT row_to_flexbuffers(ROW('John', 25, true));
-
--- Serialize table rows individually
 SELECT row_to_msgpack(users.*) FROM users;
+SELECT row_to_cbor(users.*) FROM users;
+SELECT row_to_zera(users.*) FROM users;
+SELECT row_to_flexbuffers(users.*) FROM users;
 ```
 
-### Batch Processing (Faster for Multiple Rows)
+Each function returns one protocol document as `bytea`. A row is represented as
+a map/object whose keys are PostgreSQL attribute names.
+
+## Batch Serialization
 
 ```sql
--- Serialize multiple rows in a single call (2-3x faster!)
 SELECT rows_to_msgpack(array_agg(users.*)) FROM users;
 SELECT rows_to_cbor(array_agg(users.*)) FROM users;
 SELECT rows_to_zera(array_agg(users.*)) FROM users;
 SELECT rows_to_flexbuffers(array_agg(users.*)) FROM users;
-
--- Compare sizes across all formats
-SELECT
-    octet_length(rows_to_msgpack(array_agg(users.*))) as msgpack_bytes,
-    octet_length(rows_to_cbor(array_agg(users.*))) as cbor_bytes,
-    octet_length(rows_to_zera(array_agg(users.*))) as zera_bytes,
-    octet_length(rows_to_flexbuffers(array_agg(users.*))) as flexbuffers_bytes
-FROM users;
 ```
 
-## Performance
+Batch functions return one protocol array containing row maps. They accept a
+one-dimensional array of composite records and preserve null records.
 
-Based on real-world testing with user records (5 rows average):
+## Nested Values
 
-| Format      | Avg Size | vs JSON | Best For |
-|-------------|----------|---------|----------|
-| MessagePack | 71 bytes | **-21%** 🥇 | Max compression, APIs, caching |
-| CBOR        | 71 bytes | **-21%** 🥈 | IoT, IETF standard (RFC 8949) |
-| JSON        | 90 bytes | baseline | Human-readable, debugging |
-| FlexBuffers | 142 bytes | +58% | Zero-copy reads, lazy access |
-| ZERA        | 209 bytes | +132% | Zerialize ecosystem, advanced features |
+Named composite columns are recursively represented as nested protocol maps.
+This applies to row and batch serialization for all four protocols.
 
-**MessagePack** and **CBOR** are the most compact, both saving ~21% vs JSON.
-**FlexBuffers** trades size for zero-copy deserialization capability.
-**ZERA** includes additional structure for advanced features but is larger.
+MessagePack also provides JSON-style builders and aggregates:
 
-## Performance Optimizations
+```sql
+SELECT msgpack_from_jsonb(
+  jsonb_build_object(
+    'department', d.name,
+    'staff', COALESCE(e.employees, '[]'::jsonb)
+  )
+)
+FROM departments d
+LEFT JOIN (
+  SELECT department_id,
+         jsonb_agg(jsonb_build_object('id', id, 'name', name)) AS employees
+  FROM employees
+  GROUP BY department_id
+) e ON e.department_id = d.id;
 
-All major performance optimizations complete! **Combined speedup: ~3-5x faster than original!**
+SELECT msgpack_build_object('id', 7, 'active', true);
+SELECT msgpack_build_array(1, 'two', NULL, 3.5::numeric);
+SELECT msgpack_agg(value ORDER BY id) FROM items;
+SELECT msgpack_object_agg(key, value ORDER BY key) FROM items;
+```
 
-✅ **Schema Caching** - TupleDesc lookups cached, **20-30% faster** bulk operations
+Passing a builder's `bytea` result into another builder encodes that result as a
+binary blob. Use one JSONB tree with `msgpack_from_jsonb` when values must be
+spliced into one nested MessagePack document.
 
-✅ **Batch Processing** - Multiple rows in single call, **2-3x faster** for bulk operations
+## Wire Semantics
 
-✅ **Buffer Pre-allocation** - Map/array capacity reserved upfront, **5-10% faster** with reduced memory fragmentation
+- `int2`, `int4`, and `int8` are protocol integers.
+- `float4` and `float8` are protocol floating-point values.
+- Integral `numeric` values fitting in signed 64 bits are exact integers. Other
+  `numeric` values are `float64` and may lose decimal precision.
+- The default decimal-to-float parser is fast_float. Set
+  `pg_zerialize.numeric_float_backend = 'postgres'` to use PostgreSQL's parser.
+- Date values are PostgreSQL days since 2000-01-01.
+- Timestamp values are PostgreSQL microseconds since 2000-01-01.
+- `bytea` and row-level `jsonb` values are binary payloads.
+- A `json` value remains its original JSON text string.
+- UUID, enum, `name`, internal `"char"`, inet/cidr, and interval values use
+  canonical PostgreSQL-compatible text representations.
+- One-dimensional PostgreSQL arrays become protocol arrays and preserve null
+  elements.
+- Multidimensional arrays currently use text fallback in row serialization and
+  are rejected by batch serialization.
 
-## Next Steps
+## Fast Paths
 
-1. ✅ ~~Implement FlexBuffers support~~
-2. ✅ ~~Implement MessagePack support~~
-3. ✅ ~~Implement CBOR support~~
-4. ✅ ~~Implement ZERA support~~
-5. ✅ ~~Add array support for PostgreSQL arrays~~
-6. ✅ ~~Add native numeric encoding (int64/float64)~~
-7. ✅ ~~Schema caching optimization~~
-8. ✅ ~~Batch processing for multiple rows~~
-9. ✅ ~~Buffer pre-allocation optimization~~
-10. Add nested composite type support
-11. ✅ ~~Add date/timestamp types~~
-12. Add deserialization functions
-13. Add an exact decimal wire representation for arbitrary `numeric` values
+Schema metadata, converter selection, protocol keys, and map headers are cached
+per PostgreSQL backend. Flat supported schemas use protocol-specific direct
+writers. Schemas containing recursive composites use the generic dynamic tree
+path to preserve nested structure.
+
+The following test helpers force MessagePack's generic path for byte-parity
+checks:
+
+- `row_to_msgpack_slow(record)`
+- `rows_to_msgpack_slow(anyarray)`
+
+## Benchmarking
+
+```bash
+make bench
+make bench-isolated
+PROTOCOLS="msgpack flex" RUNS=10 WARMUP=3 make bench-isolated
+```
+
+See [`bench/README.md`](bench/README.md) for workloads, connection settings, and
+result format. Benchmark output under `results/` is intentionally untracked.
+
+## Current Limitations
+
+- Multidimensional arrays do not yet produce nested protocol arrays.
+- Deserialization functions are not provided.
+- Arbitrary-precision decimal values do not have an exact portable wire type.
+- JSON text is not recursively parsed; use JSONB builders when nested JSON
+  semantics are required.
+
+## Maintained Documentation
+
+- [`QUICKSTART.md`](QUICKSTART.md): installation and common SQL examples
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): conversion paths, caching, and semantics
+- [`bench/README.md`](bench/README.md): repeatable benchmark harness
+- [`vendor/zerialize/UPSTREAM.md`](vendor/zerialize/UPSTREAM.md): vendored source
+  provenance

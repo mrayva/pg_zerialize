@@ -1,220 +1,141 @@
-# pg_zerialize Architecture
+# Architecture
 
 ## Overview
 
-`pg_zerialize` is a PostgreSQL extension that converts database rows to efficient binary formats using the zerialize library.
-Current supported formats are FlexBuffers, MessagePack, CBOR, and ZERA for both single-row and batch APIs.
+`pg_zerialize` is a PostgreSQL C extension implemented in C++20. SQL-callable
+entry points use C linkage and convert PostgreSQL `Datum` values into
+MessagePack, CBOR, ZERA, or FlexBuffers documents.
 
-## Design
+The extension has two serialization paths:
 
-### C++ Integration with PostgreSQL
+1. Protocol-specific direct writers for supported flat schemas.
+2. A generic `zerialize::dyn::Value` tree for recursive composites and fallback
+   cases.
 
-PostgreSQL extensions are typically written in C, but C++ is supported through careful use of `extern "C"` linkage:
+Both paths produce the same documented data semantics.
 
-```cpp
-extern "C" {
-    #include "postgres.h"
-    // ... other PostgreSQL headers
-}
+## Entry Points
 
-// C++ implementation here
+Single-row functions accept `record` and return one map as `bytea`:
 
-extern "C" {
-    Datum row_to_flexbuffers(PG_FUNCTION_ARGS);
-    PG_FUNCTION_INFO_V1(row_to_flexbuffers);
-}
-```
+- `row_to_msgpack`
+- `row_to_cbor`
+- `row_to_zera`
+- `row_to_flexbuffers`
 
-### Memory Management
+Batch functions accept a one-dimensional array of composite records and return
+one protocol array:
 
-PostgreSQL uses its own memory management system (palloc/pfree). Key considerations:
+- `rows_to_msgpack`
+- `rows_to_cbor`
+- `rows_to_zera`
+- `rows_to_flexbuffers`
 
-1. **PostgreSQL memory**: Use `palloc()` for memory returned to PostgreSQL
-2. **C++ RAII**: zerialize uses C++ STL containers which manage their own memory
-3. **Copying**: Final serialized data is copied from zerialize's buffer to PostgreSQL's bytea
+MessagePack additionally exposes JSONB conversion, variadic builders, and
+aggregates. Their SQL definitions are versioned in `pg_zerialize--1.2.sql`.
 
-### Type Conversion Flow
+## Schema Cache
 
-```
-PostgreSQL Row
-    ↓
+Each PostgreSQL backend maintains schema metadata keyed by composite type OID
+and typmod. A cached schema owns:
+
+- a copied `TupleDesc`
+- non-dropped attribute metadata
+- converter kinds and output function OIDs
+- protocol-specific scalar and array writer plans
+- preencoded MessagePack and ZERA keys
+- a preencoded MessagePack map header
+- the selected tuple access strategy
+
+Catalog and relation cache callbacks clear this state after relevant DDL. Wide
+schemas use `heap_deform_tuple`; narrow schemas use `heap_getattr`.
+
+## Direct Path
+
+Flat schemas composed of supported scalar and one-dimensional array types use
+protocol-specific writers. This avoids building an intermediate dynamic tree.
+MessagePack additionally reuses a backend-local output buffer and directly
+encodes canonical headers and scalar values.
+
+A schema containing a composite column is deliberately excluded from the flat
+fast path. It uses recursive dynamic conversion so nested maps remain correct.
+
+## Dynamic Path
+
+The generic path performs this conversion:
+
+```text
 HeapTupleHeader
-    ↓
-Extract each column (Datum + type OID)
-    ↓
-Convert to zerialize::Dynamic
-    ↓
-Build Dynamic::Map
-    ↓
-serialize<Protocol>()
-    ↓
-Copy to bytea
-    ↓
-Return to PostgreSQL
+  -> cached TupleDesc and attribute values
+  -> zerialize::dyn::Value map
+  -> protocol serializer
+  -> PostgreSQL bytea
 ```
 
-## Current Implementation
+`datum_to_dynamic` recursively handles arrays and named composite values.
+Composite attributes call `record_to_dynamic_map`, producing nested protocol
+maps with the nested type's attribute names.
 
-### Supported PostgreSQL Types
+## Type Semantics
 
-- **Integers**: INT2, INT4, INT8 → `int64_t`
-- **Floats**: FLOAT4, FLOAT8 → `double`
-- **Boolean**: BOOL → `bool`
-- **Text**: TEXT, VARCHAR, BPCHAR → `string`
-- **Numeric**: NUMERIC/DECIMAL → `float8` (`double`, may lose precision)
-- **Arrays**: 1D arrays of supported element types
-- **Fallback**: All other types converted to text representation
+| PostgreSQL type | Dynamic/wire representation |
+| --- | --- |
+| `int2`, `int4`, `int8` | signed integer |
+| `float4`, `float8` | floating point |
+| `boolean` | boolean |
+| text types, `json` | string |
+| integral `numeric` fitting in `int64` | signed integer |
+| other `numeric` | `float64` |
+| date | days since PostgreSQL epoch |
+| timestamp/timestamptz | microseconds since PostgreSQL epoch |
+| `bytea`, row-level `jsonb` | binary payload |
+| UUID, enum, name, char, inet/cidr, interval | canonical text |
+| one-dimensional array | protocol array |
+| named composite | protocol map |
+| null | protocol null |
 
-### Not Yet Supported
+Multidimensional row arrays currently fall back to PostgreSQL text. Batch APIs
+reject multidimensional arrays because their outer array is reserved for rows.
 
-- Nested composite values inside records
-- Native semantic handling for DATE/TIMESTAMP/JSON/JSONB/BYTEA
-- Multidimensional arrays in batch serialization
+## Nested JSONB
 
-## Building
+Row-level `jsonb` remains an opaque PostgreSQL binary payload for compatibility.
+`msgpack_from_jsonb` is a separate semantic API that recursively maps JSONB
+objects, arrays, scalars, and nulls into MessagePack.
 
-### Requirements
+## Numeric Conversion
 
-- PostgreSQL 12+ with development headers (`postgresql-server-dev-*`)
-- C++20 compiler (GCC 10+, Clang 10+)
-- zerialize library (included in `vendor/`)
+`numeric_out` produces PostgreSQL's canonical decimal text once. Integral text
+is parsed with `std::from_chars`; other values use fast_float by default and
+fall back to `numeric_float8` for special or rejected values. The GUC
+`pg_zerialize.numeric_float_backend` selects `fast_float` or `postgres`.
 
-### Build Process
+## Memory Management
 
-```bash
-./build.sh
-sudo make install
-```
-
-The Makefile:
-1. Compiles C++ with `-std=c++20`
-2. Includes `vendor/zerialize/include`
-3. Links with `libstdc++`
-4. Uses PGXS (PostgreSQL extension build system)
-
-## Usage Examples
-
-### Basic Usage
-
-```sql
-CREATE EXTENSION pg_zerialize;
-
--- Simple row
-SELECT row_to_flexbuffers(ROW('Alice', 30, true));
-
--- From table
-SELECT id, row_to_flexbuffers(users.*) FROM users;
-```
-
-### Output Format
-
-Returns `bytea` (binary data). To inspect:
-
-```sql
--- View as hex
-SELECT encode(row_to_flexbuffers(ROW('test', 123)), 'hex');
-
--- View size
-SELECT octet_length(row_to_flexbuffers(users.*)) FROM users;
-```
-
-## Future Enhancements
-
-### Near-term (FlexBuffers polish)
-
-1. **Nested records**: Composite types → nested maps
-2. **NUMERIC handling**: Exact decimal representation option
-3. **Temporal types**: Native DATE/TIMESTAMP encoding options
-4. **JSON/JSONB**: Preserve nested structure instead of text fallback
-5. **BYTEA**: Native binary passthrough mode
-
-### Medium-term (Additional formats)
-
-1. **Format parameter**: Single function with format arg
-2. **Deserialization**: Add binary → record helpers
-
-### Long-term (Advanced features)
-
-1. **Deserialization**: Functions to convert binary → rows
-2. **Bulk operations**: Efficient array-of-rows serialization
-3. **Schema caching**: Cache type info for performance
-4. **Custom options**: Control null handling, key naming, etc.
-
-## Performance Considerations
-
-### Advantages
-
-- **Zero-copy deserialization**: FlexBuffers supports lazy reading
-- **Binary format**: Much more compact than JSON
-- **Type preservation**: Better than text serialization
-
-### Overhead
-
-- **Type inspection**: PostgreSQL type lookup per column
-- **Memory copy**: Final copy to PostgreSQL bytea
-- **Dynamic building**: Using Dynamic API vs compile-time keys
-
-### Optimization Ideas
-
-1. ✅ **Cache TupleDesc lookups for repeated calls** (IMPLEMENTED - 20-30% faster)
-2. ✅ **Batch processing for multiple rows** (IMPLEMENTED - 2-3x faster for bulk operations)
-3. ✅ **Pre-allocate buffers based on estimated size** (IMPLEMENTED - 5-10% faster)
-4. Consider compile-time optimization for common schemas (low priority)
-
-**All major performance optimizations complete! Combined: ~3-5x faster than original!**
+- Returned `bytea` values use PostgreSQL `palloc`.
+- C++ containers and zerialize buffers use RAII.
+- MessagePack reuses a backend-local malloc buffer for single-row and batch fast
+  paths, then copies the completed payload into its returned `bytea`.
+- Schema cache entries live until invalidation or backend exit.
 
 ## Testing
 
-Run the test suite:
+PGXS regression suites cover core behavior, fast/slow parity, cache
+invalidation, deterministic output, builders, semantics, and extension
+upgrades. `test/semantic_roundtrip.py` independently decodes MessagePack and
+asserts data-level meaning.
 
 ```bash
 make installcheck
-psql -d postgres -f test_pg_zerialize.sql
+make semantic-check
 ```
 
-Tests cover:
-- Simple anonymous records
-- Named composite types
-- NULL values
-- Real table data
+The isolated benchmark harness runs each protocol in a separate `psql` session
+to avoid cross-protocol cache and allocator effects. See `bench/README.md`.
 
-## Debugging
+## Remaining Work
 
-### Build Issues
-
-```bash
-# Check PostgreSQL config
-pg_config --includedir-server
-pg_config --version
-
-# Verbose build
-make clean && make VERBOSE=1
-```
-
-### Runtime Issues
-
-```sql
--- Check extension loaded
-SELECT * FROM pg_extension WHERE extname = 'pg_zerialize';
-
--- Test with simple data
-SELECT row_to_flexbuffers(ROW(1::int, 'test'::text));
-```
-
-### C++ Debugging
-
-Add to code:
-```cpp
-elog(NOTICE, "Debug: column=%s type=%u", attname, att->atttypid);
-```
-
-Rebuild and watch PostgreSQL logs.
-
-## Contributing
-
-Priority areas:
-1. Add more type support (arrays, NUMERIC, JSON)
-2. Implement other formats (MessagePack, CBOR, ZERA)
-3. Performance testing and optimization
-4. Deserialization functions
-5. Documentation improvements
+- Nested protocol arrays for multidimensional PostgreSQL arrays
+- Deserialization APIs
+- An explicit exact-decimal wire policy
+- Optional direct recursive writers if real nested workloads justify them

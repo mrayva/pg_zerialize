@@ -7,10 +7,38 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgresql: [16, 17, 18]
+
+    env:
+      PG_MAJOR: ${{ matrix.postgresql }}
+      PG_CONFIG: /usr/lib/postgresql/${{ matrix.postgresql }}/bin/pg_config
+      PGPORT: 54${{ matrix.postgresql }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Configure PostgreSQL Apt repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates \
+            curl
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          printf '%s\n' \
+            'Types: deb' \
+            'URIs: https://apt.postgresql.org/pub/repos/apt' \
+            "Suites: ${VERSION_CODENAME}-pgdg" \
+            'Components: main' \
+            'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' \
+            | sudo tee /etc/apt/sources.list.d/pgdg.sources
 
       - name: Install dependencies
         run: |
@@ -18,24 +46,32 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             clang \
-            lld \
-            llvm-dev \
             libflatbuffers-dev \
             libfast-float-dev \
             python3-msgpack \
-            postgresql \
-            postgresql-server-dev-all
+            "postgresql-${PG_MAJOR}" \
+            "postgresql-server-dev-${PG_MAJOR}"
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
 
       - name: Start PostgreSQL
         run: |
-          sudo service postgresql start
-          sudo -u postgres createuser -s "$USER" || true
+          sudo pg_ctlcluster "$PG_MAJOR" main stop || true
+          sudo pg_conftool "$PG_MAJOR" main set port "$PGPORT"
+          sudo pg_ctlcluster "$PG_MAJOR" main start
+          sudo -u postgres createuser -p "$PGPORT" -s "$USER" || true
+          sudo -u postgres psql -p "$PGPORT" -c \
+            "ALTER USER postgres PASSWORD 'postgres'"
+
+      - name: Show PostgreSQL version
+        run: |
+          "$PG_CONFIG" --version
+          psql --version
 
       - name: Build
         run: make -j"$(nproc)"
 
       - name: Install extension
-        run: sudo make install
+        run: sudo make PG_CONFIG="$PG_CONFIG" install
 
       - name: PGXS regression tests
         run: make installcheck
@@ -47,4 +83,5 @@ jobs:
         run: make semantic-check
 
       - name: Quick isolated microbench sanity
+        if: matrix.postgresql == 18
         run: RUNS=1 WARMUP=0 PROTOCOLS="msgpack" PGDATABASE=postgres ./bench/run_microbench_isolated.sh

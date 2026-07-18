@@ -167,6 +167,7 @@ enum class ConverterKind {
     Timestamptz,
     Jsonb,
     Bytea,
+    Composite,
     Array,
     Fallback
 };
@@ -358,6 +359,9 @@ static ConverterKind classify_type(Oid typid)
             }
             if (get_typtype(typid) == TYPTYPE_ENUM) {
                 return ConverterKind::EnumText;
+            }
+            if (get_typtype(typid) == TYPTYPE_COMPOSITE) {
+                return ConverterKind::Composite;
             }
             return ConverterKind::Fallback;
     }
@@ -785,12 +789,14 @@ static inline std::string_view interval_text_view(
     Datum value, char (&out)[MAXDATELEN + 1])
 {
     Interval* span = DatumGetIntervalP(value);
+#if PG_VERSION_NUM >= 170000
     if (INTERVAL_IS_NOBEGIN(span)) {
         return std::string_view(EARLY, sizeof(EARLY) - 1);
     }
     if (INTERVAL_IS_NOEND(span)) {
         return std::string_view(LATE, sizeof(LATE) - 1);
     }
+#endif
 
     struct pg_itm itm;
     interval2itm(*span, &itm);
@@ -874,12 +880,12 @@ static z::dyn::Value datum_to_dynamic(Datum value, Oid typid, bool isnull)
         case BYTEAOID:
             return z::dyn::Value::blob(datum_bytea_span(value));
 
-        // TODO: Add support for more types:
-        // - Recursively decoded JSON text
-        // - Composite types (nested records)
-
         default:
         {
+            if (typid == RECORDOID || get_typtype(typid) == TYPTYPE_COMPOSITE) {
+                return record_to_dynamic_map(DatumGetHeapTupleHeader(value));
+            }
+
             // For unsupported types, convert to text representation
             Oid typoutput;
             bool typIsVarlena;
@@ -987,6 +993,8 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
             return z::dyn::Value::blob(datum_bytea_span(value));
         case ConverterKind::Array:
             return array_to_dynamic(value, col.typid);
+        case ConverterKind::Composite:
+            return record_to_dynamic_map(DatumGetHeapTupleHeader(value));
         case ConverterKind::Fallback:
             return fallback_to_text_output(value, col.typoutput);
     }
@@ -1927,6 +1935,7 @@ static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
         case ConverterKind::Bytea: return &msgpack_scalar_bytea;
         case ConverterKind::Array: return &msgpack_scalar_array;
         case ConverterKind::Fallback: return &msgpack_scalar_fallback;
+        case ConverterKind::Composite: return &msgpack_scalar_unsupported;
     }
     return &msgpack_scalar_unsupported;
 }
