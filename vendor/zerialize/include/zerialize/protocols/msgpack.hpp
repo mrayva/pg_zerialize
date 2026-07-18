@@ -543,7 +543,17 @@ public:
     void write_raw(const uint8_t* data, std::size_t len) {
         if (len == 0) return;
         uint8_t* out = reserve_raw_append(len);
-        std::memcpy(out, data, len);
+        switch (len) {
+            case 1: std::memcpy(out, data, 1); break;
+            case 2: std::memcpy(out, data, 2); break;
+            case 3: std::memcpy(out, data, 3); break;
+            case 4: std::memcpy(out, data, 4); break;
+            case 5: std::memcpy(out, data, 5); break;
+            case 6: std::memcpy(out, data, 6); break;
+            case 7: std::memcpy(out, data, 7); break;
+            case 8: std::memcpy(out, data, 8); break;
+            default: std::memcpy(out, data, len); break;
+        }
         commit_raw_append(len);
     }
 
