@@ -228,6 +228,7 @@ struct CachedSchema {
     const uint8_t* msgpack_map_header_ptr;
     size_t msgpack_map_header_len;
     bool use_deform_access;
+    bool msgpack_has_recursive_columns;
     bool msgpack_fast_supported;
     bool cbor_fast_supported;
     bool zera_fast_supported;
@@ -426,6 +427,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
     CachedSchema schema;
     schema.tupdesc = cached_tupdesc;
     schema.use_deform_access = false;
+    schema.msgpack_has_recursive_columns = false;
     schema.msgpack_fast_supported = true;
     schema.cbor_fast_supported = true;
     schema.zera_fast_supported = true;
@@ -477,6 +479,15 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
 
         if (!is_msgpack_fast_column(col)) {
             schema.msgpack_fast_supported = false;
+        }
+        if (col.kind == ConverterKind::Composite ||
+            (col.kind == ConverterKind::Array &&
+             col.array_element_kind == ConverterKind::Composite)) {
+            schema.msgpack_has_recursive_columns = true;
+        }
+        if (!is_msgpack_fast_column(col) || col.kind == ConverterKind::Composite ||
+            (col.kind == ConverterKind::Array &&
+             col.array_element_kind == ConverterKind::Composite)) {
             schema.cbor_fast_supported = false;
             schema.zera_fast_supported = false;
             schema.flex_fast_supported = false;
@@ -1906,6 +1917,7 @@ static bool is_msgpack_fast_kind(ConverterKind kind)
         case ConverterKind::Jsonb:
         case ConverterKind::Bytea:
         case ConverterKind::Fallback:
+        case ConverterKind::Composite:
             return true;
         default:
             return false;
@@ -1937,6 +1949,7 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
         case ConverterKind::Jsonb:
         case ConverterKind::Bytea:
         case ConverterKind::Fallback:
+        case ConverterKind::Composite:
             return true;
         default:
             return false;
@@ -2045,6 +2058,12 @@ static inline void msgpack_write_text(z::MsgPackSerializer& writer, Datum value)
     writer.string(std::string_view(ptr, static_cast<size_t>(len)));
 }
 
+static inline void msgpack_write_record_map(
+    z::MsgPackSerializer& writer,
+    HeapTupleHeader rec,
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch);
+
 static inline void msgpack_array_elem_unsupported(
     z::MsgPackSerializer& writer,
     Datum value,
@@ -2056,6 +2075,17 @@ static inline void msgpack_array_elem_unsupported(
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
              errmsg("unsupported array element type for fast MessagePack path")));
+}
+
+static inline void msgpack_array_elem_composite(
+    z::MsgPackSerializer& writer, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+    const CachedSchema& schema = get_cached_schema(
+        HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+    TupleDeformScratch scratch;
+    msgpack_write_record_map(writer, rec, schema, &scratch);
 }
 
 static inline void msgpack_array_elem_int2(z::MsgPackSerializer& writer, Datum value, bool isnull)
@@ -2206,6 +2236,7 @@ static MsgpackArrayElemWriterFn select_msgpack_array_elem_writer(ConverterKind k
         case ConverterKind::Timestamptz: return &msgpack_array_elem_timestamptz;
         case ConverterKind::Jsonb: return &msgpack_array_elem_jsonb;
         case ConverterKind::Bytea: return &msgpack_array_elem_bytea;
+        case ConverterKind::Composite: return &msgpack_array_elem_composite;
         default: return &msgpack_array_elem_unsupported;
     }
 }
@@ -2319,6 +2350,11 @@ static inline void msgpack_write_array_no_nulls(
         case ConverterKind::Bytea:
             for (int i = 0; i < nitems; i++) {
                 writer.binary(datum_bytea_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Composite:
+            for (int i = 0; i < nitems; i++) {
+                msgpack_array_elem_composite(writer, elements[i], false);
             }
             return;
         default:
@@ -2625,6 +2661,17 @@ static inline void msgpack_scalar_unsupported(
              errdetail("column type OID %u", col.typid)));
 }
 
+static inline void msgpack_scalar_composite(
+    z::MsgPackSerializer& writer, const CachedColumn&, Datum value, bool isnull)
+{
+    if (isnull) { writer.null(); return; }
+    HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+    const CachedSchema& schema = get_cached_schema(
+        HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+    TupleDeformScratch scratch;
+    msgpack_write_record_map(writer, rec, schema, &scratch);
+}
+
 static inline void msgpack_scalar_fallback(
     z::MsgPackSerializer& writer, const CachedColumn& col, Datum value, bool isnull)
 {
@@ -2811,7 +2858,7 @@ static MsgpackScalarWriterFn select_msgpack_scalar_writer(ConverterKind kind)
         case ConverterKind::Bytea: return &msgpack_scalar_bytea;
         case ConverterKind::Array: return &msgpack_scalar_array;
         case ConverterKind::Fallback: return &msgpack_scalar_fallback;
-        case ConverterKind::Composite: return &msgpack_scalar_unsupported;
+        case ConverterKind::Composite: return &msgpack_scalar_composite;
     }
     return &msgpack_scalar_unsupported;
 }
@@ -2869,6 +2916,33 @@ static inline bytea* msgpack_result_from_reusable_root(z::MsgPackRootSerializer&
     return result;
 }
 
+static bool msgpack_schema_recursive_supported(
+    const CachedSchema& schema, std::unordered_set<Oid>& active_types)
+{
+    if (!schema.msgpack_fast_supported) {
+        return false;
+    }
+    for (const CachedColumn& col : schema.columns) {
+        Oid nested_type = InvalidOid;
+        if (col.kind == ConverterKind::Composite) {
+            nested_type = col.typid;
+        } else if (col.kind == ConverterKind::Array &&
+                   col.array_element_kind == ConverterKind::Composite) {
+            nested_type = col.array_element_typid;
+        }
+        if (!OidIsValid(nested_type) || !active_types.insert(nested_type).second) {
+            continue;
+        }
+        const CachedSchema& nested = get_cached_schema(nested_type, -1);
+        const bool supported = msgpack_schema_recursive_supported(nested, active_types);
+        active_types.erase(nested_type);
+        if (!supported) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
 {
     Oid tupType = HeapTupleHeaderGetTypeId(rec);
@@ -2877,6 +2951,12 @@ static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
 
     if (!schema.msgpack_fast_supported) {
         return nullptr;
+    }
+    if (schema.msgpack_has_recursive_columns) {
+        std::unordered_set<Oid> active_types{tupType};
+        if (!msgpack_schema_recursive_supported(schema, active_types)) {
+            return nullptr;
+        }
     }
 
     z::MsgPackRootSerializer& rs = msgpack_reusable_root();
@@ -2926,6 +3006,12 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
 
         if (!schema.msgpack_fast_supported) {
             return nullptr;
+        }
+        if (schema.msgpack_has_recursive_columns) {
+            std::unordered_set<Oid> active_types{tupType};
+            if (!msgpack_schema_recursive_supported(schema, active_types)) {
+                return nullptr;
+            }
         }
         schemas.push_back(&schema);
     }

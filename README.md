@@ -143,8 +143,9 @@ spliced into one nested MessagePack document.
 
 Schema metadata, converter selection, protocol keys, and map headers are cached
 per PostgreSQL backend. Flat supported schemas use protocol-specific direct
-writers. Schemas containing recursive composites use the generic dynamic tree
-path to preserve nested structure.
+writers. MessagePack also directly writes nested composite fields and composite
+arrays; unsupported recursive shapes and other protocols use the generic
+dynamic tree.
 
 The following test helpers force MessagePack's generic path for byte-parity
 checks:
