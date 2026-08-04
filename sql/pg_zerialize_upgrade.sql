@@ -72,6 +72,20 @@ SELECT to_regprocedure('msgpack_populate_record(anyelement,bytea)') IS NOT NULL 
 CREATE TYPE pg_temp.upgrade_row AS (f1 int, f2 text);
 SELECT msgpack_populate_record(NULL::pg_temp.upgrade_row, row_to_msgpack(ROW(1, 'upgrade-ok')::pg_temp.upgrade_row)) =
        ROW(1, 'upgrade-ok')::pg_temp.upgrade_row AS populate_record_works;
+
+ALTER EXTENSION pg_zerialize UPDATE TO '1.9';
+SELECT extversion = '1.9' AS upgraded_to_1_9
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('msgpack_populate_recordset(anyelement,bytea)') IS NOT NULL AS msgpack_populate_recordset_present,
+       to_regprocedure('cbor_populate_recordset(anyelement,bytea)') IS NOT NULL AS cbor_populate_recordset_present,
+       to_regprocedure('zera_populate_recordset(anyelement,bytea)') IS NOT NULL AS zera_populate_recordset_present,
+       to_regprocedure('flexbuffers_populate_recordset(anyelement,bytea)') IS NOT NULL AS flex_populate_recordset_present;
+SELECT array_agg(r ORDER BY r.f1) = ARRAY[ROW(1, 'a')::pg_temp.upgrade_row, ROW(2, 'b')::pg_temp.upgrade_row]
+FROM msgpack_populate_recordset(
+    NULL::pg_temp.upgrade_row,
+    rows_to_msgpack(ARRAY[ROW(1, 'a')::pg_temp.upgrade_row, ROW(2, 'b')::pg_temp.upgrade_row])
+) AS r;
 DROP TYPE pg_temp.upgrade_row;
 
 DROP EXTENSION pg_zerialize;

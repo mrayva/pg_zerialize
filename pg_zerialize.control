@@ -1,5 +1,5 @@
 # pg_zerialize extension
 comment = 'Serialize PostgreSQL rows and decode binary formats'
-default_version = '1.8'
+default_version = '1.9'
 module_pathname = '$libdir/pg_zerialize'
 relocatable = true

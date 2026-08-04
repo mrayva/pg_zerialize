@@ -138,6 +138,20 @@ and the `["~b", ...]`/`["~n", ...]` tagged values described below all decode
 back to their original PostgreSQL types; a domain column is validated through
 the domain's own input function, so `CHECK` constraints are enforced.
 
+`X_populate_recordset(base anyelement, data bytea)` is the batch counterpart,
+the reverse of `rows_to_X`: it decodes a binary array of documents into a
+`SETOF` typed composites, mirroring `jsonb_populate_recordset`. The same
+`base` row supplies the fallback for every document in the array. `data =
+NULL` yields an empty result set rather than a single unchanged row, since
+there is no singular row to return unchanged.
+
+```sql
+SELECT * FROM msgpack_populate_recordset(
+  NULL::employee,
+  rows_to_msgpack(ARRAY[ROW(1, 'Ada', true), ROW(2, 'Grace', true)]::employee[])
+);
+```
+
 ## Wire Semantics
 
 - `int2`, `int4`, and `int8` are protocol integers.
@@ -203,8 +217,9 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 ## Current Limitations
 
-- Deserialization targets JSONB (`X_to_jsonb`) and typed composites
-  (`X_populate_record`), for all four binary protocols.
+- Deserialization targets JSONB (`X_to_jsonb`) and typed composites, single
+  (`X_populate_record`) or batch (`X_populate_recordset`), for all four
+  binary protocols.
 - Exact decimals use an opt-in tagged-array convention rather than a native
   protocol scalar, so non-pg_zerialize consumers must interpret that tag.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON
