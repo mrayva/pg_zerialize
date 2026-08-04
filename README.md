@@ -19,6 +19,7 @@ and performance work use PostgreSQL 18.
 - C++20 compiler (GCC 10+ or Clang 10+)
 - FlatBuffers development package (`libflatbuffers-dev`)
 - fast_float development package (`libfast-float-dev`)
+- MessagePack C development package (`libmsgpack-dev`)
 - Python `msgpack` package for independent MessagePack semantic tests
 
 The zerialize headers are vendored under `vendor/`. See
@@ -143,9 +144,10 @@ spliced into one nested MessagePack document.
 
 Schema metadata, converter selection, protocol keys, and map headers are cached
 per PostgreSQL backend. Flat supported schemas use protocol-specific direct
-writers. MessagePack also directly writes nested composite fields and composite
-arrays; unsupported recursive shapes and other protocols use the generic
-dynamic tree.
+writers. All four protocols also directly write nested composite fields and
+one-dimensional composite arrays, recursing through the same cached writer
+plans at every level; schemas with a descendant column that has no direct
+writer (recursively) fall back to the generic dynamic tree.
 
 The following test helpers force MessagePack's generic path for byte-parity
 checks:

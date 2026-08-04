@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -79,11 +80,11 @@ public:
         if (owned_) return *owned_;
         if constexpr (NRows == Eigen::Dynamic || NCols == Eigen::Dynamic) {
             MatrixType out(static_cast<Eigen::Index>(rows_), static_cast<Eigen::Index>(cols_));
-            std::memcpy(out.data(), bytes_.data(), bytes_.size());
+            if (!bytes_.empty()) std::memcpy(out.data(), bytes_.data(), bytes_.size());
             return out;
         } else {
             MatrixType out;
-            std::memcpy(out.data(), bytes_.data(), bytes_.size());
+            if (!bytes_.empty()) std::memcpy(out.data(), bytes_.data(), bytes_.size());
             return out;
         }
     }
@@ -154,7 +155,14 @@ EigenMatrixView<T, NRows, NCols, Options> asEigenMatrixView(const Reader auto& b
     };
     auto bytes = to_span(blob);
 
-    const std::size_t expected = rows * cols * sizeof(T);
+    if (rows != 0 && cols != 0 && rows > std::numeric_limits<std::size_t>::max() / cols) {
+        throw DeserializationError("asEigenMatrixView: rows * cols overflows");
+    }
+    const std::size_t element_count = rows * cols;
+    if (element_count != 0 && sizeof(T) > std::numeric_limits<std::size_t>::max() / element_count) {
+        throw DeserializationError("asEigenMatrixView: element count * sizeof(T) overflows");
+    }
+    const std::size_t expected = element_count * sizeof(T);
     if (bytes.size() != expected) {
         throw DeserializationError(
             "asEigenMatrixView expected " + std::to_string(expected) + " bytes, but found " + std::to_string(bytes.size())
@@ -170,11 +178,11 @@ EigenMatrixView<T, NRows, NCols, Options> asEigenMatrixView(const Reader auto& b
         info.byte_size = bytes.size();
         if constexpr (NRows == Eigen::Dynamic || NCols == Eigen::Dynamic) {
             MatrixType copy(static_cast<Eigen::Index>(rows), static_cast<Eigen::Index>(cols));
-            std::memcpy(copy.data(), bytes.data(), bytes.size());
+            if (!bytes.empty()) std::memcpy(copy.data(), bytes.data(), bytes.size());
             return ViewType(std::move(copy), rows, cols, info);
         } else {
             MatrixType copy;
-            std::memcpy(copy.data(), bytes.data(), bytes.size());
+            if (!bytes.empty()) std::memcpy(copy.data(), bytes.data(), bytes.size());
             return ViewType(std::move(copy), rows, cols, info);
         }
     };
@@ -193,11 +201,11 @@ EigenMatrixView<T, NRows, NCols, Options> asEigenMatrixView(const Reader auto& b
             info.reason = tensor::TensorViewReason::Misaligned;
             if constexpr (NRows == Eigen::Dynamic || NCols == Eigen::Dynamic) {
                 MatrixType copy(static_cast<Eigen::Index>(rows), static_cast<Eigen::Index>(cols));
-                std::memcpy(copy.data(), bytes.data(), bytes.size());
+                if (!bytes.empty()) std::memcpy(copy.data(), bytes.data(), bytes.size());
                 return ViewType(std::move(copy), rows, cols, info);
             } else {
                 MatrixType copy;
-                std::memcpy(copy.data(), bytes.data(), bytes.size());
+                if (!bytes.empty()) std::memcpy(copy.data(), bytes.data(), bytes.size());
                 return ViewType(std::move(copy), rows, cols, info);
             }
         }

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(zerialize VERSION 1.0 LANGUAGES CXX)
+project(zerialize VERSION 1.0.1 LANGUAGES CXX)
 
 include(FetchContent)
 
@@ -48,7 +48,7 @@ if(ZERIALIZE_ENABLE_FLEXBUFFERS)
     FetchContent_Declare(
         flatbuffers
         GIT_REPOSITORY https://github.com/google/flatbuffers.git
-        GIT_TAG master
+        GIT_TAG v25.12.19
     )
     FetchContent_GetProperties(flatbuffers)
     if(NOT flatbuffers_POPULATED)
@@ -59,6 +59,18 @@ if(ZERIALIZE_ENABLE_FLEXBUFFERS)
 
   target_include_directories(${PROJECT_NAME} INTERFACE ${_zerialize_flatbuffers_includes})
   target_compile_definitions(${PROJECT_NAME} INTERFACE ZERIALIZE_HAS_FLEXBUFFERS=1)
+
+  # We only ever use flatbuffers/flexbuffers headers (no linking, no
+  # add_subdirectory) - but flatbuffers/base.h defaults
+  # FLATBUFFERS_LOCALE_INDEPENDENT to 1 on any POSIX.1-2008 system, which
+  # makes flatbuffers/util.h declare a ClassicLocale class whose static
+  # instance_ member (and its ctor/dtor) are only ever *defined* in
+  # flatbuffers' src/util.cpp - a translation unit we never compile. Any code
+  # path that parses/formats numbers (flexbuffers::Reference::AsInt64,
+  # AsDouble, etc.) then fails to link with "undefined reference to
+  # flatbuffers::ClassicLocale::instance_". Force it to 0 so those headers
+  # fall back to plain strtod/strtoll instead, which need no linked symbol.
+  target_compile_definitions(${PROJECT_NAME} INTERFACE FLATBUFFERS_LOCALE_INDEPENDENT=0)
 endif()
 
 # Protocol: yyjson (JSON)
@@ -126,7 +138,7 @@ if(ZERIALIZE_ENABLE_MSGPACK)
     FetchContent_Declare(
         msgpack
         GIT_REPOSITORY https://github.com/msgpack/msgpack-c.git
-        GIT_TAG c_master
+        GIT_TAG c-7.0.1
     )
     FetchContent_GetProperties(msgpack)
     if(NOT msgpack_POPULATED)

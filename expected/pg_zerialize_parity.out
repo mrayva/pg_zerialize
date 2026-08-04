@@ -95,19 +95,36 @@ SELECT rows_to_msgpack(ARRAY[
  t
 (1 row)
 
+-- Infinite interval literals ('infinity'/'-infinity'::interval) are only
+-- valid on PostgreSQL 17+; build the tested values conditionally so this
+-- suite also runs on PostgreSQL 16.
 DO $$
 DECLARE
     style text;
     value interval;
+    interval_values interval[];
+    interval_bounds interval[];
+    fixed_row pgz_parity_fixed_arrays;
 BEGIN
-    FOREACH style IN ARRAY ARRAY['postgres', 'postgres_verbose', 'sql_standard', 'iso_8601'] LOOP
-        PERFORM set_config('intervalstyle', style, false);
-        FOREACH value IN ARRAY ARRAY[
+    IF current_setting('server_version_num')::int >= 170000 THEN
+        interval_values := ARRAY[
             '0'::interval,
             '1 mon -2 days 03:04:05.000006'::interval,
             'infinity'::interval,
             '-infinity'::interval
-        ] LOOP
+        ];
+        interval_bounds := ARRAY['-infinity'::interval, '0'::interval, 'infinity'::interval];
+    ELSE
+        interval_values := ARRAY[
+            '0'::interval,
+            '1 mon -2 days 03:04:05.000006'::interval
+        ];
+        interval_bounds := ARRAY['0'::interval];
+    END IF;
+
+    FOREACH style IN ARRAY ARRAY['postgres', 'postgres_verbose', 'sql_standard', 'iso_8601'] LOOP
+        PERFORM set_config('intervalstyle', style, false);
+        FOREACH value IN ARRAY interval_values LOOP
             IF row_to_msgpack(ROW(value, ARRAY[value, NULL, value])::pgz_parity_interval)
                <> row_to_msgpack_slow(ROW(value, ARRAY[value, NULL, value])::pgz_parity_interval) THEN
                 RAISE EXCEPTION 'interval fast/slow mismatch for style % and value %', style, value;
@@ -115,7 +132,7 @@ BEGIN
         END LOOP;
     END LOOP;
 
-    IF row_to_msgpack(ROW(
+    fixed_row := ROW(
            ARRAY['-32768'::smallint, 0, 32767],
            ARRAY[-2147483647, 0, 2147483647],
            ARRAY['-9223372036854775808'::bigint, 0, '9223372036854775807'::bigint],
@@ -126,21 +143,10 @@ BEGIN
            ARRAY['first'::name, 'second'::name], ARRAY['A'::"char", 'Z'::"char"],
            ARRAY['2000-01-01'::date, '9999-12-31'::date],
            ARRAY['2000-01-01'::timestamp, '2099-12-31 23:59:59.999999'::timestamp],
-           ARRAY['-infinity'::interval, '0'::interval, 'infinity'::interval]
-       )::pgz_parity_fixed_arrays)
-       <> row_to_msgpack_slow(ROW(
-           ARRAY['-32768'::smallint, 0, 32767],
-           ARRAY[-2147483647, 0, 2147483647],
-           ARRAY['-9223372036854775808'::bigint, 0, '9223372036854775807'::bigint],
-           ARRAY[false, true], ARRAY['-Infinity'::real, 0.0, 'Infinity'::real],
-           ARRAY['-Infinity'::float8, 0.0, 'Infinity'::float8],
-           ARRAY['00000000-0000-0000-0000-000000000000'::uuid,
-                 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid],
-           ARRAY['first'::name, 'second'::name], ARRAY['A'::"char", 'Z'::"char"],
-           ARRAY['2000-01-01'::date, '9999-12-31'::date],
-           ARRAY['2000-01-01'::timestamp, '2099-12-31 23:59:59.999999'::timestamp],
-           ARRAY['-infinity'::interval, '0'::interval, 'infinity'::interval]
-       )::pgz_parity_fixed_arrays) THEN
+           interval_bounds
+       )::pgz_parity_fixed_arrays;
+
+    IF row_to_msgpack(fixed_row) <> row_to_msgpack_slow(fixed_row) THEN
         RAISE EXCEPTION 'fixed-width array fast/slow mismatch';
     END IF;
 END

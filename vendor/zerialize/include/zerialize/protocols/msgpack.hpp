@@ -45,7 +45,11 @@ inline size_t mp_skip(std::span<const uint8_t> v) {
     if ((m <= 0x7f) || (m >= 0xe0) || m == 0xc0 || m == 0xc2 || m == 0xc3) return 1;
 
     // fixstr
-    if ((m & 0xe0) == 0xa0) return 1 + (m & 0x1f);
+    if ((m & 0xe0) == 0xa0) {
+        size_t len = 1 + (size_t)(m & 0x1f);
+        if (len > v.size()) throw DeserializationError("msgpack: truncated fixstr");
+        return len;
+    }
     // fixarray
     if ((m & 0xf0) == 0x90) {
         size_t n = m & 0x0f, off = 1;
@@ -64,20 +68,21 @@ inline size_t mp_skip(std::span<const uint8_t> v) {
 
     switch (m) {
         // ints / floats
-        case 0xcc: case 0xd0: return 2;
-        case 0xcd: case 0xd1: return 3;
-        case 0xce: case 0xd2: case 0xca: return 5;
-        case 0xcf: case 0xd3: case 0xcb: return 9;
+        case 0xcc: case 0xd0: if (v.size() < 2) throw DeserializationError("msgpack: truncated"); return 2;
+        case 0xcd: case 0xd1: if (v.size() < 3) throw DeserializationError("msgpack: truncated"); return 3;
+        case 0xce: case 0xd2: case 0xca: if (v.size() < 5) throw DeserializationError("msgpack: truncated"); return 5;
+        case 0xcf: case 0xd3: case 0xcb: if (v.size() < 9) throw DeserializationError("msgpack: truncated"); return 9;
 
-        // str
-        case 0xd9: { if (v.size() < 2) throw DeserializationError("str8");  return 2 + v[1]; }
-        case 0xda: { if (v.size() < 3) throw DeserializationError("str16"); return 3 + mp_read_be16(v.data()+1); }
-        case 0xdb: { if (v.size() < 5) throw DeserializationError("str32"); return 5 + mp_read_be32(v.data()+1); }
+        // str - the header check only proves the length prefix itself fits;
+        // the resulting total must also be checked against the payload.
+        case 0xd9: { if (v.size() < 2) throw DeserializationError("str8");  size_t len = 2 + (size_t)v[1]; if (len > v.size()) throw DeserializationError("msgpack: truncated str8"); return len; }
+        case 0xda: { if (v.size() < 3) throw DeserializationError("str16"); size_t len = 3 + (size_t)mp_read_be16(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated str16"); return len; }
+        case 0xdb: { if (v.size() < 5) throw DeserializationError("str32"); size_t len = 5 + (size_t)mp_read_be32(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated str32"); return len; }
 
         // bin
-        case 0xc4: { if (v.size() < 2) throw DeserializationError("bin8");  return 2 + v[1]; }
-        case 0xc5: { if (v.size() < 3) throw DeserializationError("bin16"); return 3 + mp_read_be16(v.data()+1); }
-        case 0xc6: { if (v.size() < 5) throw DeserializationError("bin32"); return 5 + mp_read_be32(v.data()+1); }
+        case 0xc4: { if (v.size() < 2) throw DeserializationError("bin8");  size_t len = 2 + (size_t)v[1]; if (len > v.size()) throw DeserializationError("msgpack: truncated bin8"); return len; }
+        case 0xc5: { if (v.size() < 3) throw DeserializationError("bin16"); size_t len = 3 + (size_t)mp_read_be16(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated bin16"); return len; }
+        case 0xc6: { if (v.size() < 5) throw DeserializationError("bin32"); size_t len = 5 + (size_t)mp_read_be32(v.data()+1); if (len > v.size()) throw DeserializationError("msgpack: truncated bin32"); return len; }
 
         // arrays
         case 0xdc: {
@@ -114,34 +119,41 @@ class MsgPackDeserializer {
     // view over current element
     std::span<const uint8_t> view_{};
 
-    // helpers: decode headers
+    // helpers: decode headers. Every branch must validate the bytes it reads
+    // exist in v before reading them (both the length prefix itself, and -
+    // for str/bin - the payload the prefix claims), otherwise a truncated
+    // marker reads past the end of v.
     static void str_info(std::span<const uint8_t> v, const uint8_t*& p, size_t& len) {
+        if (v.empty()) throw DeserializationError("msgpack: not a string");
         const uint8_t m = v[0];
-        if ((m & 0xe0) == 0xa0) { len = (m & 0x1f); p = v.data()+1; return; }
-        if (m == 0xd9) { len = v[1]; p=v.data()+2; return; }
-        if (m == 0xda) { len = mp_read_be16(v.data()+1); p=v.data()+3; return; }
-        if (m == 0xdb) { len = mp_read_be32(v.data()+1); p=v.data()+5; return; }
+        if ((m & 0xe0) == 0xa0) { len = (m & 0x1f); p = v.data()+1; if (1+len > v.size()) throw DeserializationError("msgpack: truncated fixstr"); return; }
+        if (m == 0xd9) { if (v.size() < 2) throw DeserializationError("msgpack: truncated str8"); len = v[1]; p=v.data()+2; if (2+len > v.size()) throw DeserializationError("msgpack: truncated str8"); return; }
+        if (m == 0xda) { if (v.size() < 3) throw DeserializationError("msgpack: truncated str16"); len = mp_read_be16(v.data()+1); p=v.data()+3; if (3+len > v.size()) throw DeserializationError("msgpack: truncated str16"); return; }
+        if (m == 0xdb) { if (v.size() < 5) throw DeserializationError("msgpack: truncated str32"); len = mp_read_be32(v.data()+1); p=v.data()+5; if (5+(size_t)len > v.size()) throw DeserializationError("msgpack: truncated str32"); return; }
         throw DeserializationError("msgpack: not a string");
     }
     static void bin_info(std::span<const uint8_t> v, const uint8_t*& p, size_t& len) {
+        if (v.empty()) throw DeserializationError("msgpack: not a bin");
         const uint8_t m = v[0];
-        if (m == 0xc4) { len = v[1]; p=v.data()+2; return; }
-        if (m == 0xc5) { len = mp_read_be16(v.data()+1); p=v.data()+3; return; }
-        if (m == 0xc6) { len = mp_read_be32(v.data()+1); p=v.data()+5; return; }
+        if (m == 0xc4) { if (v.size() < 2) throw DeserializationError("msgpack: truncated bin8"); len = v[1]; p=v.data()+2; if (2+len > v.size()) throw DeserializationError("msgpack: truncated bin8"); return; }
+        if (m == 0xc5) { if (v.size() < 3) throw DeserializationError("msgpack: truncated bin16"); len = mp_read_be16(v.data()+1); p=v.data()+3; if (3+len > v.size()) throw DeserializationError("msgpack: truncated bin16"); return; }
+        if (m == 0xc6) { if (v.size() < 5) throw DeserializationError("msgpack: truncated bin32"); len = mp_read_be32(v.data()+1); p=v.data()+5; if (5+(size_t)len > v.size()) throw DeserializationError("msgpack: truncated bin32"); return; }
         throw DeserializationError("msgpack: not a bin");
     }
     static void arr_info(std::span<const uint8_t> v, size_t& count, size_t& off) {
+        if (v.empty()) throw DeserializationError("msgpack: not an array");
         const uint8_t m = v[0];
         if ((m & 0xf0) == 0x90) { count = (m & 0x0f); off = 1; return; }
-        if (m == 0xdc) { count = mp_read_be16(v.data()+1); off = 3; return; }
-        if (m == 0xdd) { count = mp_read_be32(v.data()+1); off = 5; return; }
+        if (m == 0xdc) { if (v.size() < 3) throw DeserializationError("msgpack: truncated array16"); count = mp_read_be16(v.data()+1); off = 3; return; }
+        if (m == 0xdd) { if (v.size() < 5) throw DeserializationError("msgpack: truncated array32"); count = mp_read_be32(v.data()+1); off = 5; return; }
         throw DeserializationError("msgpack: not an array");
     }
     static void map_info(std::span<const uint8_t> v, size_t& count, size_t& off) {
+        if (v.empty()) throw DeserializationError("msgpack: not a map");
         const uint8_t m = v[0];
         if ((m & 0xf0) == 0x80) { count = (m & 0x0f); off = 1; return; }
-        if (m == 0xde) { count = mp_read_be16(v.data()+1); off = 3; return; }
-        if (m == 0xdf) { count = mp_read_be32(v.data()+1); off = 5; return; }
+        if (m == 0xde) { if (v.size() < 3) throw DeserializationError("msgpack: truncated map16"); count = mp_read_be16(v.data()+1); off = 3; return; }
+        if (m == 0xdf) { if (v.size() < 5) throw DeserializationError("msgpack: truncated map32"); count = mp_read_be32(v.data()+1); off = 5; return; }
         throw DeserializationError("msgpack: not a map");
     }
 
@@ -253,19 +265,16 @@ public:
     }
     bool isFloat() const { if (view_.empty()) return false; uint8_t m=view_[0]; return m==0xca||m==0xcb; }
     bool isString()const {
-        if (view_.empty()) return false;
-        uint8_t m=view_[0];
+        if (view_.empty()) return false; uint8_t m=view_[0];
         return ((m & 0xe0) == 0xa0) || m==0xd9 || m==0xda || m==0xdb;
     }
     bool isBlob()  const { if (view_.empty()) return false; uint8_t m=view_[0]; return m==0xc4||m==0xc5||m==0xc6; }
     bool isArray() const {
-        if (view_.empty()) return false;
-        uint8_t m=view_[0];
+        if (view_.empty()) return false; uint8_t m=view_[0];
         return ((m & 0xf0) == 0x90) || m==0xdc || m==0xdd;
     }
     bool isMap()   const {
-        if (view_.empty()) return false;
-        uint8_t m=view_[0];
+        if (view_.empty()) return false; uint8_t m=view_[0];
         return ((m & 0xf0) == 0x80) || m==0xde || m==0xdf;
     }
 

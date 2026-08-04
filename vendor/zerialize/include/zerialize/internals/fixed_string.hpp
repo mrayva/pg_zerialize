@@ -37,7 +37,7 @@ struct fixed_string {
     constexpr std::string_view view() const { return {data, N - 1}; }
 
     /// @brief C-string pointer (includes the trailing '\0').
-    constexpr const char* c_str() const noexcept { return data.data(); }
+    constexpr const char* c_str() const noexcept { return data; }
 
     /// @brief Length excluding the trailing '\0'.
     static constexpr std::size_t size() noexcept { return N - 1; }
