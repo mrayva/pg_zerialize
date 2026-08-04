@@ -3259,6 +3259,132 @@ static inline void cbor_write_array_element(
              errmsg("unsupported array element type for fast CBOR path")));
 }
 
+// Hoists the elem_kind switch outside the loop for the common case of an
+// array with no null elements, instead of re-dispatching per element inside
+// cbor_write_array_element. Mirrors msgpack_write_array_no_nulls.
+static inline void cbor_write_array_no_nulls(
+    z::cborjc::Serializer& writer,
+    ConverterKind elem_kind,
+    Datum* elements,
+    int nitems)
+{
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt16(elements[i])));
+            }
+            return;
+        case ConverterKind::Int4:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt32(elements[i])));
+            }
+            return;
+        case ConverterKind::Int8:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt64(elements[i])));
+            }
+            return;
+        case ConverterKind::Float4:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(static_cast<double>(DatumGetFloat4(elements[i])));
+            }
+            return;
+        case ConverterKind::Float8:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(DatumGetFloat8(elements[i]));
+            }
+            return;
+        case ConverterKind::Bool:
+            for (int i = 0; i < nitems; i++) {
+                writer.boolean(DatumGetBool(elements[i]));
+            }
+            return;
+        case ConverterKind::Text:
+        case ConverterKind::JsonText:
+            for (int i = 0; i < nitems; i++) {
+                cbor_write_text(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Uuid:
+            for (int i = 0; i < nitems; i++) {
+                char out[36];
+                format_uuid(elements[i], out);
+                writer.string(std::string_view(out, sizeof(out)));
+            }
+            return;
+        case ConverterKind::NameText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(name_text_view(elements[i]));
+            }
+            return;
+        case ConverterKind::CharText:
+            for (int i = 0; i < nitems; i++) {
+                char ch = DatumGetChar(elements[i]);
+                writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            }
+            return;
+        case ConverterKind::EnumText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(enum_label_view(elements[i]));
+            }
+            return;
+        case ConverterKind::InetText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], false);
+            }
+            return;
+        case ConverterKind::CidrText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], true);
+            }
+            return;
+        case ConverterKind::IntervalText:
+            for (int i = 0; i < nitems; i++) {
+                write_interval_string(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Numeric:
+            for (int i = 0; i < nitems; i++) {
+                numeric_write_fast(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Date:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetDateADT(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamp:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestamp(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamptz:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestampTz(elements[i])));
+            }
+            return;
+        case ConverterKind::Jsonb:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_jsonb_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Bytea:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_bytea_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Composite:
+            for (int i = 0; i < nitems; i++) {
+                cbor_write_array_element(writer, ConverterKind::Composite, elements[i], false);
+            }
+            return;
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unsupported array element type for fast CBOR path")));
+    }
+}
+
 // See msgpack_write_array_dim for why this is decided per-value, not per-schema.
 static void cbor_write_array_dim(
     z::cborjc::Serializer& writer,
@@ -3337,13 +3463,19 @@ static inline void cbor_write_array(
                       &nitems);
 
     writer.begin_array(static_cast<size_t>(nitems));
-    for (int i = 0; i < nitems; i++) {
-        if (nulls[i]) {
-            writer.null();
-        } else if (col.array_element_kind == ConverterKind::Fallback) {
-            write_output_string(writer, col.array_element_typoutput, elements[i]);
-        } else {
-            cbor_write_array_element(writer, col.array_element_kind, elements[i], false);
+    if (col.array_element_kind == ConverterKind::Fallback) {
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                write_output_string(writer, col.array_element_typoutput, elements[i]);
+            }
+        }
+    } else if (!ARR_HASNULL(arr)) {
+        cbor_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
+    } else {
+        for (int i = 0; i < nitems; i++) {
+            cbor_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
         }
     }
     writer.end_array();
@@ -3743,6 +3875,132 @@ static inline void zera_write_array_element(
              errmsg("unsupported array element type for fast ZERA path")));
 }
 
+// Hoists the elem_kind switch outside the loop for the common case of an
+// array with no null elements, instead of re-dispatching per element inside
+// zera_write_array_element. Mirrors msgpack_write_array_no_nulls.
+static inline void zera_write_array_no_nulls(
+    z::zera::Serializer& writer,
+    ConverterKind elem_kind,
+    Datum* elements,
+    int nitems)
+{
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt16(elements[i])));
+            }
+            return;
+        case ConverterKind::Int4:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt32(elements[i])));
+            }
+            return;
+        case ConverterKind::Int8:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt64(elements[i])));
+            }
+            return;
+        case ConverterKind::Float4:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(static_cast<double>(DatumGetFloat4(elements[i])));
+            }
+            return;
+        case ConverterKind::Float8:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(DatumGetFloat8(elements[i]));
+            }
+            return;
+        case ConverterKind::Bool:
+            for (int i = 0; i < nitems; i++) {
+                writer.boolean(DatumGetBool(elements[i]));
+            }
+            return;
+        case ConverterKind::Text:
+        case ConverterKind::JsonText:
+            for (int i = 0; i < nitems; i++) {
+                zera_write_text(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Uuid:
+            for (int i = 0; i < nitems; i++) {
+                char out[36];
+                format_uuid(elements[i], out);
+                writer.string(std::string_view(out, sizeof(out)));
+            }
+            return;
+        case ConverterKind::NameText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(name_text_view(elements[i]));
+            }
+            return;
+        case ConverterKind::CharText:
+            for (int i = 0; i < nitems; i++) {
+                char ch = DatumGetChar(elements[i]);
+                writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            }
+            return;
+        case ConverterKind::EnumText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(enum_label_view(elements[i]));
+            }
+            return;
+        case ConverterKind::InetText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], false);
+            }
+            return;
+        case ConverterKind::CidrText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], true);
+            }
+            return;
+        case ConverterKind::IntervalText:
+            for (int i = 0; i < nitems; i++) {
+                write_interval_string(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Numeric:
+            for (int i = 0; i < nitems; i++) {
+                numeric_write_fast(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Date:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetDateADT(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamp:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestamp(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamptz:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestampTz(elements[i])));
+            }
+            return;
+        case ConverterKind::Jsonb:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_jsonb_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Bytea:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_bytea_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Composite:
+            for (int i = 0; i < nitems; i++) {
+                zera_write_array_element(writer, ConverterKind::Composite, elements[i], false);
+            }
+            return;
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unsupported array element type for fast ZERA path")));
+    }
+}
+
 // See msgpack_write_array_dim for why this is decided per-value, not per-schema.
 static void zera_write_array_dim(
     z::zera::Serializer& writer,
@@ -3821,13 +4079,19 @@ static inline void zera_write_array(
                       &nitems);
 
     writer.begin_array(static_cast<size_t>(nitems));
-    for (int i = 0; i < nitems; i++) {
-        if (nulls[i]) {
-            writer.null();
-        } else if (col.array_element_kind == ConverterKind::Fallback) {
-            write_output_string(writer, col.array_element_typoutput, elements[i]);
-        } else {
-            zera_write_array_element(writer, col.array_element_kind, elements[i], false);
+    if (col.array_element_kind == ConverterKind::Fallback) {
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                write_output_string(writer, col.array_element_typoutput, elements[i]);
+            }
+        }
+    } else if (!ARR_HASNULL(arr)) {
+        zera_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
+    } else {
+        for (int i = 0; i < nitems; i++) {
+            zera_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
         }
     }
     writer.end_array();
@@ -4227,6 +4491,132 @@ static inline void flex_write_array_element(
              errmsg("unsupported array element type for fast Flex path")));
 }
 
+// Hoists the elem_kind switch outside the loop for the common case of an
+// array with no null elements, instead of re-dispatching per element inside
+// flex_write_array_element. Mirrors msgpack_write_array_no_nulls.
+static inline void flex_write_array_no_nulls(
+    z::flex::Serializer& writer,
+    ConverterKind elem_kind,
+    Datum* elements,
+    int nitems)
+{
+    switch (elem_kind) {
+        case ConverterKind::Int2:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt16(elements[i])));
+            }
+            return;
+        case ConverterKind::Int4:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt32(elements[i])));
+            }
+            return;
+        case ConverterKind::Int8:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetInt64(elements[i])));
+            }
+            return;
+        case ConverterKind::Float4:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(static_cast<double>(DatumGetFloat4(elements[i])));
+            }
+            return;
+        case ConverterKind::Float8:
+            for (int i = 0; i < nitems; i++) {
+                writer.double_(DatumGetFloat8(elements[i]));
+            }
+            return;
+        case ConverterKind::Bool:
+            for (int i = 0; i < nitems; i++) {
+                writer.boolean(DatumGetBool(elements[i]));
+            }
+            return;
+        case ConverterKind::Text:
+        case ConverterKind::JsonText:
+            for (int i = 0; i < nitems; i++) {
+                flex_write_text(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Uuid:
+            for (int i = 0; i < nitems; i++) {
+                char out[36];
+                format_uuid(elements[i], out);
+                writer.string(std::string_view(out, sizeof(out)));
+            }
+            return;
+        case ConverterKind::NameText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(name_text_view(elements[i]));
+            }
+            return;
+        case ConverterKind::CharText:
+            for (int i = 0; i < nitems; i++) {
+                char ch = DatumGetChar(elements[i]);
+                writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
+            }
+            return;
+        case ConverterKind::EnumText:
+            for (int i = 0; i < nitems; i++) {
+                writer.string(enum_label_view(elements[i]));
+            }
+            return;
+        case ConverterKind::InetText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], false);
+            }
+            return;
+        case ConverterKind::CidrText:
+            for (int i = 0; i < nitems; i++) {
+                write_network_string(writer, elements[i], true);
+            }
+            return;
+        case ConverterKind::IntervalText:
+            for (int i = 0; i < nitems; i++) {
+                write_interval_string(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Numeric:
+            for (int i = 0; i < nitems; i++) {
+                numeric_write_fast(writer, elements[i]);
+            }
+            return;
+        case ConverterKind::Date:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetDateADT(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamp:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestamp(elements[i])));
+            }
+            return;
+        case ConverterKind::Timestamptz:
+            for (int i = 0; i < nitems; i++) {
+                writer.int64(static_cast<int64_t>(DatumGetTimestampTz(elements[i])));
+            }
+            return;
+        case ConverterKind::Jsonb:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_jsonb_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Bytea:
+            for (int i = 0; i < nitems; i++) {
+                writer.binary(datum_bytea_span(elements[i]));
+            }
+            return;
+        case ConverterKind::Composite:
+            for (int i = 0; i < nitems; i++) {
+                flex_write_array_element(writer, ConverterKind::Composite, elements[i], false);
+            }
+            return;
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("unsupported array element type for fast Flex path")));
+    }
+}
+
 // See msgpack_write_array_dim for why this is decided per-value, not per-schema.
 static void flex_write_array_dim(
     z::flex::Serializer& writer,
@@ -4305,13 +4695,19 @@ static inline void flex_write_array(
                       &nitems);
 
     writer.begin_array(static_cast<size_t>(nitems));
-    for (int i = 0; i < nitems; i++) {
-        if (nulls[i]) {
-            writer.null();
-        } else if (col.array_element_kind == ConverterKind::Fallback) {
-            write_output_string(writer, col.array_element_typoutput, elements[i]);
-        } else {
-            flex_write_array_element(writer, col.array_element_kind, elements[i], false);
+    if (col.array_element_kind == ConverterKind::Fallback) {
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                write_output_string(writer, col.array_element_typoutput, elements[i]);
+            }
+        }
+    } else if (!ARR_HASNULL(arr)) {
+        flex_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
+    } else {
+        for (int i = 0; i < nitems; i++) {
+            flex_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
         }
     }
     writer.end_array();
