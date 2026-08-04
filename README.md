@@ -154,8 +154,9 @@ when values must be spliced into one nested document instead.
 
 Schema metadata, converter selection, protocol keys, and map headers are cached
 per PostgreSQL backend. Flat supported schemas use protocol-specific direct
-writers. All four protocols also directly write nested composite fields and
-one-dimensional composite arrays, recursing through the same cached writer
+writers. All four protocols also directly write nested composite fields,
+one-dimensional composite arrays, and multidimensional arrays of any
+directly-writable element type, recursing through the same cached writer
 plans at every level; schemas with a descendant column that has no direct
 writer (recursively) fall back to the generic dynamic tree.
 

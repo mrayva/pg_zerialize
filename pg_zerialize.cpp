@@ -2617,6 +2617,47 @@ static inline bool msgpack_write_fixed_array_no_nulls(
     return true;
 }
 
+// Recursively writes one dimension level of a multidimensional array,
+// reusing the same per-kind element writer as the 1-D fast path below
+// (including recursion into composite/array-of-composite elements via
+// elem_writer) so a runtime N-D value gets the same fast treatment as a 1-D
+// one. PostgreSQL arrays have no declared dimensionality in the type system
+// (any int[] column can hold an N-D value at runtime), so this is decided
+// per-value rather than per-schema.
+static void msgpack_write_array_dim(
+    z::MsgPackSerializer& writer,
+    const CachedColumn& col,
+    MsgpackArrayElemWriterFn elem_writer,
+    Datum* elements,
+    bool* nulls,
+    const int* dims,
+    int ndim,
+    int depth,
+    int* offset)
+{
+    writer.begin_array(static_cast<size_t>(dims[depth]));
+    if (depth == ndim - 1) {
+        if (col.array_element_kind == ConverterKind::Fallback) {
+            for (int i = 0; i < dims[depth]; i++, (*offset)++) {
+                if (nulls[*offset]) {
+                    writer.null();
+                } else {
+                    write_output_string(writer, col.array_element_typoutput, elements[*offset]);
+                }
+            }
+        } else {
+            for (int i = 0; i < dims[depth]; i++, (*offset)++) {
+                elem_writer(writer, elements[*offset], nulls[*offset]);
+            }
+        }
+    } else {
+        for (int i = 0; i < dims[depth]; i++) {
+            msgpack_write_array_dim(writer, col, elem_writer, elements, nulls, dims, ndim, depth + 1, offset);
+        }
+    }
+    writer.end_array();
+}
+
 static inline void msgpack_write_array(
     z::MsgPackSerializer& writer,
     const CachedColumn& col,
@@ -2632,7 +2673,28 @@ static inline void msgpack_write_array(
     }
 
     if (ndim != 1) {
-        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
+        Datum* elements;
+        bool* nulls;
+        int nitems;
+        deconstruct_array(arr,
+                          col.array_element_typid,
+                          col.array_typlen,
+                          col.array_typbyval,
+                          col.array_typalign,
+                          &elements,
+                          &nulls,
+                          &nitems);
+
+        MsgpackArrayElemWriterFn elem_writer = col.msgpack_array_elem_writer;
+        if (elem_writer == nullptr) {
+            elem_writer = &msgpack_array_elem_unsupported;
+        }
+
+        int offset = 0;
+        msgpack_write_array_dim(writer, col, elem_writer, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
+
+        pfree(elements);
+        pfree(nulls);
         return;
     }
 
@@ -3197,6 +3259,36 @@ static inline void cbor_write_array_element(
              errmsg("unsupported array element type for fast CBOR path")));
 }
 
+// See msgpack_write_array_dim for why this is decided per-value, not per-schema.
+static void cbor_write_array_dim(
+    z::cborjc::Serializer& writer,
+    const CachedColumn& col,
+    Datum* elements,
+    bool* nulls,
+    const int* dims,
+    int ndim,
+    int depth,
+    int* offset)
+{
+    writer.begin_array(static_cast<size_t>(dims[depth]));
+    if (depth == ndim - 1) {
+        for (int i = 0; i < dims[depth]; i++, (*offset)++) {
+            if (nulls[*offset]) {
+                writer.null();
+            } else if (col.array_element_kind == ConverterKind::Fallback) {
+                write_output_string(writer, col.array_element_typoutput, elements[*offset]);
+            } else {
+                cbor_write_array_element(writer, col.array_element_kind, elements[*offset], false);
+            }
+        }
+    } else {
+        for (int i = 0; i < dims[depth]; i++) {
+            cbor_write_array_dim(writer, col, elements, nulls, dims, ndim, depth + 1, offset);
+        }
+    }
+    writer.end_array();
+}
+
 static inline void cbor_write_array(
     z::cborjc::Serializer& writer,
     const CachedColumn& col,
@@ -3212,7 +3304,23 @@ static inline void cbor_write_array(
     }
 
     if (ndim != 1) {
-        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
+        Datum* elements;
+        bool* nulls;
+        int nitems;
+        deconstruct_array(arr,
+                          col.array_element_typid,
+                          col.array_typlen,
+                          col.array_typbyval,
+                          col.array_typalign,
+                          &elements,
+                          &nulls,
+                          &nitems);
+
+        int offset = 0;
+        cbor_write_array_dim(writer, col, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
+
+        pfree(elements);
+        pfree(nulls);
         return;
     }
 
@@ -3635,6 +3743,36 @@ static inline void zera_write_array_element(
              errmsg("unsupported array element type for fast ZERA path")));
 }
 
+// See msgpack_write_array_dim for why this is decided per-value, not per-schema.
+static void zera_write_array_dim(
+    z::zera::Serializer& writer,
+    const CachedColumn& col,
+    Datum* elements,
+    bool* nulls,
+    const int* dims,
+    int ndim,
+    int depth,
+    int* offset)
+{
+    writer.begin_array(static_cast<size_t>(dims[depth]));
+    if (depth == ndim - 1) {
+        for (int i = 0; i < dims[depth]; i++, (*offset)++) {
+            if (nulls[*offset]) {
+                writer.null();
+            } else if (col.array_element_kind == ConverterKind::Fallback) {
+                write_output_string(writer, col.array_element_typoutput, elements[*offset]);
+            } else {
+                zera_write_array_element(writer, col.array_element_kind, elements[*offset], false);
+            }
+        }
+    } else {
+        for (int i = 0; i < dims[depth]; i++) {
+            zera_write_array_dim(writer, col, elements, nulls, dims, ndim, depth + 1, offset);
+        }
+    }
+    writer.end_array();
+}
+
 static inline void zera_write_array(
     z::zera::Serializer& writer,
     const CachedColumn& col,
@@ -3650,7 +3788,23 @@ static inline void zera_write_array(
     }
 
     if (ndim != 1) {
-        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
+        Datum* elements;
+        bool* nulls;
+        int nitems;
+        deconstruct_array(arr,
+                          col.array_element_typid,
+                          col.array_typlen,
+                          col.array_typbyval,
+                          col.array_typalign,
+                          &elements,
+                          &nulls,
+                          &nitems);
+
+        int offset = 0;
+        zera_write_array_dim(writer, col, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
+
+        pfree(elements);
+        pfree(nulls);
         return;
     }
 
@@ -4073,6 +4227,36 @@ static inline void flex_write_array_element(
              errmsg("unsupported array element type for fast Flex path")));
 }
 
+// See msgpack_write_array_dim for why this is decided per-value, not per-schema.
+static void flex_write_array_dim(
+    z::flex::Serializer& writer,
+    const CachedColumn& col,
+    Datum* elements,
+    bool* nulls,
+    const int* dims,
+    int ndim,
+    int depth,
+    int* offset)
+{
+    writer.begin_array(static_cast<size_t>(dims[depth]));
+    if (depth == ndim - 1) {
+        for (int i = 0; i < dims[depth]; i++, (*offset)++) {
+            if (nulls[*offset]) {
+                writer.null();
+            } else if (col.array_element_kind == ConverterKind::Fallback) {
+                write_output_string(writer, col.array_element_typoutput, elements[*offset]);
+            } else {
+                flex_write_array_element(writer, col.array_element_kind, elements[*offset], false);
+            }
+        }
+    } else {
+        for (int i = 0; i < dims[depth]; i++) {
+            flex_write_array_dim(writer, col, elements, nulls, dims, ndim, depth + 1, offset);
+        }
+    }
+    writer.end_array();
+}
+
 static inline void flex_write_array(
     z::flex::Serializer& writer,
     const CachedColumn& col,
@@ -4088,7 +4272,23 @@ static inline void flex_write_array(
     }
 
     if (ndim != 1) {
-        z::dyn::serialize(array_to_dynamic(value, col.typid), writer);
+        Datum* elements;
+        bool* nulls;
+        int nitems;
+        deconstruct_array(arr,
+                          col.array_element_typid,
+                          col.array_typlen,
+                          col.array_typbyval,
+                          col.array_typalign,
+                          &elements,
+                          &nulls,
+                          &nitems);
+
+        int offset = 0;
+        flex_write_array_dim(writer, col, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
+
+        pfree(elements);
+        pfree(nulls);
         return;
     }
 
