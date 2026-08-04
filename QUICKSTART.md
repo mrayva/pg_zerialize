@@ -94,6 +94,9 @@ LEFT JOIN (
 ) e ON e.department_id = d.id;
 ```
 
+`cbor_from_jsonb`, `zera_from_jsonb`, and `flexbuffers_from_jsonb` work the
+same way for their respective protocols.
+
 ## Verify Output
 
 ```sql

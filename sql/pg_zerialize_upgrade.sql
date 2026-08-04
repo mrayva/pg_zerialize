@@ -47,4 +47,18 @@ SELECT to_regprocedure('zera_to_jsonb(bytea)') IS NOT NULL AS zera_decoder_prese
 SELECT zera_to_jsonb(row_to_zera(ROW(1, 'upgrade-ok'))) =
        '{"f1":1,"f2":"upgrade-ok"}'::jsonb AS zera_decoder_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.7';
+SELECT extversion = '1.7' AS upgraded_to_1_7
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('cbor_from_jsonb(jsonb)') IS NOT NULL AS cbor_builder_api_present,
+       to_regprocedure('zera_build_object("any")') IS NOT NULL AS zera_builder_api_present,
+       to_regprocedure('flexbuffers_agg(anyelement)') IS NOT NULL AS flex_builder_api_present;
+SELECT cbor_to_jsonb(cbor_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS cbor_builder_works;
+SELECT zera_to_jsonb(zera_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS zera_builder_works;
+SELECT flexbuffers_to_jsonb(flexbuffers_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS flex_builder_works;
+
 DROP EXTENSION pg_zerialize;
