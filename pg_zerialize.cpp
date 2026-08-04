@@ -24,6 +24,7 @@ extern "C" {
 #include "access/tupdesc.h"
 #include "access/htup_details.h"
 #include "executor/spi.h"
+#include "utils/tuplestore.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "utils/inval.h"
@@ -111,6 +112,10 @@ extern "C" {
     Datum cbor_populate_record(PG_FUNCTION_ARGS);
     Datum zera_populate_record(PG_FUNCTION_ARGS);
     Datum flexbuffers_populate_record(PG_FUNCTION_ARGS);
+    Datum msgpack_populate_recordset(PG_FUNCTION_ARGS);
+    Datum cbor_populate_recordset(PG_FUNCTION_ARGS);
+    Datum zera_populate_recordset(PG_FUNCTION_ARGS);
+    Datum flexbuffers_populate_recordset(PG_FUNCTION_ARGS);
     Datum msgpack_build_object(PG_FUNCTION_ARGS);
     Datum msgpack_build_array(PG_FUNCTION_ARGS);
     Datum msgpack_agg_final(PG_FUNCTION_ARGS);
@@ -152,6 +157,10 @@ extern "C" {
     PG_FUNCTION_INFO_V1(cbor_populate_record);
     PG_FUNCTION_INFO_V1(zera_populate_record);
     PG_FUNCTION_INFO_V1(flexbuffers_populate_record);
+    PG_FUNCTION_INFO_V1(msgpack_populate_recordset);
+    PG_FUNCTION_INFO_V1(cbor_populate_recordset);
+    PG_FUNCTION_INFO_V1(zera_populate_recordset);
+    PG_FUNCTION_INFO_V1(flexbuffers_populate_recordset);
     PG_FUNCTION_INFO_V1(msgpack_build_object);
     PG_FUNCTION_INFO_V1(msgpack_build_array);
     PG_FUNCTION_INFO_V1(msgpack_agg_final);
@@ -5826,7 +5835,7 @@ static void jsonb_array_dim_collect(
     }
 }
 
-static Datum populate_composite_from_jsonb_container(
+static HeapTuple populate_heaptuple_from_jsonb_container(
     JsonbContainer* container, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec)
 {
     if (!JsonContainerIsObject(container)) {
@@ -5905,7 +5914,13 @@ static Datum populate_composite_from_jsonb_container(
         }
     }
 
-    HeapTuple result = heap_form_tuple(schema.tupdesc, values.get(), nulls.get());
+    return heap_form_tuple(schema.tupdesc, values.get(), nulls.get());
+}
+
+static Datum populate_composite_from_jsonb_container(
+    JsonbContainer* container, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec)
+{
+    HeapTuple result = populate_heaptuple_from_jsonb_container(container, tupType, tupTypmod, base_rec);
     return HeapTupleGetDatum(result);
 }
 
@@ -6111,6 +6126,228 @@ flexbuffers_populate_record(PG_FUNCTION_ARGS)
     }
 
     PG_RETURN_NULL();
+}
+
+/*
+ * Shared decode-to-SETOF core for X_populate_recordset. Mirrors
+ * jsonb_populate_recordset: the document's root must be a JSON array of
+ * objects, each decoded via populate_heaptuple_from_jsonb_container with
+ * the same base row/type resolved once for the whole call.
+ */
+static Tuplestorestate* populate_recordset_begin(FunctionCallInfo fcinfo, Oid tupType, int32 tupTypmod)
+{
+    ReturnSetInfo* rsinfo = (ReturnSetInfo*) fcinfo->resultinfo;
+    if (rsinfo == nullptr || !IsA(rsinfo, ReturnSetInfo)) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("set-valued function called in context that cannot accept a set")));
+    }
+    if (!(rsinfo->allowedModes & SFRM_Materialize)) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("materialize mode required, but it is not allowed in this context")));
+    }
+
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+    MemoryContext oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    Tuplestorestate* tupstore = tuplestore_begin_heap(false, false, work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult = tupstore;
+    rsinfo->setDesc = CreateTupleDescCopy(schema.tupdesc);
+    MemoryContextSwitchTo(oldcontext);
+
+    return tupstore;
+}
+
+static void populate_recordset_from_json_text(
+    Tuplestorestate* tupstore, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec, const std::string& json)
+{
+    Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+    Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+    JsonbContainer* root = &jb->root;
+    if (!JsonContainerIsArray(root) || JsonContainerIsScalar(root)) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                 errmsg("cannot populate a recordset from a non-array JSON value")));
+    }
+
+    const int n = (int) JsonContainerSize(root);
+    for (int i = 0; i < n; i++) {
+        JsonbValue* elem = getIthJsonbValueFromContainer(root, i);
+        if (elem->type != jbvBinary || !JsonContainerIsObject(elem->val.binary.data)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                     errmsg("recordset element %d is not a JSON object", i + 1)));
+        }
+        HeapTuple tuple = populate_heaptuple_from_jsonb_container(
+            elem->val.binary.data, tupType, tupTypmod, base_rec);
+        tuplestore_puttuple(tupstore, tuple);
+        heap_freetuple(tuple);
+    }
+}
+
+/*
+ * msgpack_populate_recordset - Decode a MessagePack array of documents into
+ * a set of typed composites, using base for columns each document omits.
+ */
+extern "C" Datum
+msgpack_populate_recordset(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    Tuplestorestate* tupstore = populate_recordset_begin(fcinfo, tupType, tupTypmod);
+
+    if (PG_ARGISNULL(1)) {
+        return (Datum) 0;
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = msgpack_decode_to_json_text(data);
+        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid MessagePack input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid MessagePack input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    return (Datum) 0;
+}
+
+/*
+ * cbor_populate_recordset - Decode a CBOR array of documents into a set of
+ * typed composites, using base for columns each document omits.
+ */
+extern "C" Datum
+cbor_populate_recordset(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    Tuplestorestate* tupstore = populate_recordset_begin(fcinfo, tupType, tupTypmod);
+
+    if (PG_ARGISNULL(1)) {
+        return (Datum) 0;
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = cbor_decode_to_json_text(data);
+        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid CBOR input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid CBOR input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    return (Datum) 0;
+}
+
+/*
+ * zera_populate_recordset - Decode a ZERA array of documents into a set of
+ * typed composites, using base for columns each document omits.
+ */
+extern "C" Datum
+zera_populate_recordset(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    Tuplestorestate* tupstore = populate_recordset_begin(fcinfo, tupType, tupTypmod);
+
+    if (PG_ARGISNULL(1)) {
+        return (Datum) 0;
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = zera_decode_to_json_text(data);
+        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid ZERA input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid ZERA input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    return (Datum) 0;
+}
+
+/*
+ * flexbuffers_populate_recordset - Decode a FlexBuffer array of documents
+ * into a set of typed composites, using base for columns each document omits.
+ */
+extern "C" Datum
+flexbuffers_populate_recordset(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    Tuplestorestate* tupstore = populate_recordset_begin(fcinfo, tupType, tupTypmod);
+
+    if (PG_ARGISNULL(1)) {
+        return (Datum) 0;
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+
+    try {
+        std::string json = flex_decode_to_json_text(bytes, length);
+        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid FlexBuffer input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid FlexBuffer input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    return (Datum) 0;
 }
 
 /*

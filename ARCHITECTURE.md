@@ -41,7 +41,11 @@ and aggregates (`X_to_jsonb`, `X_from_jsonb`, `X_build_object`,
 `X_populate_record(base anyelement, data bytea)`, added in
 `pg_zerialize--1.8.sql`, is the reverse of `row_to_X`: it decodes a binary
 document directly into a typed composite, following `jsonb_populate_record`'s
-own anyelement/base-row polymorphism. See "Composite Decode Path" below.
+own anyelement/base-row polymorphism. `X_populate_recordset(base anyelement,
+data bytea)`, added in `pg_zerialize--1.9.sql`, is the batch counterpart: the
+reverse of `rows_to_X`, decoding a binary array of documents into a `SETOF`
+typed composites, mirroring `jsonb_populate_recordset`. See "Composite Decode
+Path" below.
 
 ## Schema Cache
 
@@ -156,14 +160,16 @@ cycles before recursive decoding.
 
 ## Composite Decode Path
 
-`X_populate_record` reuses each protocol's existing, already-validated
-`X_to_jsonb` decode logic rather than parsing the wire format a second time:
-its decode-to-JSON-text core (`msgpack_decode_to_json_text`,
-`cbor_decode_to_json_text`, `zera_decode_to_json_text`,
-`flex_decode_to_json_text`) is the same code `X_to_jsonb` calls, split out so
-both entry points share one parsing/validation path per protocol. The
-resulting `Jsonb*` is then walked by one protocol-agnostic function,
-`populate_composite_from_jsonb_container`, using the same
+`X_populate_record` and `X_populate_recordset` reuse each protocol's
+existing, already-validated `X_to_jsonb` decode logic rather than parsing the
+wire format a second time: its decode-to-JSON-text core
+(`msgpack_decode_to_json_text`, `cbor_decode_to_json_text`,
+`zera_decode_to_json_text`, `flex_decode_to_json_text`) is the same code
+`X_to_jsonb` calls, split out so both entry points share one
+parsing/validation path per protocol. The resulting `Jsonb*` is then walked
+by one protocol-agnostic function, `populate_heaptuple_from_jsonb_container`
+(a thin `populate_composite_from_jsonb_container` wrapper returns it as a
+`Datum` for the single-record path), using the same
 `CachedSchema`/`CachedColumn` metadata the encode side builds.
 
 For each column, the walk looks up the matching JSONB object key
@@ -177,6 +183,14 @@ column's slot untouched, which is prefilled from `base` via
 `heap_deform_tuple` (or left NULL when there is no `base` row) before the
 walk starts — this is what produces `jsonb_populate_record`-style partial
 updates. A key present with a JSON `null` clears the column explicitly.
+
+`X_populate_recordset` requires the document's root to be a JSON array;
+`populate_recordset_from_json_text` iterates its elements (each must be an
+object) and calls `populate_heaptuple_from_jsonb_container` once per
+element, sharing one resolved `base` row/type and one `Tuplestorestate`
+across every document — standard `SFRM_Materialize` set-returning-function
+setup (`populate_recordset_begin`), the same pattern PostgreSQL's own
+materializing SRFs use.
 
 `jsonb_value_to_scalar_datum` mirrors the encode side's per-type wire
 conventions in reverse, gated on the target column's type so a coincidental

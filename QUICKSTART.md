@@ -118,6 +118,19 @@ SELECT cbor_populate_record(
 );
 ```
 
+`X_populate_recordset` is the batch counterpart, decoding a `rows_to_X`
+array back into a set of rows:
+
+```sql
+SELECT * FROM msgpack_populate_recordset(
+  NULL::customer,
+  rows_to_msgpack(ARRAY[
+    ROW(7, 'Ada', ROW('London', 'SW1A')::address),
+    ROW(8, 'Grace', ROW('Arlington', '22201')::address)
+  ]::customer[])
+);
+```
+
 ## Verify Output
 
 ```sql
