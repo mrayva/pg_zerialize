@@ -1,6 +1,7 @@
-// CBOR protocol implemented with jsoncons (reader and writer)
+// CBOR protocol implemented directly against RFC 8949 (reader and writer)
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -14,9 +15,6 @@
 #include <limits>
 #include <cmath>
 
-#include <jsoncons/json.hpp>
-#include <jsoncons_ext/cbor/cbor.hpp>
-
 #include <zerialize/zbuffer.hpp>
 #include <zerialize/errors.hpp>
 
@@ -24,49 +22,102 @@ namespace zerialize {
 namespace cborjc {
 
 // ========================== Writer (Serializer) ===============================
+// Direct byte-level CBOR encoder producing definite-length major types only.
+// pg_zerialize's own encoder avoids depending on an external library (mirrors
+// msgpack.hpp's hand-rolled writer for the same reason).
 
-struct RootSerializer {
+class RootSerializer {
     std::vector<uint8_t> out_;
-    jsoncons::cbor::cbor_bytes_encoder enc;
-    bool wrote_root = false;
+    bool wrote_root_ = false;
 
-    RootSerializer()
-        : out_()
-        , enc(out_)
-    {}
+public:
+    void put(uint8_t b) { out_.push_back(b); }
+    void put(const uint8_t* data, std::size_t len) { out_.insert(out_.end(), data, data + len); }
+    void mark_wrote_root() { wrote_root_ = true; }
 
     ZBuffer finish() {
-        if (!wrote_root) {
-            enc.null_value();
-            wrote_root = true;
+        if (!wrote_root_) {
+            out_.push_back(0xf6); // null
+            wrote_root_ = true;
         }
         return ZBuffer(std::move(out_));
     }
 };
 
-struct Serializer {
+class Serializer {
     RootSerializer* r;
+
+    static void store_be16(uint8_t* out, uint16_t value) {
+        out[0] = static_cast<uint8_t>(value >> 8);
+        out[1] = static_cast<uint8_t>(value);
+    }
+    static void store_be32(uint8_t* out, uint32_t value) {
+        out[0] = static_cast<uint8_t>(value >> 24);
+        out[1] = static_cast<uint8_t>(value >> 16);
+        out[2] = static_cast<uint8_t>(value >> 8);
+        out[3] = static_cast<uint8_t>(value);
+    }
+    static void store_be64(uint8_t* out, uint64_t value) {
+        store_be32(out, static_cast<uint32_t>(value >> 32));
+        store_be32(out + 4, static_cast<uint32_t>(value));
+    }
+
+    // Writes a major-type/length header per RFC 8949 3.1 (definite-length form).
+    void write_head(uint8_t major, std::uint64_t n) {
+        const uint8_t m = static_cast<uint8_t>(major << 5);
+        if (n < 24) {
+            r->put(static_cast<uint8_t>(m | n));
+        } else if (n <= 0xFF) {
+            r->put(static_cast<uint8_t>(m | 24));
+            r->put(static_cast<uint8_t>(n));
+        } else if (n <= 0xFFFF) {
+            r->put(static_cast<uint8_t>(m | 25));
+            uint8_t buf[2]; store_be16(buf, static_cast<uint16_t>(n)); r->put(buf, 2);
+        } else if (n <= 0xFFFFFFFFULL) {
+            r->put(static_cast<uint8_t>(m | 26));
+            uint8_t buf[4]; store_be32(buf, static_cast<uint32_t>(n)); r->put(buf, 4);
+        } else {
+            r->put(static_cast<uint8_t>(m | 27));
+            uint8_t buf[8]; store_be64(buf, n); r->put(buf, 8);
+        }
+    }
+
+public:
     explicit Serializer(RootSerializer& rs) : r(&rs) {}
 
     // primitives
-    void null()                  { r->enc.null_value(); r->wrote_root = true; }
-    void boolean(bool v)         { r->enc.bool_value(v); r->wrote_root = true; }
-    void int64(std::int64_t v)   { r->enc.int64_value(v); r->wrote_root = true; }
-    void uint64(std::uint64_t v) { r->enc.uint64_value(v); r->wrote_root = true; }
-    void double_(double v)       { r->enc.double_value(v); r->wrote_root = true; }
-    void string(std::string_view sv) { r->enc.string_value(sv); r->wrote_root = true; }
+    void null()          { r->put(0xf6); r->mark_wrote_root(); }
+    void boolean(bool v) { r->put(v ? 0xf5 : 0xf4); r->mark_wrote_root(); }
+    void int64(std::int64_t v) {
+        // RFC 8949 3.1: major type 1 encodes -1-n, computed as -(v+1) so
+        // v == INT64_MIN (where -v would overflow) stays in range.
+        if (v >= 0) write_head(0, static_cast<std::uint64_t>(v));
+        else        write_head(1, static_cast<std::uint64_t>(-(v + 1)));
+        r->mark_wrote_root();
+    }
+    void uint64(std::uint64_t v) { write_head(0, v); r->mark_wrote_root(); }
+    void double_(double v) {
+        r->put(0xfb);
+        uint8_t buf[8]; store_be64(buf, std::bit_cast<std::uint64_t>(v)); r->put(buf, 8);
+        r->mark_wrote_root();
+    }
+    void string(std::string_view sv) {
+        write_head(3, sv.size());
+        r->put(reinterpret_cast<const uint8_t*>(sv.data()), sv.size());
+        r->mark_wrote_root();
+    }
     void binary(std::span<const std::byte> b) {
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(b.data());
-        std::vector<uint8_t> tmp(p, p + b.size());
-        r->enc.byte_string_value(tmp); r->wrote_root = true;
+        write_head(2, b.size());
+        r->put(reinterpret_cast<const uint8_t*>(b.data()), b.size());
+        r->mark_wrote_root();
     }
 
-    // containers
-    void begin_array(std::size_t n) { r->enc.begin_array(n); r->wrote_root = true; }
-    void end_array()                { r->enc.end_array(); }
-    void begin_map(std::size_t n)   { r->enc.begin_object(n); r->wrote_root = true; }
-    void end_map()                  { r->enc.end_object(); }
-    void key(std::string_view k)    { r->enc.key(k); }
+    // containers (definite-length only)
+    void begin_array(std::size_t n) { write_head(4, n); r->mark_wrote_root(); }
+    void end_array()                { /* no-op: length was written up front */ }
+    void begin_map(std::size_t n)   { write_head(5, n); r->mark_wrote_root(); }
+    void end_map()                  { /* no-op: length was written up front */ }
+    void key(std::string_view k)    { string(k); }
 };
 
 // ========================== Reader (Deserializer) =============================
@@ -99,10 +150,13 @@ class CborDeserializer {
         uint8_t b = buf_[p];
         Head h{}; h.major = b >> 5; h.addl = b & 0x1F; h.indefinite = false; h.hlen = 1; h.val = 0;
         if (h.major == 7) {
-            // simple/float encoding: header is 1 byte for floats; body size depends on addl
-            if (h.addl == 25) { h.val = 2; }           // half (2 bytes)
-            else if (h.addl == 26) { h.val = 4; }      // float32
-            else if (h.addl == 27) { h.val = 8; }      // float64
+            // simple/float encoding: header is 1 byte for floats; body size depends on addl.
+            // The payload bytes must be validated here (not just at read time in asDouble/
+            // asFloat), otherwise a truncated float marker with no payload lets those
+            // accessors read past the end of buf_.
+            if (h.addl == 25) { ensure(p+3 <= buf_.size(), "CBOR: truncated f16"); h.val = 2; }           // half (2 bytes)
+            else if (h.addl == 26) { ensure(p+5 <= buf_.size(), "CBOR: truncated f32"); h.val = 4; }      // float32
+            else if (h.addl == 27) { ensure(p+9 <= buf_.size(), "CBOR: truncated f64"); h.val = 8; }      // float64
             else if (h.addl == 24) {                   // simple value (next 1 byte)
                 ensure(p+2 <= buf_.size(), "CBOR: truncated simple(24)");
                 h.hlen = 2; h.val = 0;
@@ -331,6 +385,7 @@ public:
                 auto kh = read_head(q);
                 std::string_view ksv;
                 if (kh.major==3 && !kh.indefinite) {
+                    ensure(q + kh.hlen + kh.val <= buf_.size(), "CBOR: truncated map key");
                     ksv = std::string_view(reinterpret_cast<const char*>(&buf_[q+kh.hlen]), static_cast<std::size_t>(kh.val));
                 } else {
                     // fallback: decode key to string
@@ -374,23 +429,29 @@ public:
             using difference_type   = std::ptrdiff_t;
             using reference         = std::string_view;
 
+            // Mirrors CborDeserializer::read_head()/skip() but operates on an
+            // explicit span instead of buf_ - every bounds check below has a
+            // matching one in the outer implementation; this copy must keep
+            // them in sync or a truncated map read through mapKeys() reads
+            // past the end of the buffer.
             struct H { uint8_t major, addl; uint64_t val; std::size_t hlen; bool indefinite; };
             static H read_head(std::span<const uint8_t> b, std::size_t p) {
+                ensure(p < b.size(), "CBOR: truncated");
                 uint8_t bb = b[p];
                 H h{}; h.major = bb>>5; h.addl=bb&0x1F; h.hlen=1; h.val=0; h.indefinite=false;
                 if (h.major==7) {
-                    if (h.addl==25) { h.val=2; }
-                    else if (h.addl==26) { h.val=4; }
-                    else if (h.addl==27) { h.val=8; }
-                    else if (h.addl==24) { h.hlen=2; }
+                    if (h.addl==25) { ensure(p+3 <= b.size(), "CBOR: truncated f16"); h.val=2; }
+                    else if (h.addl==26) { ensure(p+5 <= b.size(), "CBOR: truncated f32"); h.val=4; }
+                    else if (h.addl==27) { ensure(p+9 <= b.size(), "CBOR: truncated f64"); h.val=8; }
+                    else if (h.addl==24) { ensure(p+2 <= b.size(), "CBOR: truncated simple(24)"); h.hlen=2; }
                     else if (h.addl==31) { h.indefinite=true; }
                     return h;
                 }
                 if (h.addl<24) { h.val=h.addl; }
-                else if (h.addl==24) { h.val=b[p+1]; h.hlen=2; }
-                else if (h.addl==25) { h.val=(uint64_t)b[p+1]<<8 | b[p+2]; h.hlen=3; }
-                else if (h.addl==26) { h.val=((uint64_t)b[p+1]<<24)|((uint64_t)b[p+2]<<16)|((uint64_t)b[p+3]<<8)|b[p+4]; h.hlen=5; }
-                else if (h.addl==27) { h.val=((uint64_t)b[p+1]<<56)|((uint64_t)b[p+2]<<48)|((uint64_t)b[p+3]<<40)|((uint64_t)b[p+4]<<32)|((uint64_t)b[p+5]<<24)|((uint64_t)b[p+6]<<16)|((uint64_t)b[p+7]<<8)|b[p+8]; h.hlen=9; }
+                else if (h.addl==24) { ensure(p+2 <= b.size(), "CBOR: truncated u8"); h.val=b[p+1]; h.hlen=2; }
+                else if (h.addl==25) { ensure(p+3 <= b.size(), "CBOR: truncated u16"); h.val=(uint64_t)b[p+1]<<8 | b[p+2]; h.hlen=3; }
+                else if (h.addl==26) { ensure(p+5 <= b.size(), "CBOR: truncated u32"); h.val=((uint64_t)b[p+1]<<24)|((uint64_t)b[p+2]<<16)|((uint64_t)b[p+3]<<8)|b[p+4]; h.hlen=5; }
+                else if (h.addl==27) { ensure(p+9 <= b.size(), "CBOR: truncated u64"); h.val=((uint64_t)b[p+1]<<56)|((uint64_t)b[p+2]<<48)|((uint64_t)b[p+3]<<40)|((uint64_t)b[p+4]<<32)|((uint64_t)b[p+5]<<24)|((uint64_t)b[p+6]<<16)|((uint64_t)b[p+7]<<8)|b[p+8]; h.hlen=9; }
                 else if (h.addl==31) { h.indefinite=true; }
                 return h;
             }
@@ -399,20 +460,17 @@ public:
                 switch (h.major) {
                     case 0: case 1: return q;
                     case 2: case 3:
-                        if (!h.indefinite) return q + (std::size_t)h.val;
-                        for (;;) { if (b[q]==0xFF) return q+1; auto ch=read_head(b,q); q += ch.hlen + (std::size_t)ch.val; }
+                        if (!h.indefinite) { ensure(q + (std::size_t)h.val <= b.size(), "CBOR: truncated string/blob"); return q + (std::size_t)h.val; }
+                        for (;;) { ensure(q < b.size(), "CBOR: truncated indef str/blob"); if (b[q]==0xFF) return q+1; auto ch=read_head(b,q); q += ch.hlen + (std::size_t)ch.val; }
                     case 4:
                         if (!h.indefinite) { for (uint64_t i=0;i<h.val;++i) q=skip(b,q); return q; }
-                        for(;;){ if(b[q]==0xFF) return q+1; q=skip(b,q);}        
+                        for(;;){ ensure(q < b.size(), "CBOR: truncated indef arr"); if(b[q]==0xFF) return q+1; q=skip(b,q);}
                     case 5:
                         if (!h.indefinite) { for (uint64_t i=0;i<h.val;++i){ q=skip(b,q); q=skip(b,q);} return q; }
-                        for(;;){ if(b[q]==0xFF) return q+1; q=skip(b,q); q=skip(b,q);} 
+                        for(;;){ ensure(q < b.size(), "CBOR: truncated indef map"); if(b[q]==0xFF) return q+1; q=skip(b,q); q=skip(b,q);}
                     case 6: return skip(b,q);
                     case 7:
-                        if (h.addl==25) return q+2;
-                        if (h.addl==26) return q+4;
-                        if (h.addl==27) return q+8;
-                        return q;
+                        if (h.addl==25) return q+2; if (h.addl==26) return q+4; if (h.addl==27) return q+8; return q;
                 }
                 return q;
             }
@@ -420,6 +478,7 @@ public:
             reference operator*() const {
                 auto kh = read_head(buf, q);
                 if (kh.major==3 && !kh.indefinite) {
+                    ensure(q + kh.hlen + kh.val <= buf.size(), "CBOR: truncated map key");
                     return std::string_view(reinterpret_cast<const char*>(&buf[q+kh.hlen]), (std::size_t)kh.val);
                 }
                 // fallback: materialize
@@ -453,7 +512,7 @@ public:
                 std::size_t q = start + h.hlen; for (uint64_t i=0;i<h.val;++i){ q = iterator::skip(buf,q); q = iterator::skip(buf,q);} it.q = q; it.indefinite=false; it.remaining=0; return it;
             } else {
                 // find break
-                std::size_t q = start + h.hlen; for(;;){ if (buf[q]==0xFF){ it.q=q+1; break; } q = iterator::skip(buf,q); q = iterator::skip(buf,q);} it.indefinite=true; return it;
+                std::size_t q = start + h.hlen; for(;;){ ensure(q < buf.size(), "CBOR: truncated indef map"); if (buf[q]==0xFF){ it.q=q+1; break; } q = iterator::skip(buf,q); q = iterator::skip(buf,q);} it.indefinite=true; return it;
             }
         }
     };

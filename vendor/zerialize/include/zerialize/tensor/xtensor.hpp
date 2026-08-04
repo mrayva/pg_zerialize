@@ -70,7 +70,7 @@ public:
     ArrayType array() const {
         if (owned_) return *owned_;
         auto out = ArrayType::from_shape(shape_as_sizet());
-        std::memcpy(out.data(), bytes_.data(), bytes_.size());
+        if (!bytes_.empty()) std::memcpy(out.data(), bytes_.data(), bytes_.size());
         return out;
     }
 
@@ -162,7 +162,7 @@ XTensorView<T> asXTensorView(const Reader auto& buf) {
             for (auto d : vshape) s.push_back(static_cast<std::size_t>(d));
             return s;
         }());
-        std::memcpy(out.data(), bytes.data(), bytes.size());
+        if (!bytes.empty()) std::memcpy(out.data(), bytes.data(), bytes.size());
         tensor::TensorViewInfo info{};
         info.zero_copy = false;
         info.reason = tensor::TensorViewReason::NotSpanBacked;
@@ -193,7 +193,7 @@ XTensorView<T> asXTensorView(const Reader auto& buf) {
                 for (auto d : vshape) s.push_back(static_cast<std::size_t>(d));
                 return s;
             }());
-            std::memcpy(out.data(), bytes.data(), bytes.size());
+            if (!bytes.empty()) std::memcpy(out.data(), bytes.data(), bytes.size());
             return XTensorView<T>(std::move(out), std::move(vshape), element_count, info);
         }
         info.zero_copy = true;

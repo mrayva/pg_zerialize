@@ -249,6 +249,43 @@ struct RootSerializer {
         if (!doc) throw std::bad_alloc{};
     }
 
+    // doc is a raw yyjson_mut_doc* freed by finish() - but finish() is only
+    // reached on the success path. If a Writer call (or the source Reader
+    // being translated from) throws before finish() runs, doc would
+    // otherwise leak on unwind. Free it here too if still owned; not copy-
+    // able (would double-free) but movable, so ownership can still transfer
+    // if a future caller needs that.
+    ~RootSerializer() {
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+    }
+
+    RootSerializer(const RootSerializer&) = delete;
+    RootSerializer& operator=(const RootSerializer&) = delete;
+
+    RootSerializer(RootSerializer&& other) noexcept
+        : doc(other.doc), root(other.root), wrote_root(other.wrote_root),
+          st(std::move(other.st)) {
+        other.doc = nullptr;
+        other.root = nullptr;
+    }
+
+    RootSerializer& operator=(RootSerializer&& other) noexcept {
+        if (this != &other) {
+            if (doc) {
+                yyjson_mut_doc_free(doc);
+            }
+            doc = other.doc;
+            root = other.root;
+            wrote_root = other.wrote_root;
+            st = std::move(other.st);
+            other.doc = nullptr;
+            other.root = nullptr;
+        }
+        return *this;
+    }
+
     // Consume and produce the final buffer.
     ZBuffer finish() {
         if (!root) {

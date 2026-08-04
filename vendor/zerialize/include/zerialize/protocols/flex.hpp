@@ -57,7 +57,14 @@ struct Serializer {
     void uint64(std::uint64_t v) { r->fbb.UInt(v); r->wrote_root_ = true; }
     void double_(double v)       { r->fbb.Double(v); r->wrote_root_ = true; }
     void string(std::string_view sv) {
-        r->fbb.String(sv.data(), sv.size()); r->wrote_root_ = true;
+        // flexbuffers::Builder::String(const char*, size_t) reads size()+1
+        // bytes so it can also store a trailing NUL for C-string
+        // compatibility. std::string_view gives no guarantee of a valid byte
+        // past its end (unlike std::string), so a non-null-terminated view
+        // (e.g. a substring, or a view into an arbitrary buffer) makes it
+        // read one byte past the caller's data. Materialize a
+        // null-terminated copy first to avoid that.
+        r->fbb.String(std::string(sv)); r->wrote_root_ = true;
     }
     void binary(std::span<const std::byte> b) {
         auto ptr = reinterpret_cast<const std::uint8_t*>(b.data());
@@ -91,8 +98,12 @@ struct Serializer {
     }
 
     void key(std::string_view k) {
-        // FlexBuffers requires a key immediately before its value
-        r->fbb.Key(k.data(), k.size());
+        // FlexBuffers requires a key immediately before its value.
+        // Builder::Key(const char*, size_t), like String(), reads size()+1
+        // bytes for a trailing NUL - std::string_view doesn't guarantee one
+        // exists past its end, so materialize a null-terminated copy first
+        // (see the identical reasoning in string() above).
+        r->fbb.Key(std::string(k));
     }
 
 private:

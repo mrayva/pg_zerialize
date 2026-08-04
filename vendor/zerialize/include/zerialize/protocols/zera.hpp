@@ -413,7 +413,7 @@ public:
             (void)read_u16_le(e + 2); // reserved
             const auto* key_bytes = env_ptr_at(static_cast<std::uint32_t>(ofs + 4), key_len);
             if (key_len == key.size() &&
-                std::memcmp(key_bytes, key.data(), key.size()) == 0) return true;
+                (key.empty() || std::memcmp(key_bytes, key.data(), key.size()) == 0)) return true;
             ofs += 4 + std::size_t(key_len) + 16;
             (void)env_ptr_at(static_cast<std::uint32_t>(ofs), 0);
         }
@@ -475,7 +475,7 @@ inline ZeraValue ZeraViewBase::operator[](std::string_view key) const {
         (void)read_u16_le(e + 2); // reserved
         const auto* key_bytes = env_ptr_at(static_cast<std::uint32_t>(ofs + 4), key_len);
         const auto* value_vr = env_ptr_at(static_cast<std::uint32_t>(ofs + 4 + key_len), 16);
-        if (key_len == key.size() && std::memcmp(key_bytes, key.data(), key.size()) == 0) {
+        if (key_len == key.size() && (key.empty() || std::memcmp(key_bytes, key.data(), key.size()) == 0)) {
             return ZeraValue(*this, value_vr);
         }
         ofs += 4 + std::size_t(key_len) + 16;
@@ -627,8 +627,13 @@ struct RootSerializer {
         write_header32(12, env_size);
         write_header32(16, static_cast<std::uint32_t>(arena_ofs));
 
-        std::memcpy(out.data() + HeaderSize, env_.data(), env_.size());
-        std::memcpy(out.data() + arena_ofs, arena_.data(), arena_.size());
+        // env_/arena_ can be empty (e.g. a payload with no out-of-line
+        // strings or blobs never touches arena_) - vector::data() is then
+        // permitted to return nullptr, and memcpy's source argument must be
+        // non-null even for a 0-byte copy. Guard both, matching the
+        // convention already used for every other memcpy in this file below.
+        if (!env_.empty()) std::memcpy(out.data() + HeaderSize, env_.data(), env_.size());
+        if (!arena_.empty()) std::memcpy(out.data() + arena_ofs, arena_.data(), arena_.size());
 
         return ZBuffer(std::move(out));
     }

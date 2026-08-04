@@ -19,6 +19,7 @@ and performance work use PostgreSQL 18.
 - C++20 compiler (GCC 10+ or Clang 10+)
 - FlatBuffers development package (`libflatbuffers-dev`)
 - fast_float development package (`libfast-float-dev`)
+- MessagePack C development package (`libmsgpack-dev`)
 - Python `msgpack` package for independent MessagePack semantic tests
 
 The zerialize headers are vendored under `vendor/`. See

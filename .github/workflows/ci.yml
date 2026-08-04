@@ -48,6 +48,7 @@ jobs:
             clang \
             libflatbuffers-dev \
             libfast-float-dev \
+            libmsgpack-dev \
             python3-msgpack \
             "postgresql-${PG_MAJOR}" \
             "postgresql-server-dev-${PG_MAJOR}"
