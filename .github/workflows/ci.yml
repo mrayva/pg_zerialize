@@ -57,6 +57,9 @@ jobs:
       - name: Start PostgreSQL
         run: |
           sudo pg_ctlcluster "$PG_MAJOR" main stop || true
+          if ! pg_lsclusters | awk '{print $1, $2}' | grep -qx "$PG_MAJOR main"; then
+            sudo pg_createcluster "$PG_MAJOR" main
+          fi
           sudo pg_conftool "$PG_MAJOR" main set port "$PGPORT"
           sudo pg_ctlcluster "$PG_MAJOR" main start
           sudo -u postgres createuser -p "$PGPORT" -s "$USER" || true
