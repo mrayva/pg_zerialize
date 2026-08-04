@@ -97,6 +97,27 @@ LEFT JOIN (
 `cbor_from_jsonb`, `zera_from_jsonb`, and `flexbuffers_from_jsonb` work the
 same way for their respective protocols.
 
+## Decode Back Into a Row
+
+`X_populate_record` is the reverse of `row_to_X`:
+
+```sql
+SELECT msgpack_populate_record(
+  NULL::customer,
+  row_to_msgpack(ROW(7, 'Ada', ROW('London', 'SW1A')::address)::customer)
+);
+```
+
+Columns missing from the document keep `base`'s value instead of erroring,
+matching `jsonb_populate_record`:
+
+```sql
+SELECT cbor_populate_record(
+  ROW(7, 'Ada', ROW('London', 'SW1A')::address)::customer,
+  cbor_build_object('name', 'Ada Lovelace')
+);
+```
+
 ## Verify Output
 
 ```sql
@@ -124,7 +145,6 @@ local PostgreSQL configuration differs.
 
 ## Limitations
 
-- Multidimensional arrays are not emitted as nested arrays.
-- Fractional or out-of-range `numeric` values use lossy `float64`.
-- Deserialization APIs are not implemented.
+- Fractional `numeric` values use lossy `float64` by default; set
+  `pg_zerialize.numeric_encoding = 'tagged_decimal'` for exact round trips.
 - A `json` value remains text; use JSONB builders for recursive JSON objects.

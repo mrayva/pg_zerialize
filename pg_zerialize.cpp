@@ -19,8 +19,10 @@ extern "C" {
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/jsonb.h"
+#include "utils/fmgrprotos.h"
 #include "utils/timestamp.h"
 #include "access/tupdesc.h"
+#include "access/htup_details.h"
 #include "executor/spi.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -105,6 +107,10 @@ extern "C" {
     Datum flexbuffers_to_jsonb(PG_FUNCTION_ARGS);
     Datum cbor_to_jsonb(PG_FUNCTION_ARGS);
     Datum zera_to_jsonb(PG_FUNCTION_ARGS);
+    Datum msgpack_populate_record(PG_FUNCTION_ARGS);
+    Datum cbor_populate_record(PG_FUNCTION_ARGS);
+    Datum zera_populate_record(PG_FUNCTION_ARGS);
+    Datum flexbuffers_populate_record(PG_FUNCTION_ARGS);
     Datum msgpack_build_object(PG_FUNCTION_ARGS);
     Datum msgpack_build_array(PG_FUNCTION_ARGS);
     Datum msgpack_agg_final(PG_FUNCTION_ARGS);
@@ -142,6 +148,10 @@ extern "C" {
     PG_FUNCTION_INFO_V1(flexbuffers_to_jsonb);
     PG_FUNCTION_INFO_V1(cbor_to_jsonb);
     PG_FUNCTION_INFO_V1(zera_to_jsonb);
+    PG_FUNCTION_INFO_V1(msgpack_populate_record);
+    PG_FUNCTION_INFO_V1(cbor_populate_record);
+    PG_FUNCTION_INFO_V1(zera_populate_record);
+    PG_FUNCTION_INFO_V1(flexbuffers_populate_record);
     PG_FUNCTION_INFO_V1(msgpack_build_object);
     PG_FUNCTION_INFO_V1(msgpack_build_array);
     PG_FUNCTION_INFO_V1(msgpack_agg_final);
@@ -5416,6 +5426,25 @@ msgpack_from_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Shared decode core for msgpack_to_jsonb/msgpack_populate_record: validates
+ * one complete MessagePack value and renders it to JSON text. Throws
+ * z::DeserializationError (or lets one propagate) on any invalid input.
+ */
+static std::string msgpack_decode_to_json_text(std::span<const uint8_t> data)
+{
+    const size_t consumed = msgpack_validate_value(data, 0);
+    if (consumed != data.size()) {
+        throw z::DeserializationError("trailing bytes after MessagePack value");
+    }
+
+    z::MsgPackDeserializer reader(data);
+    std::string json;
+    json.reserve(data.size() + 32);
+    msgpack_reader_to_json(reader, json);
+    return json;
+}
+
+/*
  * msgpack_to_jsonb - Safely decode one complete MessagePack value to jsonb.
  */
 extern "C" Datum
@@ -5427,15 +5456,7 @@ msgpack_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        const size_t consumed = msgpack_validate_value(data, 0);
-        if (consumed != data.size()) {
-            throw z::DeserializationError("trailing bytes after MessagePack value");
-        }
-
-        z::MsgPackDeserializer reader(data);
-        std::string json;
-        json.reserve(length + 32);
-        msgpack_reader_to_json(reader, json);
+        std::string json = msgpack_decode_to_json_text(data);
         PG_FREE_IF_COPY(input, 0);
 
         Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
@@ -5456,6 +5477,22 @@ msgpack_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Shared decode core for flexbuffers_to_jsonb/flexbuffers_populate_record.
+ */
+static std::string flex_decode_to_json_text(const uint8_t* bytes, size_t length)
+{
+    if (!::flexbuffers::VerifyBuffer(bytes, length)) {
+        throw z::DeserializationError("FlexBuffer verification failed");
+    }
+
+    ::flexbuffers::Reference root = ::flexbuffers::GetRoot(bytes, length);
+    std::string json;
+    json.reserve(length + 32);
+    flex_reference_to_json(root, json);
+    return json;
+}
+
+/*
  * flexbuffers_to_jsonb - Verify and decode one FlexBuffer value to jsonb.
  */
 extern "C" Datum
@@ -5466,14 +5503,7 @@ flexbuffers_to_jsonb(PG_FUNCTION_ARGS)
     const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
 
     try {
-        if (!::flexbuffers::VerifyBuffer(bytes, length)) {
-            throw z::DeserializationError("FlexBuffer verification failed");
-        }
-
-        ::flexbuffers::Reference root = ::flexbuffers::GetRoot(bytes, length);
-        std::string json;
-        json.reserve(length + 32);
-        flex_reference_to_json(root, json);
+        std::string json = flex_decode_to_json_text(bytes, length);
         PG_FREE_IF_COPY(input, 0);
 
         Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
@@ -5491,6 +5521,20 @@ flexbuffers_to_jsonb(PG_FUNCTION_ARGS)
     }
 
     PG_RETURN_NULL();
+}
+
+/*
+ * Shared decode core for cbor_to_jsonb/cbor_populate_record.
+ */
+static std::string cbor_decode_to_json_text(std::span<const uint8_t> data)
+{
+    std::string json;
+    json.reserve(data.size() + 32);
+    const size_t consumed = cbor_value_to_json(data, 0, json);
+    if (consumed != data.size()) {
+        throw z::DeserializationError("trailing bytes after CBOR value");
+    }
+    return json;
 }
 
 /*
@@ -5505,12 +5549,7 @@ cbor_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json;
-        json.reserve(length + 32);
-        const size_t consumed = cbor_value_to_json(data, 0, json);
-        if (consumed != data.size()) {
-            throw z::DeserializationError("trailing bytes after CBOR value");
-        }
+        std::string json = cbor_decode_to_json_text(data);
         PG_FREE_IF_COPY(input, 0);
 
         Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
@@ -5531,6 +5570,53 @@ cbor_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Shared decode core for zera_to_jsonb/zera_populate_record.
+ */
+static std::string zera_decode_to_json_text(std::span<const uint8_t> data)
+{
+    if (data.size() < z::zera::HeaderSize) {
+        throw z::DeserializationError("truncated ZERA header");
+    }
+    const z::zera::HeaderView header = z::zera::parse_header(data);
+    if (header.magic != z::zera::Magic) {
+        throw z::DeserializationError("invalid ZERA magic");
+    }
+    if (header.version != z::zera::Version) {
+        throw z::DeserializationError("unsupported ZERA version");
+    }
+    if (header.flags != 1) {
+        throw z::DeserializationError("invalid ZERA header flags");
+    }
+    if (header.env_size < 16 ||
+        header.env_size > data.size() - z::zera::HeaderSize) {
+        throw z::DeserializationError("invalid ZERA envelope size");
+    }
+    if (header.root_ofs > header.env_size - 16) {
+        throw z::DeserializationError("ZERA root ValueRef is out of bounds");
+    }
+    const size_t envelope_end =
+        z::zera::HeaderSize + static_cast<size_t>(header.env_size);
+    if (header.arena_ofs < envelope_end || header.arena_ofs > data.size() ||
+        header.arena_ofs % z::zera::ArenaBaseAlign != 0) {
+        throw z::DeserializationError("invalid ZERA arena offset");
+    }
+    for (size_t i = envelope_end; i < header.arena_ofs; i++) {
+        if (data[i] != 0) {
+            throw z::DeserializationError("nonzero ZERA envelope padding");
+        }
+    }
+
+    ZeraDecodeContext context{
+        data.subspan(z::zera::HeaderSize, header.env_size),
+        data.subspan(header.arena_ofs),
+        {}};
+    std::string json;
+    json.reserve(data.size() + 32);
+    zera_value_to_json(context, header.root_ofs, json, 0);
+    return json;
+}
+
+/*
  * zera_to_jsonb - Validate and decode one ZERA v1 document to jsonb.
  */
 extern "C" Datum
@@ -5542,45 +5628,7 @@ zera_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        if (data.size() < z::zera::HeaderSize) {
-            throw z::DeserializationError("truncated ZERA header");
-        }
-        const z::zera::HeaderView header = z::zera::parse_header(data);
-        if (header.magic != z::zera::Magic) {
-            throw z::DeserializationError("invalid ZERA magic");
-        }
-        if (header.version != z::zera::Version) {
-            throw z::DeserializationError("unsupported ZERA version");
-        }
-        if (header.flags != 1) {
-            throw z::DeserializationError("invalid ZERA header flags");
-        }
-        if (header.env_size < 16 ||
-            header.env_size > data.size() - z::zera::HeaderSize) {
-            throw z::DeserializationError("invalid ZERA envelope size");
-        }
-        if (header.root_ofs > header.env_size - 16) {
-            throw z::DeserializationError("ZERA root ValueRef is out of bounds");
-        }
-        const size_t envelope_end =
-            z::zera::HeaderSize + static_cast<size_t>(header.env_size);
-        if (header.arena_ofs < envelope_end || header.arena_ofs > data.size() ||
-            header.arena_ofs % z::zera::ArenaBaseAlign != 0) {
-            throw z::DeserializationError("invalid ZERA arena offset");
-        }
-        for (size_t i = envelope_end; i < header.arena_ofs; i++) {
-            if (data[i] != 0) {
-                throw z::DeserializationError("nonzero ZERA envelope padding");
-            }
-        }
-
-        ZeraDecodeContext context{
-            data.subspan(z::zera::HeaderSize, header.env_size),
-            data.subspan(header.arena_ofs),
-            {}};
-        std::string json;
-        json.reserve(length + 32);
-        zera_value_to_json(context, header.root_ofs, json, 0);
+        std::string json = zera_decode_to_json_text(data);
         PG_FREE_IF_COPY(input, 0);
 
         Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
@@ -5594,6 +5642,471 @@ zera_to_jsonb(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
                  errmsg("invalid ZERA input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * Shared decode-to-composite core for X_populate_record. Reuses each
+ * protocol's own X_decode_to_json_text() (already validated/tested via
+ * X_to_jsonb) to get a Jsonb*, then walks that Jsonb tree directly into a
+ * PostgreSQL composite Datum using the same CachedSchema/CachedColumn
+ * metadata the encode side uses, mirroring jsonb_populate_record's
+ * base-row-fallback and tag-decoding semantics.
+ */
+static Datum populate_composite_from_jsonb_container(
+    JsonbContainer* container, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec);
+
+struct JsonbTag {
+    std::string_view tag;
+    std::string_view payload;
+    std::string_view encoding;
+};
+
+static bool jsonb_container_try_tag(JsonbContainer* container, JsonbTag* out)
+{
+    if (!JsonContainerIsArray(container) || JsonContainerIsScalar(container) ||
+        JsonContainerSize(container) != 3) {
+        return false;
+    }
+    JsonbValue* e0 = getIthJsonbValueFromContainer(container, 0);
+    JsonbValue* e1 = getIthJsonbValueFromContainer(container, 1);
+    JsonbValue* e2 = getIthJsonbValueFromContainer(container, 2);
+    if (e0->type != jbvString || e1->type != jbvString || e2->type != jbvString) {
+        return false;
+    }
+    out->tag = std::string_view(e0->val.string.val, e0->val.string.len);
+    out->payload = std::string_view(e1->val.string.val, e1->val.string.len);
+    out->encoding = std::string_view(e2->val.string.val, e2->val.string.len);
+    return true;
+}
+
+/*
+ * Reverses datum_bytea_span/datum_jsonb_span: both bytea and jsonb store a
+ * raw byte payload directly after the varlena header, so one palloc+memcpy
+ * reconstructs either from the decoded "~b" tag payload.
+ */
+static Datum jsonb_tagged_binary_to_datum(std::string_view base64_text)
+{
+    std::vector<std::byte> decoded = z::base64Decode(base64_text);
+    bytea* result = static_cast<bytea*>(palloc(VARHDRSZ + decoded.size()));
+    SET_VARSIZE(result, VARHDRSZ + decoded.size());
+    if (!decoded.empty()) {
+        memcpy(VARDATA(result), decoded.data(), decoded.size());
+    }
+    return PointerGetDatum(result);
+}
+
+/*
+ * Converts one non-null JsonbValue to a scalar Datum for target_typid.
+ * Tag detection is gated on target_typid so a coincidental 3-element JSON
+ * array/object in a genuine array or object column is never misread as a
+ * pg_zerialize tag.
+ */
+static Datum jsonb_value_to_scalar_datum(JsonbValue* jbv, Oid target_typid, int32 target_typmod)
+{
+    if (jbv->type == jbvBinary && (target_typid == BYTEAOID || target_typid == JSONBOID)) {
+        JsonbTag tag;
+        if (jsonb_container_try_tag(jbv->val.binary.data, &tag) &&
+            tag.tag == "~b" && tag.encoding == "base64") {
+            return jsonb_tagged_binary_to_datum(tag.payload);
+        }
+    }
+
+    /*
+     * Every write path (row_to_X, X_build_object/array, X_agg) encodes
+     * date/timestamp/timestamptz as a raw PG-internal epoch integer, not
+     * text (see datum_to_dynamic's Date/Timestamp/Timestamptz cases) -
+     * reconstruct the Datum directly rather than routing "0" through
+     * date_in/timestamp_in. A hand-built document with a text date for one
+     * of these columns still works via the jbvString fallback below.
+     */
+    if (jbv->type == jbvNumeric &&
+        (target_typid == DATEOID || target_typid == TIMESTAMPOID || target_typid == TIMESTAMPTZOID)) {
+        int64 raw = DatumGetInt64(DirectFunctionCall1(numeric_int8, NumericGetDatum(jbv->val.numeric)));
+        if (target_typid == DATEOID) {
+            return DateADTGetDatum(static_cast<DateADT>(raw));
+        }
+        if (target_typid == TIMESTAMPOID) {
+            return TimestampGetDatum(static_cast<Timestamp>(raw));
+        }
+        return TimestampTzGetDatum(static_cast<TimestampTz>(raw));
+    }
+
+    std::string text;
+    switch (jbv->type) {
+        case jbvString:
+            text.assign(jbv->val.string.val, jbv->val.string.len);
+            break;
+        case jbvNumeric: {
+            char* out = DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(jbv->val.numeric)));
+            text.assign(out);
+            pfree(out);
+            break;
+        }
+        case jbvBool:
+            text = jbv->val.boolean ? "true" : "false";
+            break;
+        case jbvBinary: {
+            JsonbTag tag;
+            if (target_typid == NUMERICOID &&
+                jsonb_container_try_tag(jbv->val.binary.data, &tag) &&
+                tag.tag == "~n" && tag.encoding == "decimal") {
+                text.assign(tag.payload);
+                break;
+            }
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                     errmsg("cannot convert a JSON array or object to a scalar column")));
+        }
+        default:
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                     errmsg("cannot convert JSON value to scalar column")));
+    }
+
+    Oid typinput, typioparam;
+    getTypeInputInfo(target_typid, &typinput, &typioparam);
+    return OidInputFunctionCall(typinput, text.data(), typioparam, target_typmod);
+}
+
+struct JsonbArrayBuild {
+    std::vector<Datum> values;
+    std::vector<uint8_t> nulls;
+    std::vector<int> dims;
+};
+
+/*
+ * Recursively walks a (possibly nested) JSON array into flat row-major
+ * values/nulls plus one dims[] entry per nesting depth, mirroring
+ * array_level_to_dynamic in reverse. Validates that the array is
+ * rectangular, matching construct_md_array's requirements.
+ */
+static void jsonb_array_dim_collect(
+    JsonbContainer* container, int depth, const CachedColumn& col, JsonbArrayBuild& out)
+{
+    const int n = (int) JsonContainerSize(container);
+    if ((int) out.dims.size() <= depth) {
+        out.dims.push_back(n);
+    } else if (out.dims[depth] != n) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                 errmsg("malformed array literal: subarrays have inconsistent sizes for column \"%s\"",
+                        col.name.c_str())));
+    }
+
+    for (int i = 0; i < n; i++) {
+        JsonbValue* elem = getIthJsonbValueFromContainer(container, i);
+        if (elem->type == jbvNull) {
+            out.values.push_back((Datum) 0);
+            out.nulls.push_back(1);
+            continue;
+        }
+        if (elem->type == jbvBinary && JsonContainerIsArray(elem->val.binary.data) &&
+            !JsonContainerIsScalar(elem->val.binary.data)) {
+            jsonb_array_dim_collect(elem->val.binary.data, depth + 1, col, out);
+            continue;
+        }
+        if (elem->type == jbvBinary && JsonContainerIsObject(elem->val.binary.data)) {
+            if (col.array_element_kind != ConverterKind::Composite) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                         errmsg("unexpected JSON object in array column \"%s\"", col.name.c_str())));
+            }
+            Datum d = populate_composite_from_jsonb_container(
+                elem->val.binary.data, col.array_element_typid, -1, nullptr);
+            out.values.push_back(d);
+            out.nulls.push_back(0);
+            continue;
+        }
+        out.values.push_back(jsonb_value_to_scalar_datum(elem, col.array_element_typid, -1));
+        out.nulls.push_back(0);
+    }
+}
+
+static Datum populate_composite_from_jsonb_container(
+    JsonbContainer* container, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec)
+{
+    if (!JsonContainerIsObject(container)) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                 errmsg("cannot populate a composite value from a non-object JSON value")));
+    }
+
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+    const int natts = schema.tupdesc->natts;
+
+    std::unique_ptr<Datum[]> values(new Datum[natts]());
+    std::unique_ptr<bool[]> nulls(new bool[natts]);
+
+    if (base_rec != nullptr) {
+        HeapTupleData tuple;
+        tuple.t_len = HeapTupleHeaderGetDatumLength(base_rec);
+        tuple.t_data = base_rec;
+        heap_deform_tuple(&tuple, schema.tupdesc, values.get(), nulls.get());
+    } else {
+        for (int i = 0; i < natts; i++) {
+            nulls[i] = true;
+        }
+    }
+
+    for (const CachedColumn& col : schema.columns) {
+        const int idx = col.attnum - 1;
+        JsonbValue key_result;
+        JsonbValue* found = getKeyJsonValueFromContainer(
+            container, col.name.data(), (int) col.name.size(), &key_result);
+        if (found == nullptr) {
+            continue;
+        }
+        if (found->type == jbvNull) {
+            values[idx] = (Datum) 0;
+            nulls[idx] = true;
+            continue;
+        }
+
+        Form_pg_attribute att = TupleDescAttr(schema.tupdesc, idx);
+
+        if (col.kind == ConverterKind::Composite) {
+            if (found->type != jbvBinary || !JsonContainerIsObject(found->val.binary.data)) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                         errmsg("expected a JSON object for composite column \"%s\"", col.name.c_str())));
+            }
+            values[idx] = populate_composite_from_jsonb_container(
+                found->val.binary.data, col.typid, att->atttypmod, nullptr);
+            nulls[idx] = false;
+        } else if (col.kind == ConverterKind::Array) {
+            if (found->type != jbvBinary || !JsonContainerIsArray(found->val.binary.data)) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                         errmsg("expected a JSON array for array column \"%s\"", col.name.c_str())));
+            }
+            JsonbArrayBuild build;
+            jsonb_array_dim_collect(found->val.binary.data, 0, col, build);
+            if (build.values.empty()) {
+                values[idx] = PointerGetDatum(construct_empty_array(col.array_element_typid));
+            } else {
+                const int ndims = (int) build.dims.size();
+                std::vector<int> lbs(ndims, 1);
+                std::unique_ptr<bool[]> elem_nulls(new bool[build.nulls.size()]);
+                for (size_t i = 0; i < build.nulls.size(); i++) {
+                    elem_nulls[i] = build.nulls[i] != 0;
+                }
+                values[idx] = PointerGetDatum(construct_md_array(
+                    build.values.data(), elem_nulls.get(), ndims, build.dims.data(), lbs.data(),
+                    col.array_element_typid, col.array_typlen, col.array_typbyval, col.array_typalign));
+            }
+            nulls[idx] = false;
+        } else {
+            values[idx] = jsonb_value_to_scalar_datum(found, att->atttypid, att->atttypmod);
+            nulls[idx] = false;
+        }
+    }
+
+    HeapTuple result = heap_form_tuple(schema.tupdesc, values.get(), nulls.get());
+    return HeapTupleGetDatum(result);
+}
+
+/*
+ * Resolves the target composite type/typmod and base row for an
+ * X_populate_record(base anyelement, data bytea) call, following
+ * jsonb_populate_record's own anyelement-polymorphism pattern.
+ */
+static void populate_record_resolve_target(
+    FunctionCallInfo fcinfo, Oid* tupType, int32* tupTypmod, HeapTupleHeader* base_rec)
+{
+    if (!PG_ARGISNULL(0)) {
+        *base_rec = PG_GETARG_HEAPTUPLEHEADER(0);
+        *tupType = HeapTupleHeaderGetTypeId(*base_rec);
+        *tupTypmod = HeapTupleHeaderGetTypMod(*base_rec);
+        return;
+    }
+
+    *base_rec = nullptr;
+    *tupType = get_fn_expr_argtype(fcinfo->flinfo, 0);
+    *tupTypmod = -1;
+    if (!OidIsValid(*tupType) || *tupType == RECORDOID) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("could not determine row type for result")));
+    }
+}
+
+static Datum populate_record_null_data(Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec)
+{
+    if (base_rec != nullptr) {
+        return HeapTupleHeaderGetDatum(base_rec);
+    }
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+    const int natts = schema.tupdesc->natts;
+    std::unique_ptr<Datum[]> values(new Datum[natts]());
+    std::unique_ptr<bool[]> nulls(new bool[natts]);
+    for (int i = 0; i < natts; i++) {
+        nulls[i] = true;
+    }
+    HeapTuple result = heap_form_tuple(schema.tupdesc, values.get(), nulls.get());
+    return HeapTupleGetDatum(result);
+}
+
+/*
+ * msgpack_populate_record - Decode a MessagePack document into a typed
+ * composite, falling back to base's columns for keys the document omits.
+ */
+extern "C" Datum
+msgpack_populate_record(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    if (PG_ARGISNULL(1)) {
+        PG_RETURN_DATUM(populate_record_null_data(tupType, tupTypmod, base_rec));
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = msgpack_decode_to_json_text(data);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid MessagePack input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid MessagePack input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * cbor_populate_record - Decode a CBOR document into a typed composite,
+ * falling back to base's columns for keys the document omits.
+ */
+extern "C" Datum
+cbor_populate_record(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    if (PG_ARGISNULL(1)) {
+        PG_RETURN_DATUM(populate_record_null_data(tupType, tupTypmod, base_rec));
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = cbor_decode_to_json_text(data);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid CBOR input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid CBOR input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * zera_populate_record - Decode a ZERA document into a typed composite,
+ * falling back to base's columns for keys the document omits.
+ */
+extern "C" Datum
+zera_populate_record(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    if (PG_ARGISNULL(1)) {
+        PG_RETURN_DATUM(populate_record_null_data(tupType, tupTypmod, base_rec));
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = zera_decode_to_json_text(data);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid ZERA input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid ZERA input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * flexbuffers_populate_record - Decode a FlexBuffer document into a typed
+ * composite, falling back to base's columns for keys the document omits.
+ */
+extern "C" Datum
+flexbuffers_populate_record(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    if (PG_ARGISNULL(1)) {
+        PG_RETURN_DATUM(populate_record_null_data(tupType, tupTypmod, base_rec));
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+
+    try {
+        std::string json = flex_decode_to_json_text(bytes, length);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid FlexBuffer input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid FlexBuffer input"),
                  errdetail("unknown decoding error")));
     }
 

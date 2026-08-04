@@ -1,0 +1,388 @@
+-- pg_zerialize extension SQL definitions, version 1.7
+
+-- Function to convert a row to FlexBuffers format
+CREATE OR REPLACE FUNCTION row_to_flexbuffers(record)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'row_to_flexbuffers'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION row_to_flexbuffers(record) IS
+'Convert a PostgreSQL row/record to FlexBuffers binary format';
+
+-- Function to convert a row to MessagePack format
+CREATE OR REPLACE FUNCTION row_to_msgpack(record)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'row_to_msgpack'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION row_to_msgpack(record) IS
+'Convert a PostgreSQL row/record to MessagePack binary format';
+
+-- Test helper: force generic (slow) MessagePack path for parity validation
+CREATE OR REPLACE FUNCTION row_to_msgpack_slow(record)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'row_to_msgpack_slow'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION row_to_msgpack_slow(record) IS
+'Convert a PostgreSQL row/record to MessagePack using generic slow path (test/parity helper)';
+
+-- Convert nested jsonb to nested MessagePack
+CREATE OR REPLACE FUNCTION msgpack_from_jsonb(jsonb)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_from_jsonb'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION msgpack_from_jsonb(jsonb) IS
+'Convert jsonb value (including nested objects/arrays) to MessagePack';
+
+CREATE OR REPLACE FUNCTION msgpack_to_jsonb(bytea)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'msgpack_to_jsonb'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+COMMENT ON FUNCTION msgpack_to_jsonb(bytea) IS
+'Decode one MessagePack value to jsonb; binary values use a tagged base64 array';
+
+CREATE OR REPLACE FUNCTION flexbuffers_to_jsonb(bytea)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'flexbuffers_to_jsonb'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+COMMENT ON FUNCTION flexbuffers_to_jsonb(bytea) IS
+'Decode one verified FlexBuffer value to jsonb; blobs use a tagged base64 array';
+
+CREATE OR REPLACE FUNCTION cbor_to_jsonb(bytea)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'cbor_to_jsonb'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+COMMENT ON FUNCTION cbor_to_jsonb(bytea) IS
+'Strictly decode one CBOR value to jsonb; byte strings use a tagged base64 array';
+
+CREATE OR REPLACE FUNCTION zera_to_jsonb(bytea)
+RETURNS jsonb
+AS 'MODULE_PATHNAME', 'zera_to_jsonb'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+COMMENT ON FUNCTION zera_to_jsonb(bytea) IS
+'Validate and decode one ZERA v1 document to jsonb; U8 typed arrays use base64';
+
+-- SQL-builder style wrappers
+CREATE OR REPLACE FUNCTION msgpack_build_object(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_build_object'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION msgpack_build_object(VARIADIC "any") IS
+'Build a MessagePack object from key/value pairs (json_build_object-style)';
+
+CREATE OR REPLACE FUNCTION msgpack_build_array(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_build_array'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION msgpack_build_array(VARIADIC "any") IS
+'Build a MessagePack array from variadic values (json_build_array-style)';
+
+-- Aggregate finalizers
+CREATE OR REPLACE FUNCTION msgpack_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_agg_final'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION msgpack_object_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'msgpack_object_agg_final'
+LANGUAGE C;
+
+CREATE AGGREGATE msgpack_agg(anyelement)
+(
+    SFUNC = jsonb_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = msgpack_agg_final
+);
+
+COMMENT ON AGGREGATE msgpack_agg(anyelement) IS
+'Aggregate values into a MessagePack array (json_agg-style)';
+
+CREATE AGGREGATE msgpack_object_agg(text, anyelement)
+(
+    SFUNC = jsonb_object_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = msgpack_object_agg_final
+);
+
+COMMENT ON AGGREGATE msgpack_object_agg(text, anyelement) IS
+'Aggregate key/value pairs into a MessagePack object (json_object_agg-style)';
+
+-- CBOR builder API
+
+CREATE OR REPLACE FUNCTION cbor_from_jsonb(jsonb)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'cbor_from_jsonb'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION cbor_from_jsonb(jsonb) IS
+'Convert jsonb value (including nested objects/arrays) to CBOR';
+
+CREATE OR REPLACE FUNCTION cbor_build_object(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'cbor_build_object'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION cbor_build_object(VARIADIC "any") IS
+'Build a CBOR object from key/value pairs (json_build_object-style)';
+
+CREATE OR REPLACE FUNCTION cbor_build_array(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'cbor_build_array'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION cbor_build_array(VARIADIC "any") IS
+'Build a CBOR array from variadic values (json_build_array-style)';
+
+CREATE OR REPLACE FUNCTION cbor_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'cbor_agg_final'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION cbor_object_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'cbor_object_agg_final'
+LANGUAGE C;
+
+CREATE AGGREGATE cbor_agg(anyelement)
+(
+    SFUNC = jsonb_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = cbor_agg_final
+);
+
+COMMENT ON AGGREGATE cbor_agg(anyelement) IS
+'Aggregate values into a CBOR array (json_agg-style)';
+
+CREATE AGGREGATE cbor_object_agg(text, anyelement)
+(
+    SFUNC = jsonb_object_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = cbor_object_agg_final
+);
+
+COMMENT ON AGGREGATE cbor_object_agg(text, anyelement) IS
+'Aggregate key/value pairs into a CBOR object (json_object_agg-style)';
+
+-- ZERA builder API
+
+CREATE OR REPLACE FUNCTION zera_from_jsonb(jsonb)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'zera_from_jsonb'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION zera_from_jsonb(jsonb) IS
+'Convert jsonb value (including nested objects/arrays) to ZERA';
+
+CREATE OR REPLACE FUNCTION zera_build_object(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'zera_build_object'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION zera_build_object(VARIADIC "any") IS
+'Build a ZERA object from key/value pairs (json_build_object-style)';
+
+CREATE OR REPLACE FUNCTION zera_build_array(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'zera_build_array'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION zera_build_array(VARIADIC "any") IS
+'Build a ZERA array from variadic values (json_build_array-style)';
+
+CREATE OR REPLACE FUNCTION zera_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'zera_agg_final'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION zera_object_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'zera_object_agg_final'
+LANGUAGE C;
+
+CREATE AGGREGATE zera_agg(anyelement)
+(
+    SFUNC = jsonb_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = zera_agg_final
+);
+
+COMMENT ON AGGREGATE zera_agg(anyelement) IS
+'Aggregate values into a ZERA array (json_agg-style)';
+
+CREATE AGGREGATE zera_object_agg(text, anyelement)
+(
+    SFUNC = jsonb_object_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = zera_object_agg_final
+);
+
+COMMENT ON AGGREGATE zera_object_agg(text, anyelement) IS
+'Aggregate key/value pairs into a ZERA object (json_object_agg-style)';
+
+-- FlexBuffers builder API
+
+CREATE OR REPLACE FUNCTION flexbuffers_from_jsonb(jsonb)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'flexbuffers_from_jsonb'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION flexbuffers_from_jsonb(jsonb) IS
+'Convert jsonb value (including nested objects/arrays) to FlexBuffers';
+
+CREATE OR REPLACE FUNCTION flexbuffers_build_object(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'flexbuffers_build_object'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION flexbuffers_build_object(VARIADIC "any") IS
+'Build a FlexBuffers object from key/value pairs (json_build_object-style)';
+
+CREATE OR REPLACE FUNCTION flexbuffers_build_array(VARIADIC "any")
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'flexbuffers_build_array'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION flexbuffers_build_array(VARIADIC "any") IS
+'Build a FlexBuffers array from variadic values (json_build_array-style)';
+
+CREATE OR REPLACE FUNCTION flexbuffers_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'flexbuffers_agg_final'
+LANGUAGE C;
+
+CREATE OR REPLACE FUNCTION flexbuffers_object_agg_final(internal)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'flexbuffers_object_agg_final'
+LANGUAGE C;
+
+CREATE AGGREGATE flexbuffers_agg(anyelement)
+(
+    SFUNC = jsonb_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = flexbuffers_agg_final
+);
+
+COMMENT ON AGGREGATE flexbuffers_agg(anyelement) IS
+'Aggregate values into a FlexBuffers array (json_agg-style)';
+
+CREATE AGGREGATE flexbuffers_object_agg(text, anyelement)
+(
+    SFUNC = jsonb_object_agg_transfn,
+    STYPE = internal,
+    FINALFUNC = flexbuffers_object_agg_final
+);
+
+COMMENT ON AGGREGATE flexbuffers_object_agg(text, anyelement) IS
+'Aggregate key/value pairs into a FlexBuffers object (json_object_agg-style)';
+
+-- Function to convert a row to CBOR format
+CREATE OR REPLACE FUNCTION row_to_cbor(record)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'row_to_cbor'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION row_to_cbor(record) IS
+'Convert a PostgreSQL row/record to CBOR binary format';
+
+-- Function to convert a row to ZERA format
+CREATE OR REPLACE FUNCTION row_to_zera(record)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'row_to_zera'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION row_to_zera(record) IS
+'Convert a PostgreSQL row/record to ZERA binary format (zerialize native protocol)';
+
+-- Batch processing functions (multiple rows at once for better performance)
+
+-- Function to convert an array of rows to FlexBuffers format
+CREATE OR REPLACE FUNCTION rows_to_flexbuffers(anyarray)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'rows_to_flexbuffers'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION rows_to_flexbuffers(anyarray) IS
+'Convert an array of PostgreSQL rows/records to FlexBuffers binary format (batch processing)';
+
+-- Function to convert an array of rows to MessagePack format
+CREATE OR REPLACE FUNCTION rows_to_msgpack(anyarray)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'rows_to_msgpack'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION rows_to_msgpack(anyarray) IS
+'Convert an array of PostgreSQL rows/records to MessagePack binary format (batch processing)';
+
+-- Test helper: force generic (slow) MessagePack batch path for parity validation
+CREATE OR REPLACE FUNCTION rows_to_msgpack_slow(anyarray)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'rows_to_msgpack_slow'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION rows_to_msgpack_slow(anyarray) IS
+'Convert an array of PostgreSQL rows/records to MessagePack using generic slow path (test/parity helper)';
+
+-- Function to convert an array of rows to CBOR format
+CREATE OR REPLACE FUNCTION rows_to_cbor(anyarray)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'rows_to_cbor'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION rows_to_cbor(anyarray) IS
+'Convert an array of PostgreSQL rows/records to CBOR binary format (batch processing)';
+
+-- Function to convert an array of rows to ZERA format
+CREATE OR REPLACE FUNCTION rows_to_zera(anyarray)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'rows_to_zera'
+LANGUAGE C STABLE STRICT;
+
+COMMENT ON FUNCTION rows_to_zera(anyarray) IS
+'Convert an array of PostgreSQL rows/records to ZERA binary format (batch processing)';
+
+-- Decode-to-composite API: the reverse of row_to_X, decoding a binary
+-- document directly into a typed composite value. Mirrors
+-- jsonb_populate_record's anyelement/base-row polymorphism: columns missing
+-- from the document keep base's value, and base can be NULL::sometype to
+-- select the target type without supplying default values.
+
+CREATE OR REPLACE FUNCTION msgpack_populate_record(base anyelement, data bytea)
+RETURNS anyelement
+AS 'MODULE_PATHNAME', 'msgpack_populate_record'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION msgpack_populate_record(anyelement, bytea) IS
+'Decode a MessagePack document into a typed composite, using base for columns the document omits';
+
+CREATE OR REPLACE FUNCTION cbor_populate_record(base anyelement, data bytea)
+RETURNS anyelement
+AS 'MODULE_PATHNAME', 'cbor_populate_record'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION cbor_populate_record(anyelement, bytea) IS
+'Decode a CBOR document into a typed composite, using base for columns the document omits';
+
+CREATE OR REPLACE FUNCTION zera_populate_record(base anyelement, data bytea)
+RETURNS anyelement
+AS 'MODULE_PATHNAME', 'zera_populate_record'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION zera_populate_record(anyelement, bytea) IS
+'Decode a ZERA document into a typed composite, using base for columns the document omits';
+
+CREATE OR REPLACE FUNCTION flexbuffers_populate_record(base anyelement, data bytea)
+RETURNS anyelement
+AS 'MODULE_PATHNAME', 'flexbuffers_populate_record'
+LANGUAGE C STABLE;
+
+COMMENT ON FUNCTION flexbuffers_populate_record(anyelement, bytea) IS
+'Decode a FlexBuffer document into a typed composite, using base for columns the document omits';
