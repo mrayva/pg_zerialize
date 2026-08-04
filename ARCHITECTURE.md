@@ -71,6 +71,17 @@ guarding, though PostgreSQL composite types cannot actually embed themselves
 schema with an unsupported column (recursively) fails the check and the whole
 value falls back to the dynamic tree before any output is written.
 
+Array columns are declared with a fixed element type but no fixed
+dimensionality — any array-typed column can hold an N-dimensional value at
+runtime — so multidimensional arrays are handled per-value rather than
+gated by the schema cache. All four protocols write these directly too: a
+recursive per-dimension writer walks `ARR_DIMS` and the flat
+`deconstruct_array` output emitting nested `begin_array`/`end_array` pairs,
+reusing the same per-element-kind writer (and its composite recursion) the
+one-dimensional path uses at the innermost level. An array whose element
+kind has no direct writer still falls back to the dynamic tree, same as the
+one-dimensional case.
+
 ## Dynamic Path
 
 The generic path performs this conversion:
