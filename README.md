@@ -1,8 +1,8 @@
 # pg_zerialize
 
 PostgreSQL extension for serializing rows and batches of rows to MessagePack,
-CBOR, ZERA, and FlexBuffers. MessagePack also includes SQL builders and
-aggregates for constructing nested binary values.
+CBOR, ZERA, and FlexBuffers. Each protocol also includes SQL builders and
+aggregates for constructing nested binary values from scratch.
 
 ## Support
 
@@ -73,7 +73,9 @@ one-dimensional array of composite records and preserve null records.
 Named composite columns are recursively represented as nested protocol maps.
 This applies to row and batch serialization for all four protocols.
 
-MessagePack also provides JSON-style builders and aggregates:
+All four protocols provide JSON-style builders and aggregates
+(`msgpack_*`/`cbor_*`/`zera_*`/`flexbuffers_*`), for composing a document from
+scratch rather than serializing an existing composite row:
 
 ```sql
 SELECT msgpack_from_jsonb(
@@ -98,11 +100,19 @@ SELECT msgpack_to_jsonb(msgpack_build_object('id', 7, 'active', true));
 SELECT flexbuffers_to_jsonb(row_to_flexbuffers(users.*)) FROM users;
 SELECT cbor_to_jsonb(row_to_cbor(users.*)) FROM users;
 SELECT zera_to_jsonb(row_to_zera(users.*)) FROM users;
+
+-- Same builder API for CBOR, ZERA, and FlexBuffers:
+SELECT cbor_build_object('id', 7, 'active', true);
+SELECT zera_build_array(1, 'two', NULL, 3.5::numeric);
+SELECT flexbuffers_agg(value ORDER BY id) FROM items;
+SELECT cbor_object_agg(key, value ORDER BY key) FROM items;
+SELECT zera_from_jsonb(jsonb_build_object('id', 7, 'active', true));
 ```
 
-Passing a builder's `bytea` result into another builder encodes that result as a
-binary blob. Use one JSONB tree with `msgpack_from_jsonb` when values must be
-spliced into one nested MessagePack document.
+Passing a builder's `bytea` result into another builder of the same protocol
+encodes that result as a binary blob. Use one JSONB tree with
+`msgpack_from_jsonb`/`cbor_from_jsonb`/`zera_from_jsonb`/`flexbuffers_from_jsonb`
+when values must be spliced into one nested document instead.
 
 ## Wire Semantics
 

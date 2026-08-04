@@ -32,8 +32,11 @@ one protocol array:
 - `rows_to_zera`
 - `rows_to_flexbuffers`
 
-MessagePack additionally exposes JSONB conversion, variadic builders, and
-aggregates. Their SQL definitions are versioned in `pg_zerialize--1.2.sql`.
+All four protocols additionally expose JSONB conversion, variadic builders,
+and aggregates (`X_to_jsonb`, `X_from_jsonb`, `X_build_object`,
+`X_build_array`, `X_agg`, `X_object_agg`). MessagePack's were introduced in
+`pg_zerialize--1.2.sql`; CBOR/ZERA/FlexBuffers' were added in
+`pg_zerialize--1.7.sql`, mirroring the same design.
 
 ## Schema Cache
 
@@ -109,8 +112,15 @@ for rows.
 ## Nested JSONB
 
 Row-level `jsonb` remains an opaque PostgreSQL binary payload for compatibility.
-`msgpack_from_jsonb` is a separate semantic API that recursively maps JSONB
-objects, arrays, scalars, and nulls into MessagePack.
+`X_from_jsonb` is a separate semantic API that recursively maps JSONB objects,
+arrays, scalars, and nulls into the target protocol. The JSONB-to-`dyn::Value`
+walk (`jsonb_to_dynamic`) is protocol-agnostic; only the final
+`z::serialize<Protocol>` call differs, so `msgpack_from_jsonb`,
+`cbor_from_jsonb`, `zera_from_jsonb`, and `flexbuffers_from_jsonb` share one
+implementation via `dynamic_to_binary<Protocol>`. The builder
+(`X_build_object`/`X_build_array`) and aggregate (`X_agg`/`X_object_agg`)
+functions follow the same pattern: build or reuse a `dyn::Value` tree, then
+call `dynamic_to_binary<Protocol>` once at the end.
 
 `msgpack_to_jsonb` validates one complete MessagePack value before invoking the
 vendored reader, then recursively maps it to JSONB. MessagePack binary values

@@ -111,6 +111,21 @@ extern "C" {
     Datum msgpack_object_agg_final(PG_FUNCTION_ARGS);
     Datum row_to_cbor(PG_FUNCTION_ARGS);
     Datum row_to_zera(PG_FUNCTION_ARGS);
+    Datum cbor_from_jsonb(PG_FUNCTION_ARGS);
+    Datum cbor_build_object(PG_FUNCTION_ARGS);
+    Datum cbor_build_array(PG_FUNCTION_ARGS);
+    Datum cbor_agg_final(PG_FUNCTION_ARGS);
+    Datum cbor_object_agg_final(PG_FUNCTION_ARGS);
+    Datum zera_from_jsonb(PG_FUNCTION_ARGS);
+    Datum zera_build_object(PG_FUNCTION_ARGS);
+    Datum zera_build_array(PG_FUNCTION_ARGS);
+    Datum zera_agg_final(PG_FUNCTION_ARGS);
+    Datum zera_object_agg_final(PG_FUNCTION_ARGS);
+    Datum flexbuffers_from_jsonb(PG_FUNCTION_ARGS);
+    Datum flexbuffers_build_object(PG_FUNCTION_ARGS);
+    Datum flexbuffers_build_array(PG_FUNCTION_ARGS);
+    Datum flexbuffers_agg_final(PG_FUNCTION_ARGS);
+    Datum flexbuffers_object_agg_final(PG_FUNCTION_ARGS);
 
     // Batch processing functions
     Datum rows_to_flexbuffers(PG_FUNCTION_ARGS);
@@ -133,6 +148,21 @@ extern "C" {
     PG_FUNCTION_INFO_V1(msgpack_object_agg_final);
     PG_FUNCTION_INFO_V1(row_to_cbor);
     PG_FUNCTION_INFO_V1(row_to_zera);
+    PG_FUNCTION_INFO_V1(cbor_from_jsonb);
+    PG_FUNCTION_INFO_V1(cbor_build_object);
+    PG_FUNCTION_INFO_V1(cbor_build_array);
+    PG_FUNCTION_INFO_V1(cbor_agg_final);
+    PG_FUNCTION_INFO_V1(cbor_object_agg_final);
+    PG_FUNCTION_INFO_V1(zera_from_jsonb);
+    PG_FUNCTION_INFO_V1(zera_build_object);
+    PG_FUNCTION_INFO_V1(zera_build_array);
+    PG_FUNCTION_INFO_V1(zera_agg_final);
+    PG_FUNCTION_INFO_V1(zera_object_agg_final);
+    PG_FUNCTION_INFO_V1(flexbuffers_from_jsonb);
+    PG_FUNCTION_INFO_V1(flexbuffers_build_object);
+    PG_FUNCTION_INFO_V1(flexbuffers_build_array);
+    PG_FUNCTION_INFO_V1(flexbuffers_agg_final);
+    PG_FUNCTION_INFO_V1(flexbuffers_object_agg_final);
 
     PG_FUNCTION_INFO_V1(rows_to_flexbuffers);
     PG_FUNCTION_INFO_V1(rows_to_msgpack);
@@ -4493,10 +4523,11 @@ static bytea* tuple_to_binary_slow(HeapTupleHeader rec)
     return nullptr;
 }
 
-static bytea* dynamic_to_msgpack_binary(const z::dyn::Value& v)
+template<typename Protocol>
+static bytea* dynamic_to_binary(const z::dyn::Value& v)
 {
     try {
-        z::ZBuffer buffer = z::serialize<z::MsgPack>(v);
+        z::ZBuffer buffer = z::serialize<Protocol>(v);
         std::span<const uint8_t> data = buffer.buf();
         size_t len = data.size();
         bytea* result = (bytea*) palloc(len + VARHDRSZ);
@@ -4506,14 +4537,19 @@ static bytea* dynamic_to_msgpack_binary(const z::dyn::Value& v)
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("msgpack serialization failed"),
+                 errmsg("%s serialization failed", Protocol::Name),
                  errdetail("%s", ex.what())));
     } catch (...) {
         ereport(ERROR,
                 (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg("msgpack serialization failed with unknown exception")));
+                 errmsg("%s serialization failed with unknown exception", Protocol::Name)));
     }
     return nullptr;
+}
+
+static inline bytea* dynamic_to_msgpack_binary(const z::dyn::Value& v)
+{
+    return dynamic_to_binary<z::MsgPack>(v);
 }
 
 /*
@@ -5069,6 +5105,366 @@ msgpack_object_agg_final(PG_FUNCTION_ARGS)
     Jsonb* jb = DatumGetJsonbP(agg);
     z::dyn::Value v = jsonb_to_dynamic(jb);
     bytea* result = dynamic_to_msgpack_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * CBOR builder API - mirrors the msgpack_* builder family above.
+ */
+
+/*
+ * cbor_from_jsonb - Convert nested jsonb to nested CBOR.
+ */
+extern "C" Datum
+cbor_from_jsonb(PG_FUNCTION_ARGS)
+{
+    Jsonb* jb = PG_GETARG_JSONB_P(0);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::CBOR>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * cbor_build_object - Build a CBOR object from variadic key/value args.
+ * Mirrors json_build_object semantics at SQL layer.
+ */
+extern "C" Datum
+cbor_build_object(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    if ((nargs % 2) != 0) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("cbor_build_object requires an even number of arguments")));
+    }
+
+    z::dyn::Value::Map entries;
+    entries.reserve(static_cast<size_t>(nargs / 2));
+
+    for (int i = 0; i < nargs; i += 2) {
+        if (PG_ARGISNULL(i)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("cbor_build_object key must not be null")));
+        }
+
+        Oid key_typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(key_typid)) {
+            key_typid = TEXTOID;
+        }
+        std::string key = datum_to_string_output(PG_GETARG_DATUM(i), key_typid);
+
+        Oid val_typid = get_fn_expr_argtype(fcinfo->flinfo, i + 1);
+        if (!OidIsValid(val_typid)) {
+            val_typid = TEXTOID;
+        }
+        Datum val = (i + 1 < nargs && !PG_ARGISNULL(i + 1)) ? PG_GETARG_DATUM(i + 1) : (Datum) 0;
+        entries.emplace_back(std::move(key), datum_to_dynamic(val, val_typid, PG_ARGISNULL(i + 1)));
+    }
+
+    bytea* result = dynamic_to_binary<z::CBOR>(z::dyn::Value::map(std::move(entries)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * cbor_build_array - Build a CBOR array from variadic arguments.
+ * Mirrors json_build_array semantics at SQL layer.
+ */
+extern "C" Datum
+cbor_build_array(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    z::dyn::Value::Array arr;
+    arr.reserve(static_cast<size_t>(nargs));
+
+    for (int i = 0; i < nargs; i++) {
+        Oid typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(typid)) {
+            typid = TEXTOID;
+        }
+        Datum val = (!PG_ARGISNULL(i)) ? PG_GETARG_DATUM(i) : (Datum) 0;
+        arr.push_back(datum_to_dynamic(val, typid, PG_ARGISNULL(i)));
+    }
+
+    bytea* result = dynamic_to_binary<z::CBOR>(z::dyn::Value::array(std::move(arr)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * cbor_agg_final - Finalize jsonb_agg state and convert to CBOR.
+ */
+extern "C" Datum
+cbor_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::CBOR>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * cbor_object_agg_final - Finalize jsonb_object_agg state and convert.
+ */
+extern "C" Datum
+cbor_object_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_object_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::CBOR>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * ZERA builder API - mirrors the msgpack_* builder family above.
+ */
+
+/*
+ * zera_from_jsonb - Convert nested jsonb to nested ZERA.
+ */
+extern "C" Datum
+zera_from_jsonb(PG_FUNCTION_ARGS)
+{
+    Jsonb* jb = PG_GETARG_JSONB_P(0);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::Zera>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * zera_build_object - Build a ZERA object from variadic key/value args.
+ * Mirrors json_build_object semantics at SQL layer.
+ */
+extern "C" Datum
+zera_build_object(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    if ((nargs % 2) != 0) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("zera_build_object requires an even number of arguments")));
+    }
+
+    z::dyn::Value::Map entries;
+    entries.reserve(static_cast<size_t>(nargs / 2));
+
+    for (int i = 0; i < nargs; i += 2) {
+        if (PG_ARGISNULL(i)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("zera_build_object key must not be null")));
+        }
+
+        Oid key_typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(key_typid)) {
+            key_typid = TEXTOID;
+        }
+        std::string key = datum_to_string_output(PG_GETARG_DATUM(i), key_typid);
+
+        Oid val_typid = get_fn_expr_argtype(fcinfo->flinfo, i + 1);
+        if (!OidIsValid(val_typid)) {
+            val_typid = TEXTOID;
+        }
+        Datum val = (i + 1 < nargs && !PG_ARGISNULL(i + 1)) ? PG_GETARG_DATUM(i + 1) : (Datum) 0;
+        entries.emplace_back(std::move(key), datum_to_dynamic(val, val_typid, PG_ARGISNULL(i + 1)));
+    }
+
+    bytea* result = dynamic_to_binary<z::Zera>(z::dyn::Value::map(std::move(entries)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * zera_build_array - Build a ZERA array from variadic arguments.
+ * Mirrors json_build_array semantics at SQL layer.
+ */
+extern "C" Datum
+zera_build_array(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    z::dyn::Value::Array arr;
+    arr.reserve(static_cast<size_t>(nargs));
+
+    for (int i = 0; i < nargs; i++) {
+        Oid typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(typid)) {
+            typid = TEXTOID;
+        }
+        Datum val = (!PG_ARGISNULL(i)) ? PG_GETARG_DATUM(i) : (Datum) 0;
+        arr.push_back(datum_to_dynamic(val, typid, PG_ARGISNULL(i)));
+    }
+
+    bytea* result = dynamic_to_binary<z::Zera>(z::dyn::Value::array(std::move(arr)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * zera_agg_final - Finalize jsonb_agg state and convert to ZERA.
+ */
+extern "C" Datum
+zera_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::Zera>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * zera_object_agg_final - Finalize jsonb_object_agg state and convert.
+ */
+extern "C" Datum
+zera_object_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_object_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::Zera>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * FlexBuffers builder API - mirrors the msgpack_* builder family above.
+ */
+
+/*
+ * flexbuffers_from_jsonb - Convert nested jsonb to nested FlexBuffers.
+ */
+extern "C" Datum
+flexbuffers_from_jsonb(PG_FUNCTION_ARGS)
+{
+    Jsonb* jb = PG_GETARG_JSONB_P(0);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::Flex>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * flexbuffers_build_object - Build a FlexBuffers object from variadic key/value args.
+ * Mirrors json_build_object semantics at SQL layer.
+ */
+extern "C" Datum
+flexbuffers_build_object(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    if ((nargs % 2) != 0) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("flexbuffers_build_object requires an even number of arguments")));
+    }
+
+    z::dyn::Value::Map entries;
+    entries.reserve(static_cast<size_t>(nargs / 2));
+
+    for (int i = 0; i < nargs; i += 2) {
+        if (PG_ARGISNULL(i)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("flexbuffers_build_object key must not be null")));
+        }
+
+        Oid key_typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(key_typid)) {
+            key_typid = TEXTOID;
+        }
+        std::string key = datum_to_string_output(PG_GETARG_DATUM(i), key_typid);
+
+        Oid val_typid = get_fn_expr_argtype(fcinfo->flinfo, i + 1);
+        if (!OidIsValid(val_typid)) {
+            val_typid = TEXTOID;
+        }
+        Datum val = (i + 1 < nargs && !PG_ARGISNULL(i + 1)) ? PG_GETARG_DATUM(i + 1) : (Datum) 0;
+        entries.emplace_back(std::move(key), datum_to_dynamic(val, val_typid, PG_ARGISNULL(i + 1)));
+    }
+
+    bytea* result = dynamic_to_binary<z::Flex>(z::dyn::Value::map(std::move(entries)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * flexbuffers_build_array - Build a FlexBuffers array from variadic arguments.
+ * Mirrors json_build_array semantics at SQL layer.
+ */
+extern "C" Datum
+flexbuffers_build_array(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    z::dyn::Value::Array arr;
+    arr.reserve(static_cast<size_t>(nargs));
+
+    for (int i = 0; i < nargs; i++) {
+        Oid typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(typid)) {
+            typid = TEXTOID;
+        }
+        Datum val = (!PG_ARGISNULL(i)) ? PG_GETARG_DATUM(i) : (Datum) 0;
+        arr.push_back(datum_to_dynamic(val, typid, PG_ARGISNULL(i)));
+    }
+
+    bytea* result = dynamic_to_binary<z::Flex>(z::dyn::Value::array(std::move(arr)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * flexbuffers_agg_final - Finalize jsonb_agg state and convert to FlexBuffers.
+ */
+extern "C" Datum
+flexbuffers_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::Flex>(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * flexbuffers_object_agg_final - Finalize jsonb_object_agg state and convert.
+ */
+extern "C" Datum
+flexbuffers_object_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_object_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_binary<z::Flex>(v);
     PG_RETURN_BYTEA_P(result);
 }
 
