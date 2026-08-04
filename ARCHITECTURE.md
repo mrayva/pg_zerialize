@@ -38,6 +38,11 @@ and aggregates (`X_to_jsonb`, `X_from_jsonb`, `X_build_object`,
 `pg_zerialize--1.2.sql`; CBOR/ZERA/FlexBuffers' were added in
 `pg_zerialize--1.7.sql`, mirroring the same design.
 
+`X_populate_record(base anyelement, data bytea)`, added in
+`pg_zerialize--1.8.sql`, is the reverse of `row_to_X`: it decodes a binary
+document directly into a typed composite, following `jsonb_populate_record`'s
+own anyelement/base-row polymorphism. See "Composite Decode Path" below.
+
 ## Schema Cache
 
 Each PostgreSQL backend maintains schema metadata keyed by composite type OID
@@ -148,6 +153,54 @@ containers but rejects semantic tags because their JSONB mapping is ambiguous.
 `zera_to_jsonb` validates the v1 header, zero padding, envelope graph, arena
 spans, map metadata, and U8 blob shapes. Active-reference tracking rejects
 cycles before recursive decoding.
+
+## Composite Decode Path
+
+`X_populate_record` reuses each protocol's existing, already-validated
+`X_to_jsonb` decode logic rather than parsing the wire format a second time:
+its decode-to-JSON-text core (`msgpack_decode_to_json_text`,
+`cbor_decode_to_json_text`, `zera_decode_to_json_text`,
+`flex_decode_to_json_text`) is the same code `X_to_jsonb` calls, split out so
+both entry points share one parsing/validation path per protocol. The
+resulting `Jsonb*` is then walked by one protocol-agnostic function,
+`populate_composite_from_jsonb_container`, using the same
+`CachedSchema`/`CachedColumn` metadata the encode side builds.
+
+For each column, the walk looks up the matching JSONB object key
+(`getKeyJsonValueFromContainer`) and dispatches on `CachedColumn::kind`:
+composite columns recurse into a nested `populate_composite_from_jsonb_container`
+call; array columns walk dimensions recursively (`jsonb_array_dim_collect`,
+mirroring the encode side's dimension walker in reverse) and reassemble via
+`construct_md_array`; everything else goes through
+`jsonb_value_to_scalar_datum`. A key missing from the document leaves that
+column's slot untouched, which is prefilled from `base` via
+`heap_deform_tuple` (or left NULL when there is no `base` row) before the
+walk starts — this is what produces `jsonb_populate_record`-style partial
+updates. A key present with a JSON `null` clears the column explicitly.
+
+`jsonb_value_to_scalar_datum` mirrors the encode side's per-type wire
+conventions in reverse, gated on the target column's type so a coincidental
+JSON shape in an unrelated column is never misread as one of these
+conventions:
+
+- `bytea` and row-level `jsonb`: reconstructed directly from the `["~b", "<base64>", "base64"]`
+  tag with one palloc+memcpy (the reverse of `datum_bytea_span`/`datum_jsonb_span`),
+  no `byteain`/`jsonb_in` text round trip.
+- `date`/`timestamp`/`timestamptz`: every write path encodes these as a raw
+  PG-internal epoch integer, not text (see Type Semantics above), so a
+  JSON-number value for one of these columns is reconstructed directly via
+  `DateADTGetDatum`/`TimestampGetDatum`/`TimestampTzGetDatum` rather than
+  routed through `date_in`/`timestamp_in`, which expect human-readable text.
+  A hand-built document that supplies a text date for these columns still
+  works, since a JSON-string value always falls through to the generic path
+  below.
+- `numeric` in `tagged_decimal` mode: the `["~n", "<canonical text>", "decimal"]`
+  tag's payload is already `numeric_out`-formatted text, so it is handed
+  straight to `numeric`'s input function.
+- Everything else: `getTypeInputInfo` + `OidInputFunctionCall` on the
+  column's own `typinput`, the same generic mechanism
+  `jsonb_populate_record` itself uses. This transparently enforces domain
+  `CHECK` constraints too, since a domain's `typinput` is `domain_in`.
 
 ## Numeric Conversion
 

@@ -114,6 +114,30 @@ encodes that result as a binary blob. Use one JSONB tree with
 `msgpack_from_jsonb`/`cbor_from_jsonb`/`zera_from_jsonb`/`flexbuffers_from_jsonb`
 when values must be spliced into one nested document instead.
 
+## Decoding Into Composite Rows
+
+`X_populate_record(base anyelement, data bytea)` is the reverse of `row_to_X`:
+it decodes a binary document straight into a typed composite, for all four
+protocols. It follows `jsonb_populate_record`'s own anyelement/base-row
+polymorphism: columns the document omits keep `base`'s value, an explicit
+JSON null clears a column, and `base` can be `NULL::sometype` to select the
+result type without supplying defaults. `data = NULL` returns `base`
+unchanged (or an all-NULL composite of `base`'s type if `base` is also
+`NULL::sometype`).
+
+```sql
+CREATE TYPE employee AS (id int, name text, active boolean);
+
+SELECT msgpack_populate_record(NULL::employee, row_to_msgpack(ROW(1, 'Ada', true)::employee));
+SELECT cbor_populate_record(ROW(1, 'Ada', true)::employee, cbor_build_object('active', false));
+SELECT zera_populate_record(NULL::employee, zera_from_jsonb('{"id":2,"name":"Grace"}'::jsonb));
+```
+
+Nested composites, arrays of any dimension (including arrays of composites),
+and the `["~b", ...]`/`["~n", ...]` tagged values described below all decode
+back to their original PostgreSQL types; a domain column is validated through
+the domain's own input function, so `CHECK` constraints are enforced.
+
 ## Wire Semantics
 
 - `int2`, `int4`, and `int8` are protocol integers.
@@ -179,8 +203,8 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 ## Current Limitations
 
-- Deserialization currently targets JSONB and is available for all four binary
-  protocols.
+- Deserialization targets JSONB (`X_to_jsonb`) and typed composites
+  (`X_populate_record`), for all four binary protocols.
 - Exact decimals use an opt-in tagged-array convention rather than a native
   protocol scalar, so non-pg_zerialize consumers must interpret that tag.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON

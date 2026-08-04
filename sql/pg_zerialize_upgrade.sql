@@ -61,4 +61,17 @@ SELECT zera_to_jsonb(zera_from_jsonb('{"upgrade":true}'::jsonb)) =
 SELECT flexbuffers_to_jsonb(flexbuffers_from_jsonb('{"upgrade":true}'::jsonb)) =
        '{"upgrade":true}'::jsonb AS flex_builder_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.8';
+SELECT extversion = '1.8' AS upgraded_to_1_8
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('msgpack_populate_record(anyelement,bytea)') IS NOT NULL AS msgpack_populate_record_present,
+       to_regprocedure('cbor_populate_record(anyelement,bytea)') IS NOT NULL AS cbor_populate_record_present,
+       to_regprocedure('zera_populate_record(anyelement,bytea)') IS NOT NULL AS zera_populate_record_present,
+       to_regprocedure('flexbuffers_populate_record(anyelement,bytea)') IS NOT NULL AS flex_populate_record_present;
+CREATE TYPE pg_temp.upgrade_row AS (f1 int, f2 text);
+SELECT msgpack_populate_record(NULL::pg_temp.upgrade_row, row_to_msgpack(ROW(1, 'upgrade-ok')::pg_temp.upgrade_row)) =
+       ROW(1, 'upgrade-ok')::pg_temp.upgrade_row AS populate_record_works;
+DROP TYPE pg_temp.upgrade_row;
+
 DROP EXTENSION pg_zerialize;
