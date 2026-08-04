@@ -8,8 +8,8 @@ MessagePack, CBOR, ZERA, or FlexBuffers documents.
 
 The extension has two serialization paths:
 
-1. Protocol-specific direct writers for supported schemas; MessagePack also
-   writes nested composites and composite arrays recursively.
+1. Protocol-specific direct writers for supported schemas, recursing into
+   nested composites and composite arrays.
 2. A generic `zerialize::dyn::Value` tree for unsupported recursive and
    fallback cases.
 
@@ -58,11 +58,15 @@ protocol-specific writers. This avoids building an intermediate dynamic tree.
 MessagePack additionally reuses a backend-local output buffer and directly
 encodes canonical headers and scalar values.
 
-MessagePack recursively applies cached writer plans to composite columns and
-one-dimensional composite arrays. A recursive capability check runs only for
-schemas containing those columns; unsupported descendants fall back before any
-output is written. Other protocols continue to use recursive dynamic
-conversion for nested composites.
+All four protocols recursively apply cached writer plans to composite columns
+and one-dimensional composite arrays: writing a composite value calls the same
+protocol writer against that value's own cached schema, to any nesting depth.
+A recursive capability check (one per protocol, since each protocol tracks its
+own `*_fast_supported` flag) walks the composite type graph — with cycle
+guarding, though PostgreSQL composite types cannot actually embed themselves
+— and runs only for schemas containing composite-typed columns; a descendant
+schema with an unsupported column (recursively) fails the check and the whole
+value falls back to the dynamic tree before any output is written.
 
 ## Dynamic Path
 

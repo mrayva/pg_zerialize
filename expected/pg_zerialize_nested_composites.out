@@ -67,6 +67,57 @@ FROM pgz_nested_values;
  t                    | t                 | t                 | t
 (1 row)
 
+-- CBOR/ZERA/Flex now recurse through their own cached writer plans for
+-- composite columns and composite arrays too (previously only MessagePack
+-- did; the others fell back to the generic dynamic tree for any schema with
+-- a composite-typed column). Cross-check their recursive fast-path output
+-- against MessagePack's, decoded through each protocol's own JSONB decoder,
+-- since only MessagePack exposes a _slow() helper for direct byte parity.
+SELECT (cbor_to_jsonb(row_to_cbor(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS cbor_nested_matches_msgpack,
+       (zera_to_jsonb(row_to_zera(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS zera_nested_matches_msgpack,
+       (flexbuffers_to_jsonb(row_to_flexbuffers(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS flex_nested_matches_msgpack
+FROM pgz_nested_values;
+ cbor_nested_matches_msgpack | zera_nested_matches_msgpack | flex_nested_matches_msgpack 
+-----------------------------+-----------------------------+-----------------------------
+ t                           | t                           | t
+(1 row)
+
+SELECT (cbor_to_jsonb(rows_to_cbor(ARRAY[value, NULL::pg_temp.pgz_nested_customer]))
+        = msgpack_to_jsonb(rows_to_msgpack(ARRAY[value, NULL::pg_temp.pgz_nested_customer]))) AS cbor_batch_matches_msgpack,
+       (zera_to_jsonb(rows_to_zera(ARRAY[value, NULL::pg_temp.pgz_nested_customer]))
+        = msgpack_to_jsonb(rows_to_msgpack(ARRAY[value, NULL::pg_temp.pgz_nested_customer]))) AS zera_batch_matches_msgpack,
+       (flexbuffers_to_jsonb(rows_to_flexbuffers(ARRAY[value, NULL::pg_temp.pgz_nested_customer]))
+        = msgpack_to_jsonb(rows_to_msgpack(ARRAY[value, NULL::pg_temp.pgz_nested_customer]))) AS flex_batch_matches_msgpack
+FROM pgz_nested_values;
+ cbor_batch_matches_msgpack | zera_batch_matches_msgpack | flex_batch_matches_msgpack 
+----------------------------+----------------------------+----------------------------
+ t                          | t                          | t
+(1 row)
+
+-- A composite column whose own nested type contains an unsupported column
+-- (point has no protocol writer) cannot use any protocol's recursive fast
+-- path; every protocol must fall back to the generic dynamic tree rather
+-- than erroring.
+CREATE TYPE pg_temp.pgz_nested_unsupported_inner AS (id integer, location point);
+CREATE TYPE pg_temp.pgz_nested_unsupported_outer AS (
+    label text,
+    inner_value pg_temp.pgz_nested_unsupported_inner
+);
+SELECT (cbor_to_jsonb(row_to_cbor(v))
+        = msgpack_to_jsonb(row_to_msgpack(v))) AS cbor_fallback_matches_msgpack,
+       (zera_to_jsonb(row_to_zera(v))
+        = msgpack_to_jsonb(row_to_msgpack(v))) AS zera_fallback_matches_msgpack,
+       (flexbuffers_to_jsonb(row_to_flexbuffers(v))
+        = msgpack_to_jsonb(row_to_msgpack(v))) AS flex_fallback_matches_msgpack
+FROM (SELECT ROW(
+          'unsupported-nested',
+          ROW(1, '(1,2)'::point)::pg_temp.pgz_nested_unsupported_inner
+      )::pg_temp.pgz_nested_unsupported_outer AS v) s;
+ cbor_fallback_matches_msgpack | zera_fallback_matches_msgpack | flex_fallback_matches_msgpack 
+-------------------------------+-------------------------------+-------------------------------
+ t                             | t                             | t
+(1 row)
+
 -- Composite values supplied to SQL builders are nested maps, not text.
 SELECT msgpack_build_array(
            ROW('Rome', '00100', NULL)::pg_temp.pgz_nested_address

@@ -228,16 +228,20 @@ struct CachedSchema {
     const uint8_t* msgpack_map_header_ptr;
     size_t msgpack_map_header_len;
     bool use_deform_access;
-    bool msgpack_has_recursive_columns;
+    // Whether any column is a composite value or a one-dimensional array of
+    // composite values; gates the recursive schema-graph capability check in
+    // try_serialize_*_row_fast/try_serialize_*_array_fast. Protocol-independent:
+    // recursion support is the same regardless of wire format.
+    bool has_recursive_columns;
     bool msgpack_fast_supported;
     bool cbor_fast_supported;
     bool zera_fast_supported;
     bool flex_fast_supported;
 };
 
-static bool is_msgpack_fast_kind(ConverterKind kind);
-static bool is_msgpack_fast_array_element_kind(ConverterKind kind);
-static bool is_msgpack_fast_column(const CachedColumn& col);
+static bool is_fast_kind(ConverterKind kind);
+static bool is_fast_array_element_kind(ConverterKind kind);
+static bool is_fast_column(const CachedColumn& col);
 static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key);
 static std::vector<uint8_t> encode_msgpack_map_header(size_t n);
 static std::vector<uint8_t> encode_zera_key(std::string_view key);
@@ -427,7 +431,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
     CachedSchema schema;
     schema.tupdesc = cached_tupdesc;
     schema.use_deform_access = false;
-    schema.msgpack_has_recursive_columns = false;
+    schema.has_recursive_columns = false;
     schema.msgpack_fast_supported = true;
     schema.cbor_fast_supported = true;
     schema.zera_fast_supported = true;
@@ -477,20 +481,20 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
             }
         }
 
-        if (!is_msgpack_fast_column(col)) {
+        // All four protocols' fast writers accept the same column kinds
+        // (including Composite/Array-of-Composite, handled recursively via
+        // each protocol's own schema-graph capability check below), so a
+        // single is_fast_column() gate applies uniformly.
+        if (!is_fast_column(col)) {
             schema.msgpack_fast_supported = false;
+            schema.cbor_fast_supported = false;
+            schema.zera_fast_supported = false;
+            schema.flex_fast_supported = false;
         }
         if (col.kind == ConverterKind::Composite ||
             (col.kind == ConverterKind::Array &&
              col.array_element_kind == ConverterKind::Composite)) {
-            schema.msgpack_has_recursive_columns = true;
-        }
-        if (!is_msgpack_fast_column(col) || col.kind == ConverterKind::Composite ||
-            (col.kind == ConverterKind::Array &&
-             col.array_element_kind == ConverterKind::Composite)) {
-            schema.cbor_fast_supported = false;
-            schema.zera_fast_supported = false;
-            schema.flex_fast_supported = false;
+            schema.has_recursive_columns = true;
         }
 
         if (col.kind == ConverterKind::Fallback || col.kind == ConverterKind::Array) {
@@ -1892,7 +1896,7 @@ static z::dyn::Value datum_to_dynamic_cached(Datum value, bool isnull, const Cac
     return z::dyn::Value();
 }
 
-static bool is_msgpack_fast_kind(ConverterKind kind)
+static bool is_fast_kind(ConverterKind kind)
 {
     switch (kind) {
         case ConverterKind::Int2:
@@ -1924,7 +1928,7 @@ static bool is_msgpack_fast_kind(ConverterKind kind)
     }
 }
 
-static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
+static bool is_fast_array_element_kind(ConverterKind kind)
 {
     switch (kind) {
         case ConverterKind::Int2:
@@ -1956,13 +1960,13 @@ static bool is_msgpack_fast_array_element_kind(ConverterKind kind)
     }
 }
 
-static bool is_msgpack_fast_column(const CachedColumn& col)
+static bool is_fast_column(const CachedColumn& col)
 {
     if (col.kind != ConverterKind::Array) {
-        return is_msgpack_fast_kind(col.kind);
+        return is_fast_kind(col.kind);
     }
     return OidIsValid(col.array_element_typid) &&
-           is_msgpack_fast_array_element_kind(col.array_element_kind);
+           is_fast_array_element_kind(col.array_element_kind);
 }
 
 static std::vector<uint8_t> encode_msgpack_string_key(std::string_view key)
@@ -2952,7 +2956,7 @@ static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
     if (!schema.msgpack_fast_supported) {
         return nullptr;
     }
-    if (schema.msgpack_has_recursive_columns) {
+    if (schema.has_recursive_columns) {
         std::unordered_set<Oid> active_types{tupType};
         if (!msgpack_schema_recursive_supported(schema, active_types)) {
             return nullptr;
@@ -3007,7 +3011,7 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
         if (!schema.msgpack_fast_supported) {
             return nullptr;
         }
-        if (schema.msgpack_has_recursive_columns) {
+        if (schema.has_recursive_columns) {
             std::unordered_set<Oid> active_types{tupType};
             if (!msgpack_schema_recursive_supported(schema, active_types)) {
                 return nullptr;
@@ -3058,6 +3062,12 @@ static inline void cbor_write_text(z::cborjc::Serializer& writer, Datum value)
     int len = VARSIZE_ANY_EXHDR(txt);
     writer.string(std::string_view(ptr, static_cast<size_t>(len)));
 }
+
+static inline void cbor_write_record_map(
+    z::cborjc::Serializer& writer,
+    HeapTupleHeader rec,
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch);
 
 static inline void cbor_write_array_element(
     z::cborjc::Serializer& writer,
@@ -3139,6 +3149,15 @@ static inline void cbor_write_array_element(
         case ConverterKind::Bytea:
             writer.binary(datum_bytea_span(value));
             return;
+        case ConverterKind::Composite:
+        {
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+            const CachedSchema& schema = get_cached_schema(
+                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+            TupleDeformScratch scratch;
+            cbor_write_record_map(writer, rec, schema, &scratch);
+            return;
+        }
         default:
             break;
     }
@@ -3278,6 +3297,15 @@ static inline void cbor_write_scalar(
         case ConverterKind::Array:
             cbor_write_array(writer, col, value);
             return;
+        case ConverterKind::Composite:
+        {
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+            const CachedSchema& schema = get_cached_schema(
+                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+            TupleDeformScratch scratch;
+            cbor_write_record_map(writer, rec, schema, &scratch);
+            return;
+        }
         case ConverterKind::Fallback:
         {
             char* str = OidOutputFunctionCall(col.typoutput, value);
@@ -3326,6 +3354,33 @@ static inline void cbor_write_record_map(
     writer.end_map();
 }
 
+static bool cbor_schema_recursive_supported(
+    const CachedSchema& schema, std::unordered_set<Oid>& active_types)
+{
+    if (!schema.cbor_fast_supported) {
+        return false;
+    }
+    for (const CachedColumn& col : schema.columns) {
+        Oid nested_type = InvalidOid;
+        if (col.kind == ConverterKind::Composite) {
+            nested_type = col.typid;
+        } else if (col.kind == ConverterKind::Array &&
+                   col.array_element_kind == ConverterKind::Composite) {
+            nested_type = col.array_element_typid;
+        }
+        if (!OidIsValid(nested_type) || !active_types.insert(nested_type).second) {
+            continue;
+        }
+        const CachedSchema& nested = get_cached_schema(nested_type, -1);
+        const bool supported = cbor_schema_recursive_supported(nested, active_types);
+        active_types.erase(nested_type);
+        if (!supported) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec)
 {
     Oid tupType = HeapTupleHeaderGetTypeId(rec);
@@ -3334,6 +3389,12 @@ static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec)
 
     if (!schema.cbor_fast_supported) {
         return nullptr;
+    }
+    if (schema.has_recursive_columns) {
+        std::unordered_set<Oid> active_types{tupType};
+        if (!cbor_schema_recursive_supported(schema, active_types)) {
+            return nullptr;
+        }
     }
 
     try {
@@ -3386,6 +3447,12 @@ static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int ni
         if (!schema.cbor_fast_supported) {
             return nullptr;
         }
+        if (schema.has_recursive_columns) {
+            std::unordered_set<Oid> active_types{tupType};
+            if (!cbor_schema_recursive_supported(schema, active_types)) {
+                return nullptr;
+            }
+        }
         schemas.push_back(&schema);
     }
 
@@ -3433,6 +3500,12 @@ static inline void zera_write_text(z::zera::Serializer& writer, Datum value)
     int len = VARSIZE_ANY_EXHDR(txt);
     writer.string(std::string_view(ptr, static_cast<size_t>(len)));
 }
+
+static inline void zera_write_record_map(
+    z::zera::Serializer& writer,
+    HeapTupleHeader rec,
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch);
 
 static inline void zera_write_array_element(
     z::zera::Serializer& writer,
@@ -3514,6 +3587,15 @@ static inline void zera_write_array_element(
         case ConverterKind::Bytea:
             writer.binary(datum_bytea_span(value));
             return;
+        case ConverterKind::Composite:
+        {
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+            const CachedSchema& schema = get_cached_schema(
+                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+            TupleDeformScratch scratch;
+            zera_write_record_map(writer, rec, schema, &scratch);
+            return;
+        }
         default:
             break;
     }
@@ -3653,6 +3735,15 @@ static inline void zera_write_scalar(
         case ConverterKind::Array:
             zera_write_array(writer, col, value);
             return;
+        case ConverterKind::Composite:
+        {
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+            const CachedSchema& schema = get_cached_schema(
+                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+            TupleDeformScratch scratch;
+            zera_write_record_map(writer, rec, schema, &scratch);
+            return;
+        }
         case ConverterKind::Fallback:
         {
             char* str = OidOutputFunctionCall(col.typoutput, value);
@@ -3701,6 +3792,33 @@ static inline void zera_write_record_map(
     writer.end_map();
 }
 
+static bool zera_schema_recursive_supported(
+    const CachedSchema& schema, std::unordered_set<Oid>& active_types)
+{
+    if (!schema.zera_fast_supported) {
+        return false;
+    }
+    for (const CachedColumn& col : schema.columns) {
+        Oid nested_type = InvalidOid;
+        if (col.kind == ConverterKind::Composite) {
+            nested_type = col.typid;
+        } else if (col.kind == ConverterKind::Array &&
+                   col.array_element_kind == ConverterKind::Composite) {
+            nested_type = col.array_element_typid;
+        }
+        if (!OidIsValid(nested_type) || !active_types.insert(nested_type).second) {
+            continue;
+        }
+        const CachedSchema& nested = get_cached_schema(nested_type, -1);
+        const bool supported = zera_schema_recursive_supported(nested, active_types);
+        active_types.erase(nested_type);
+        if (!supported) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bytea* try_serialize_zera_row_fast(HeapTupleHeader rec)
 {
     Oid tupType = HeapTupleHeaderGetTypeId(rec);
@@ -3709,6 +3827,12 @@ static bytea* try_serialize_zera_row_fast(HeapTupleHeader rec)
 
     if (!schema.zera_fast_supported) {
         return nullptr;
+    }
+    if (schema.has_recursive_columns) {
+        std::unordered_set<Oid> active_types{tupType};
+        if (!zera_schema_recursive_supported(schema, active_types)) {
+            return nullptr;
+        }
     }
 
     try {
@@ -3761,6 +3885,12 @@ static bytea* try_serialize_zera_array_fast(Datum* elements, bool* nulls, int ni
         if (!schema.zera_fast_supported) {
             return nullptr;
         }
+        if (schema.has_recursive_columns) {
+            std::unordered_set<Oid> active_types{tupType};
+            if (!zera_schema_recursive_supported(schema, active_types)) {
+                return nullptr;
+            }
+        }
         schemas.push_back(&schema);
     }
 
@@ -3808,6 +3938,12 @@ static inline void flex_write_text(z::flex::Serializer& writer, Datum value)
     int len = VARSIZE_ANY_EXHDR(txt);
     writer.string(std::string_view(ptr, static_cast<size_t>(len)));
 }
+
+static inline void flex_write_record_map(
+    z::flex::Serializer& writer,
+    HeapTupleHeader rec,
+    const CachedSchema& schema,
+    TupleDeformScratch* scratch);
 
 static inline void flex_write_array_element(
     z::flex::Serializer& writer,
@@ -3889,6 +4025,15 @@ static inline void flex_write_array_element(
         case ConverterKind::Bytea:
             writer.binary(datum_bytea_span(value));
             return;
+        case ConverterKind::Composite:
+        {
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+            const CachedSchema& schema = get_cached_schema(
+                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+            TupleDeformScratch scratch;
+            flex_write_record_map(writer, rec, schema, &scratch);
+            return;
+        }
         default:
             break;
     }
@@ -4028,6 +4173,15 @@ static inline void flex_write_scalar(
         case ConverterKind::Array:
             flex_write_array(writer, col, value);
             return;
+        case ConverterKind::Composite:
+        {
+            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
+            const CachedSchema& schema = get_cached_schema(
+                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
+            TupleDeformScratch scratch;
+            flex_write_record_map(writer, rec, schema, &scratch);
+            return;
+        }
         case ConverterKind::Fallback:
         {
             char* str = OidOutputFunctionCall(col.typoutput, value);
@@ -4076,6 +4230,33 @@ static inline void flex_write_record_map(
     writer.end_map();
 }
 
+static bool flex_schema_recursive_supported(
+    const CachedSchema& schema, std::unordered_set<Oid>& active_types)
+{
+    if (!schema.flex_fast_supported) {
+        return false;
+    }
+    for (const CachedColumn& col : schema.columns) {
+        Oid nested_type = InvalidOid;
+        if (col.kind == ConverterKind::Composite) {
+            nested_type = col.typid;
+        } else if (col.kind == ConverterKind::Array &&
+                   col.array_element_kind == ConverterKind::Composite) {
+            nested_type = col.array_element_typid;
+        }
+        if (!OidIsValid(nested_type) || !active_types.insert(nested_type).second) {
+            continue;
+        }
+        const CachedSchema& nested = get_cached_schema(nested_type, -1);
+        const bool supported = flex_schema_recursive_supported(nested, active_types);
+        active_types.erase(nested_type);
+        if (!supported) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bytea* try_serialize_flex_row_fast(HeapTupleHeader rec)
 {
     Oid tupType = HeapTupleHeaderGetTypeId(rec);
@@ -4084,6 +4265,12 @@ static bytea* try_serialize_flex_row_fast(HeapTupleHeader rec)
 
     if (!schema.flex_fast_supported) {
         return nullptr;
+    }
+    if (schema.has_recursive_columns) {
+        std::unordered_set<Oid> active_types{tupType};
+        if (!flex_schema_recursive_supported(schema, active_types)) {
+            return nullptr;
+        }
     }
 
     try {
@@ -4135,6 +4322,12 @@ static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int ni
 
         if (!schema.flex_fast_supported) {
             return nullptr;
+        }
+        if (schema.has_recursive_columns) {
+            std::unordered_set<Oid> active_types{tupType};
+            if (!flex_schema_recursive_supported(schema, active_types)) {
+                return nullptr;
+            }
         }
         schemas.push_back(&schema);
     }
