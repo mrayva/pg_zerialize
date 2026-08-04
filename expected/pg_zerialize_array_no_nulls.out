@@ -1,0 +1,82 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+BEGIN;
+-- CBOR/ZERA/Flex's 1-D array fast path now hoists the array_element_kind
+-- switch outside the per-element loop when the array has no nulls, instead
+-- of re-dispatching that switch on every element inside
+-- cbor/zera/flex_write_array_element (cbor/zera/flex_write_array_no_nulls,
+-- mirroring MessagePack's existing msgpack_write_array_no_nulls). One column
+-- per ConverterKind that path covers, each populated with no nulls so every
+-- one exercises the new hoisted-switch code instead of the general
+-- per-element loop.
+CREATE TYPE pg_temp.pgz_nn_inner AS (a int, b text);
+CREATE TYPE pg_temp.pgz_nn_wide AS (
+    a_int2 smallint[],
+    a_int4 integer[],
+    a_int8 bigint[],
+    a_float4 real[],
+    a_float8 double precision[],
+    a_bool boolean[],
+    a_text text[],
+    a_json json[],
+    a_uuid uuid[],
+    a_name name[],
+    a_char "char"[],
+    a_inet inet[],
+    a_cidr cidr[],
+    a_interval interval[],
+    a_numeric numeric[],
+    a_date date[],
+    a_timestamp timestamp[],
+    a_timestamptz timestamptz[],
+    a_jsonb jsonb[],
+    a_bytea bytea[],
+    a_composite pg_temp.pgz_nn_inner[]
+);
+CREATE TEMP TABLE pgz_nn_values AS
+SELECT ROW(
+    ARRAY['-32768'::smallint, 0, 32767],
+    ARRAY[-2147483648, 0, 2147483647],
+    ARRAY['-9223372036854775808'::bigint, 0, '9223372036854775807'::bigint],
+    ARRAY['-Infinity'::real, 0.0, 'Infinity'::real],
+    ARRAY['-Infinity'::float8, 0.0, 'Infinity'::float8],
+    ARRAY[true, false, true],
+    ARRAY['hello', 'world', ''],
+    ARRAY['{"a":1}'::json, '[1,2,3]'::json],
+    ARRAY['00000000-0000-0000-0000-000000000000'::uuid, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid],
+    ARRAY['first'::name, 'second'::name],
+    ARRAY['A'::"char", 'Z'::"char"],
+    ARRAY['192.168.1.1'::inet, '::1'::inet],
+    ARRAY['10.0.0.0/8'::cidr, '::/0'::cidr],
+    ARRAY['1 mon -2 days 03:04:05.000006'::interval, '0'::interval],
+    ARRAY[1234.5678::numeric, 0::numeric, 42::numeric],
+    ARRAY['2000-01-01'::date, '9999-12-31'::date],
+    ARRAY['2000-01-01 00:00:00'::timestamp, '2099-12-31 23:59:59.999999'::timestamp],
+    ARRAY['2000-01-01 00:00:00+00'::timestamptz, '2099-12-31 23:59:59.999999+00'::timestamptz],
+    ARRAY['{"k":1}'::jsonb, '[1,2]'::jsonb],
+    ARRAY[decode('DEADBEEF','hex'), decode('CAFEBABE','hex')],
+    ARRAY[ROW(1,'x')::pg_temp.pgz_nn_inner, ROW(2,'y')::pg_temp.pgz_nn_inner]
+)::pg_temp.pgz_nn_wide AS value;
+-- MessagePack's own no-nulls batch path is unaffected by this change; keep
+-- its byte-parity check as the reference.
+SELECT row_to_msgpack(value) = row_to_msgpack_slow(value) AS msgpack_parity
+FROM pgz_nn_values;
+ msgpack_parity 
+----------------
+ t
+(1 row)
+
+-- No _slow() helper exists for CBOR/ZERA/Flex, so cross-check their output
+-- against MessagePack's, decoded through each protocol's own JSONB decoder.
+SELECT (cbor_to_jsonb(row_to_cbor(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS cbor_matches_msgpack,
+       (zera_to_jsonb(row_to_zera(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS zera_matches_msgpack,
+       (flexbuffers_to_jsonb(row_to_flexbuffers(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS flex_matches_msgpack
+FROM pgz_nn_values;
+ cbor_matches_msgpack | zera_matches_msgpack | flex_matches_msgpack 
+----------------------+----------------------+----------------------
+ t                    | t                    | t
+(1 row)
+
+ROLLBACK;
+DROP EXTENSION pg_zerialize;
