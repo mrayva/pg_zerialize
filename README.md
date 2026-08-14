@@ -268,10 +268,55 @@ result format. Benchmark output under `results/` is intentionally untracked.
   `beve_to_jsonb`/`beve_populate_record(set)` simply decode the leading
   document and silently ignore anything appended after it.
 
+## Changelog
+
+Each entry corresponds to one `pg_zerialize--X.Y--X.Z.sql` upgrade script;
+see those files for the exact functions/aggregates each version added.
+
+- **1.11** -- Added BEVE (`row_to_beve`/`rows_to_beve`, `beve_from_jsonb`/
+  `beve_to_jsonb`, builders, aggregates, `beve_populate_record`/
+  `beve_populate_recordset`), full parity with the other five protocols.
+  Vendored a pruned subset of glaze v8.0.0 (`vendor/glaze/`) and bumped
+  `PG_CPPFLAGS` from `-std=c++20` to `-std=c++23`, glaze's own minimum.
+- **1.10** -- Added Ion (full parity) and BSON (reduced surface: no
+  `bson_build_array`/`bson_agg`/`rows_to_bson`/`bson_populate_recordset`,
+  since BSON can't distinguish a bare root array from a root document).
+  Both decode through a new shared `Reader`-based JSON walker
+  (`reader_value_to_json`) rather than a hand-rolled wire-byte parser.
+  Added `libjsoncons-dev` as a build dependency for BSON's writer.
+- **1.9** -- Added `X_populate_recordset(base anyelement, data bytea)` for
+  MessagePack/CBOR/ZERA/FlexBuffers: the reverse of `rows_to_X`, decoding a
+  binary array of documents into a `SETOF` typed composites.
+- **1.8** -- Added `X_populate_record(base anyelement, data bytea)` for
+  MessagePack/CBOR/ZERA/FlexBuffers: the reverse of `row_to_X`, decoding a
+  binary document directly into a typed composite, mirroring
+  `jsonb_populate_record`'s base-row/anyelement polymorphism.
+- **1.7** -- Ported the `msgpack_*` JSONB-builder API (`X_from_jsonb`,
+  `X_build_object`, `X_build_array`, `X_agg`, `X_object_agg`) to CBOR, ZERA,
+  and FlexBuffers, which previously could only serialize existing composite
+  rows via `row_to_X`/`rows_to_X`.
+- **1.6** -- Added `zera_to_jsonb(bytea)`.
+- **1.5** -- Added `cbor_to_jsonb(bytea)`.
+- **1.4** -- Added `flexbuffers_to_jsonb(bytea)`.
+- **1.3** -- Added `msgpack_to_jsonb(bytea)`, the first `X_to_jsonb`
+  decoder in the extension.
+- **1.2** -- Schema caching and cache invalidation, plus build-hardening
+  fixes; re-registered APIs added during the 1.1 development cycle so
+  deployed 1.1 installations have a complete, explicit upgrade path.
+- **1.1** -- Corrected function volatility (`STABLE`/`IMMUTABLE`) and
+  preserved `STRICT` markings for planner correctness.
+- **1.0** -- Initial release: `row_to_X`/`rows_to_X` for MessagePack, CBOR,
+  ZERA, and FlexBuffers, plus MessagePack's JSONB-builder API
+  (`msgpack_from_jsonb`, `msgpack_build_object`/`build_array`,
+  `msgpack_agg`/`object_agg`) and `row_to_msgpack_slow`/`rows_to_msgpack_slow`
+  (generic-path parity test helpers, msgpack-only).
+
 ## Maintained Documentation
 
 - [`QUICKSTART.md`](QUICKSTART.md): installation and common SQL examples
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): conversion paths, caching, and semantics
 - [`bench/README.md`](bench/README.md): repeatable benchmark harness
-- [`vendor/zerialize/UPSTREAM.md`](vendor/zerialize/UPSTREAM.md): vendored source
-  provenance
+- [`vendor/zerialize/UPSTREAM.md`](vendor/zerialize/UPSTREAM.md): vendored
+  zerialize source provenance
+- [`vendor/glaze/UPSTREAM.md`](vendor/glaze/UPSTREAM.md): vendored glaze
+  source provenance (BEVE only)
