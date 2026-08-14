@@ -4,8 +4,8 @@ The vendored source is synchronized with:
 
 - Repository: <https://github.com/mrayva/zerialize> (fork of
   <https://github.com/colinator/zerialize>)
-- Commit: `f0f07a182fa139f8085d9ddbe71df3f3ed9ab422` (upstream: `Add
-  mapEntries() to fix O(n^2) map decoding for consumers`)
+- Commit: `32d04de942b4b7c87dba358d97d7346ef9769cfd` (upstream: `Add
+  elements() to fix O(n^2) array decoding for consumers`)
 - Commit date: 2026-08-14
 
 `f0f07a1` adds one thing on top of `13f6383`: `mapEntries()` on
@@ -15,11 +15,23 @@ O(n) re-scan per lookup). Found while auditing this extension's own
 `reader_value_to_json`/`msgpack_reader_to_json` (`pg_zerialize.cpp`) for an
 O(n^2) map-decode pattern in a per-row hot path, fixed locally here first
 (verified: all 28 REGRESS tests, ~3.5x on a 200-key object), then ported
-upstream and pulled back in as this bump -- so `ion.hpp`/`bson.hpp`/
-`beve.hpp` are, once again, vendored verbatim with no local patch, and
-`msgpack.hpp`'s reader-side `mapEntries()` addition is upstream-identical
-too (its writer remains locally patched, see below, unaffected by this
-change since it's reader-only).
+upstream and pulled back in as that bump.
+
+`32d04de` does the same thing for array decoding: adds `elements()` (single-
+pass element iteration vs. `arraySize()` + `operator[](idx)`'s O(n) re-scan
+per lookup) to the same four deserializers. Same discover-fix-port-back
+cycle (verified: ~2.9x on a 300-element array; BEVE typed numeric/string
+arrays and empty/nested/heterogeneous arrays spot-checked across all four
+formats). For BEVE, `elements()` only speeds up generic (heterogeneous)
+arrays -- numeric typed arrays already had true O(1) `operator[]` access
+via glz's fixed-element-width pointer math, and glz's own iterator doesn't
+tag typed-array elements it yields, so `elements()` falls back to
+per-index access for those (no worse than before).
+
+So, once again: `ion.hpp`/`bson.hpp`/`beve.hpp` are vendored verbatim with
+no local patch, and `msgpack.hpp`'s reader-side `mapEntries()`/`elements()`
+additions are upstream-identical too (its writer remains locally patched,
+see below, unaffected by either change since both are reader-only).
 
 Bumped from the previous pin, `32d9d9447c9ce725ba0ea9d1a5d25005066a0cd8`
 (2026-08-04): that bump added `include/zerialize/protocols/ion.hpp` and
