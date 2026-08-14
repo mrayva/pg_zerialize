@@ -89,3 +89,123 @@ jobs:
       - name: Quick isolated microbench sanity
         if: matrix.postgresql == 18
         run: RUNS=1 WARMUP=0 PROTOCOLS="msgpack" PGDATABASE=postgres ./bench/run_microbench_isolated.sh
+
+  asan-ubsan:
+    runs-on: ubuntu-latest
+    # One PG version is enough here -- this job exists to catch memory-
+    # safety/UB bugs in pg_zerialize's own C++ code, not PG-version-specific
+    # behavior (that's what the build-test matrix above is for).
+    env:
+      PG_MAJOR: 18
+      PG_CONFIG: /usr/lib/postgresql/18/bin/pg_config
+      PGHOST: /tmp
+      # Deliberately not 5432: installing the postgresql-18 apt package
+      # auto-starts its own cluster bound to 5432 (see build-test's "Start
+      # PostgreSQL" step, which stops that one before reusing its port).
+      # This job runs its own from-scratch scratch cluster instead, so a
+      # different port sidesteps the collision without needing to touch
+      # the apt-managed cluster at all.
+      PGPORT: 5555
+      PGUSER: postgres
+      PGDATABASE: postgres
+      PGDATA: /tmp/pgz_asan_data
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure PostgreSQL Apt repository
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates \
+            curl
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          printf '%s\n' \
+            'Types: deb' \
+            'URIs: https://apt.postgresql.org/pub/repos/apt' \
+            "Suites: ${VERSION_CODENAME}-pgdg" \
+            'Components: main' \
+            'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' \
+            | sudo tee /etc/apt/sources.list.d/pgdg.sources
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            libflatbuffers-dev \
+            libfast-float-dev \
+            libmsgpack-dev \
+            python3-msgpack \
+            "postgresql-${PG_MAJOR}" \
+            "postgresql-server-dev-${PG_MAJOR}"
+          # Best-effort: the ASan/UBSan runtime is normally pulled in
+          # transitively by gcc, but package names vary by Ubuntu release.
+          sudo apt-get install -y libasan8 || true
+          sudo apt-get install -y libasan6 || true
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+
+      - name: Show PostgreSQL version
+        run: |
+          "$PG_CONFIG" --version
+          psql --version
+
+      - name: Build with ASan+UBSan
+        run: |
+          make -j"$(nproc)" \
+            CPPFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            SHLIB_LINK="-lstdc++ -lflatbuffers -fsanitize=address,undefined"
+
+      - name: Install extension
+        run: sudo make PG_CONFIG="$PG_CONFIG" install
+
+      - name: Initialize scratch cluster
+        run: |
+          initdb -D "$PGDATA" --auth=trust -U "$PGUSER"
+          {
+            echo "port = ${PGPORT}"
+            echo "unix_socket_directories = '/tmp'"
+          } >> "$PGDATA/postgresql.conf"
+
+      - name: Start PostgreSQL under ASan/UBSan
+        run: |
+          ASAN_LIB=$(ldconfig -p | grep 'libasan\.so' | grep 'x86-64' | awk '{print $NF; exit}')
+          if [ -z "$ASAN_LIB" ]; then
+            echo "::error::libasan runtime not found via ldconfig -- cannot LD_PRELOAD it"
+            exit 1
+          fi
+          echo "Preloading $ASAN_LIB"
+          LD_PRELOAD="$ASAN_LIB" \
+          ASAN_OPTIONS="detect_leaks=0:abort_on_error=1" \
+          UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+          pg_ctl -D "$PGDATA" -l "$PGDATA/server.log" start
+          createdb contrib_regression
+
+      - name: PGXS regression tests under ASan/UBSan
+        run: make installcheck
+
+      - name: Comprehensive SQL suite under ASan/UBSan
+        run: psql -v ON_ERROR_STOP=1 -f test_pg_zerialize.sql
+
+      - name: Independent MessagePack semantics under ASan/UBSan
+        run: make semantic-check
+
+      - name: Check server log for sanitizer reports
+        if: always()
+        run: |
+          if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error' "$PGDATA/server.log"; then
+            echo "::error::Sanitizer report found in the PostgreSQL server log"
+            cat "$PGDATA/server.log"
+            exit 1
+          fi
+          echo "No sanitizer reports found."
+
+      - name: Dump server log on failure
+        if: failure()
+        run: cat "$PGDATA/server.log" || true
