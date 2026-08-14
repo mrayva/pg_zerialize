@@ -22,14 +22,16 @@ and performance work use PostgreSQL 18.
 - FlatBuffers development package (`libflatbuffers-dev`)
 - fast_float development package (`libfast-float-dev`)
 - MessagePack C development package (`libmsgpack-dev`)
-- jsoncons development package (`libjsoncons-dev`) -- used by BSON's writer
 - Python `msgpack` package for independent MessagePack semantic tests
 
 The zerialize headers are vendored under `vendor/zerialize/`. See
 [`vendor/zerialize/UPSTREAM.md`](vendor/zerialize/UPSTREAM.md) for provenance
 and local changes. BEVE additionally needs glaze (for its zero-copy reader),
-vendored as a pruned subset under `vendor/glaze/` rather than via apt -- see
-[`vendor/glaze/UPSTREAM.md`](vendor/glaze/UPSTREAM.md) for why.
+and BSON's writer needs jsoncons -- both vendored as pruned subsets under
+`vendor/glaze/` and `vendor/jsoncons/` rather than via apt, since neither is
+reliably apt-installable on the Ubuntu release CI actually runs on; see
+[`vendor/glaze/UPSTREAM.md`](vendor/glaze/UPSTREAM.md) and
+[`vendor/jsoncons/UPSTREAM.md`](vendor/jsoncons/UPSTREAM.md) for why.
 
 ## Build And Test
 
@@ -283,7 +285,10 @@ see those files for the exact functions/aggregates each version added.
   since BSON can't distinguish a bare root array from a root document).
   Both decode through a new shared `Reader`-based JSON walker
   (`reader_value_to_json`) rather than a hand-rolled wire-byte parser.
-  Added `libjsoncons-dev` as a build dependency for BSON's writer.
+  Added `libjsoncons-dev` as a build dependency for BSON's writer -- later
+  replaced by a vendored copy (`vendor/jsoncons/`) once it turned out that
+  apt package isn't installable on the Ubuntu release CI actually runs on;
+  see [`vendor/jsoncons/UPSTREAM.md`](vendor/jsoncons/UPSTREAM.md).
 - **1.9** -- Added `X_populate_recordset(base anyelement, data bytea)` for
   MessagePack/CBOR/ZERA/FlexBuffers: the reverse of `rows_to_X`, decoding a
   binary array of documents into a `SETOF` typed composites.
@@ -320,3 +325,5 @@ see those files for the exact functions/aggregates each version added.
   zerialize source provenance
 - [`vendor/glaze/UPSTREAM.md`](vendor/glaze/UPSTREAM.md): vendored glaze
   source provenance (BEVE only)
+- [`vendor/jsoncons/UPSTREAM.md`](vendor/jsoncons/UPSTREAM.md): vendored
+  jsoncons source provenance (BSON writer only)

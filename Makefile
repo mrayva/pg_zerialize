@@ -22,7 +22,11 @@ REGRESS = pg_zerialize pg_zerialize_core pg_zerialize_parity pg_zerialize_cache 
 # zero-copy lazy BEVE reader (vendor/glaze; see vendor/glaze/UPSTREAM.md and
 # vendor/zerialize/UPSTREAM.md for why glaze can't come from apt). Verified
 # the rest of this file compiles unchanged under c++23 before bumping.
-PG_CPPFLAGS = -std=c++23 -fPIC -Ivendor/zerialize/include -Ivendor/glaze/include
+#
+# jsoncons (vendor/jsoncons, used by bson.hpp's writer) is vendored for the
+# same reason glaze is: libjsoncons-dev isn't apt-installable on the
+# Ubuntu release CI actually runs on -- see vendor/jsoncons/UPSTREAM.md.
+PG_CPPFLAGS = -std=c++23 -fPIC -Ivendor/zerialize/include -Ivendor/glaze/include -Ivendor/jsoncons/include
 SHLIB_LINK = -lstdc++ -lflatbuffers
 
 # Use C++ compiler

@@ -12,9 +12,12 @@ sudo apt-get install \
   libflatbuffers-dev \
   libfast-float-dev \
   libmsgpack-dev \
-  libjsoncons-dev \
   python3-msgpack
 ```
+
+(jsoncons and glaze, both used by BSON's writer and BEVE respectively, are
+vendored in `vendor/` -- no apt package needed for either; see
+`vendor/jsoncons/UPSTREAM.md` and `vendor/glaze/UPSTREAM.md`.)
 
 Use matching `postgresql-<major>` and `postgresql-server-dev-<major>` packages
 for PostgreSQL 16 or 17.
