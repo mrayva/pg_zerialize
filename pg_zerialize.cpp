@@ -1038,11 +1038,11 @@ static size_t msgpack_validate_value(std::span<const uint8_t> data, size_t pos)
     return pos + payload_size;
 }
 
-// Shared by append_json_string (text path) and the JsonbValue-tree builders
-// below (reader_value_to_jsonb): pushJsonbValue does no validation of its
-// own -- a jbvString is just a stored {char*,int} pointer/length pair, byte-
-// copied verbatim by JsonbValueToJsonb later -- so these checks have to live
-// here rather than in the (bypassed, for the jsonb path) text-escaping step.
+// Used throughout the JsonbValue-tree builders below (reader_value_to_jsonb
+// and friends): pushJsonbValue does no validation of its own -- a jbvString
+// is just a stored {char*,int} pointer/length pair, byte-copied verbatim by
+// JsonbValueToJsonb later -- so every decoded string has to be checked here
+// before being handed to pushJsonbValue.
 static void validate_jsonb_string(std::string_view value)
 {
     if (value.find('\0') != std::string_view::npos) {
@@ -1054,57 +1054,11 @@ static void validate_jsonb_string(std::string_view value)
     }
 }
 
-static void append_json_string(std::string& out, std::string_view value)
-{
-    validate_jsonb_string(value);
-    static constexpr char hex[] = "0123456789abcdef";
-    out.push_back('"');
-    for (unsigned char ch : value) {
-        switch (ch) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (ch < 0x20) {
-                    out += "\\u00";
-                    out.push_back(hex[ch >> 4]);
-                    out.push_back(hex[ch & 0x0f]);
-                } else {
-                    out.push_back(static_cast<char>(ch));
-                }
-        }
-    }
-    out.push_back('"');
-}
-
-template<typename Number>
-static void append_json_number(std::string& out, Number value)
-{
-    std::array<char, 64> buffer;
-    std::to_chars_result converted;
-    if constexpr (std::is_floating_point_v<Number>) {
-        converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
-                                  std::chars_format::general,
-                                  std::numeric_limits<Number>::max_digits10);
-    } else {
-        converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
-    }
-    if (converted.ec != std::errc()) {
-        throw z::DeserializationError("failed to format decoded number");
-    }
-    out.append(buffer.data(), converted.ptr);
-}
-
 // ===== Numeric -> Numeric helpers for the JsonbValue-tree builders below =====
 //
 // jbvNumeric needs an actual Numeric datum (see JsonbValue's tagged union),
-// not text -- these are the direct (no full-document JSON-text/lexer pass)
-// equivalents of what append_json_number+jsonb_in's own number lexer used
-// to do for each scalar.
+// not text -- these build one directly from the decoded wire value, no
+// full-document JSON-text/lexer pass involved.
 
 static inline Numeric jsonb_numeric_from_int64(int64_t v)
 {
@@ -1321,77 +1275,145 @@ static Jsonb* reader_to_jsonb(const V& root)
     return JsonbValueToJsonb(result);
 }
 
-static void flex_reference_to_json(
-    const ::flexbuffers::Reference& value, std::string& out)
+/*
+ * Populates `out` for true-scalar FlexBuffer references only (Null/Bool/
+ * UInt/Int/Float/String) -- never Map/AnyVector/Blob, which are container-
+ * shaped (Blob emits a 3-element ["~b", base64, "base64"] array, same as
+ * every other format's blob tag) and handled by flex_value_to_jsonb below.
+ * Shared between that recursive walker (nested scalars, where a pstate/
+ * token is always available) and flexbuffers_decode_to_jsonb's bare-root-
+ * scalar case, which builds the JsonbValue directly via JsonbValueToJsonb
+ * without ever touching pushJsonbValue/JsonbParseState.
+ *
+ * FlexBuffer strings are zero-copy views into the underlying buffer (see
+ * flatbuffers/flexbuffers.h's String::c_str(), a raw data_ pointer) so, like
+ * ZERA, no blob_arena entry is needed here -- only the blob branch below
+ * needs one, for its derived base64 string.
+ */
+static void flex_scalar_to_jsonb_value(
+    const ::flexbuffers::Reference& value, JsonbValue& out)
 {
-    check_stack_depth();
     if (value.IsNull()) {
-        out += "null";
+        out.type = jbvNull;
     } else if (value.IsBool()) {
-        out += value.AsBool() ? "true" : "false";
+        out.type = jbvBool;
+        out.val.boolean = value.AsBool();
     } else if (value.IsUInt()) {
-        append_json_number(out, value.AsUInt64());
+        out.type = jbvNumeric;
+        out.val.numeric = jsonb_numeric_from_uint64(value.AsUInt64());
     } else if (value.IsInt()) {
-        append_json_number(out, value.AsInt64());
+        out.type = jbvNumeric;
+        out.val.numeric = jsonb_numeric_from_int64(value.AsInt64());
     } else if (value.IsFloat()) {
         const double number = value.AsDouble();
         if (std::isfinite(number)) {
-            append_json_number(out, number);
+            out.type = jbvNumeric;
+            out.val.numeric = jsonb_numeric_from_double(number);
         } else if (std::isnan(number)) {
-            append_json_string(out, "NaN");
+            out.type = jbvString;
+            out.val.string.val = const_cast<char*>("NaN");
+            out.val.string.len = 3;
         } else {
-            append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
+            const char* text = number > 0 ? "Infinity" : "-Infinity";
+            out.type = jbvString;
+            out.val.string.val = const_cast<char*>(text);
+            out.val.string.len = static_cast<int>(std::strlen(text));
         }
     } else if (value.IsString()) {
         auto string_value = value.AsString();
-        append_json_string(
-            out, std::string_view(string_value.c_str(), string_value.size()));
-    } else if (value.IsBlob()) {
-        auto blob = value.AsBlob();
-        auto bytes = std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(blob.data()), blob.size());
-        out += "[\"~b\",";
-        append_json_string(out, z::base64Encode(bytes));
-        out += ",\"base64\"]";
-    } else if (value.IsMap()) {
+        std::string_view sv(string_value.c_str(), string_value.size());
+        validate_jsonb_string(sv);
+        out.type = jbvString;
+        out.val.string.val = const_cast<char*>(sv.data());
+        out.val.string.len = static_cast<int>(sv.size());
+    } else {
+        throw z::DeserializationError("unsupported FlexBuffer scalar value");
+    }
+}
+
+/*
+ * Recursive FlexBuffer-Reference-to-JsonbValue-tree walker: mirrors the
+ * former flex_reference_to_json's exact structure (duplicate-key check,
+ * 3-way vector dispatch) but pushes JsonbValues via pushJsonbValue instead
+ * of appending JSON text, so callers avoid the jsonb_in lex/parse round
+ * trip entirely.
+ */
+static JsonbValue* flex_value_to_jsonb(
+    const ::flexbuffers::Reference& value,
+    JsonbParseState** pstate, JsonbIteratorToken scalar_token,
+    std::deque<std::string>& blob_arena)
+{
+    check_stack_depth();
+    JsonbValue* result = nullptr;
+    if (value.IsMap()) {
         auto map = value.AsMap();
         auto keys = map.Keys();
         auto values = map.Values();
         std::unordered_set<std::string_view> seen_keys;
 
-        out.push_back('{');
+        pushJsonbValue(pstate, WJB_BEGIN_OBJECT, nullptr);
         for (size_t i = 0; i < keys.size(); i++) {
-            if (i > 0) out.push_back(',');
             auto key_value = keys[i].AsString();
             std::string_view key(key_value.c_str(), key_value.size());
             if (!seen_keys.insert(key).second) {
                 throw z::DeserializationError("duplicate FlexBuffer map key");
             }
-            append_json_string(out, key);
-            out.push_back(':');
-            flex_reference_to_json(values[i], out);
+            validate_jsonb_string(key);
+            JsonbValue keyv;
+            keyv.type = jbvString;
+            keyv.val.string.val = const_cast<char*>(key.data());
+            keyv.val.string.len = static_cast<int>(key.size());
+            pushJsonbValue(pstate, WJB_KEY, &keyv);
+            flex_value_to_jsonb(values[i], pstate, WJB_VALUE, blob_arena);
         }
-        out.push_back('}');
+        result = pushJsonbValue(pstate, WJB_END_OBJECT, nullptr);
+    } else if (value.IsBlob()) {
+        auto blob = value.AsBlob();
+        auto bytes = std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(blob.data()), blob.size());
+
+        pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
+        JsonbValue tag_v;
+        tag_v.type = jbvString;
+        tag_v.val.string.val = const_cast<char*>("~b");
+        tag_v.val.string.len = 2;
+        pushJsonbValue(pstate, WJB_ELEM, &tag_v);
+
+        std::string& encoded = blob_arena.emplace_back(z::base64Encode(bytes));
+        JsonbValue enc_v;
+        enc_v.type = jbvString;
+        enc_v.val.string.val = encoded.data();
+        enc_v.val.string.len = static_cast<int>(encoded.size());
+        pushJsonbValue(pstate, WJB_ELEM, &enc_v);
+
+        JsonbValue fmt_v;
+        fmt_v.type = jbvString;
+        fmt_v.val.string.val = const_cast<char*>("base64");
+        fmt_v.val.string.len = 6;
+        pushJsonbValue(pstate, WJB_ELEM, &fmt_v);
+        result = pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
     } else if (value.IsAnyVector()) {
-        auto append_vector = [&](const auto& vector) {
-            out.push_back('[');
+        auto append_vector = [&](const auto& vector) -> JsonbValue* {
+            pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
             for (size_t i = 0; i < vector.size(); i++) {
-                if (i > 0) out.push_back(',');
-                flex_reference_to_json(vector[i], out);
+                flex_value_to_jsonb(vector[i], pstate, WJB_ELEM, blob_arena);
             }
-            out.push_back(']');
+            return pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
         };
 
         if (value.IsTypedVector()) {
-            append_vector(value.AsTypedVector());
+            result = append_vector(value.AsTypedVector());
         } else if (value.IsFixedTypedVector()) {
-            append_vector(value.AsFixedTypedVector());
+            result = append_vector(value.AsFixedTypedVector());
         } else {
-            append_vector(value.AsVector());
+            result = append_vector(value.AsVector());
         }
     } else {
-        throw z::DeserializationError("unsupported FlexBuffer value");
+        JsonbValue v;
+        flex_scalar_to_jsonb_value(value, v);
+        result = pushJsonbValue(pstate, scalar_token, &v);
     }
+    return result;
 }
 
 struct CborHead {
@@ -1543,19 +1565,153 @@ static double cbor_decode_half(uint16_t bits)
     return negative ? -value : value;
 }
 
-static void append_cbor_float(std::string& out, double number)
+static void cbor_float_to_jsonb_value(double number, JsonbValue& out)
 {
     if (std::isfinite(number)) {
-        append_json_number(out, number);
+        out.type = jbvNumeric;
+        out.val.numeric = jsonb_numeric_from_double(number);
     } else if (std::isnan(number)) {
-        append_json_string(out, "NaN");
+        out.type = jbvString;
+        out.val.string.val = const_cast<char*>("NaN");
+        out.val.string.len = 3;
     } else {
-        append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
+        const char* text = number > 0 ? "Infinity" : "-Infinity";
+        out.type = jbvString;
+        out.val.string.val = const_cast<char*>(text);
+        out.val.string.len = static_cast<int>(std::strlen(text));
     }
 }
 
-static size_t cbor_value_to_json(
-    std::span<const uint8_t> data, size_t pos, std::string& out)
+// CBOR-wire-encoding-specific: major-type-1 magnitude M means the actual
+// value is -(M+1), which can go as low as -2^64 -- wider than any integer
+// type -- so this doesn't fit the generic jsonb_numeric_from_* helpers
+// above and stays local to CBOR's decode path.
+static Numeric jsonb_numeric_from_cbor_negative(uint64_t head_value)
+{
+    if (head_value <= static_cast<uint64_t>(INT64_MAX)) {
+        return jsonb_numeric_from_int64(-1 - static_cast<int64_t>(head_value));
+    }
+    if (head_value == UINT64_MAX) {
+        // -2^64 exactly; no integer type holds the magnitude at all, but
+        // it's one fixed literal, so a direct numeric_in call (not a
+        // generic text-formatting path) is fine here.
+        return DatumGetNumeric(DirectFunctionCall3(numeric_in,
+            CStringGetDatum("-18446744073709551616"),
+            ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+    }
+    // head_value+1 fits in uint64 (checked above) but not int64 -- get its
+    // magnitude via the existing >INT64_MAX path in jsonb_numeric_from_
+    // uint64, then negate directly via PostgreSQL's own numeric_uminus
+    // rather than another text round trip.
+    Numeric magnitude = jsonb_numeric_from_uint64(head_value + 1);
+    return DatumGetNumeric(DirectFunctionCall1(numeric_uminus, NumericGetDatum(magnitude)));
+}
+
+/*
+ * Populates `out` for true-scalar CBOR major types only (0/1/3/7 -- unsigned
+ * int, negative int, text string, and the simple/float/bool/null major
+ * type) -- never 2/4/5 (byte string/array/map), which are container-shaped
+ * (a byte string emits a 3-element ["~b", base64, "base64"] array, same as
+ * every other format's blob tag) and handled by cbor_value_to_jsonb below.
+ * Shared between that recursive walker (nested scalars, where a pstate/
+ * token is always available) and cbor_decode_to_jsonb's bare-root-scalar
+ * case, which builds the JsonbValue directly via JsonbValueToJsonb without
+ * ever touching pushJsonbValue/JsonbParseState.
+ *
+ * Unlike ZERA/FlexBuffers, cbor_parse_text always materializes into a
+ * caller-owned std::string (see its own definition above) even for the
+ * simple, non-chunked case -- so, unlike those two formats, CBOR's string
+ * values (here) *and* map keys (in cbor_value_to_jsonb) need a blob_arena
+ * entry too, not just its byte-string/blob branch.
+ *
+ * Returns the cursor position just past this value, same as the former
+ * cbor_value_to_json -- CBOR's recursive walk is byte-cursor-driven (unlike
+ * ZERA's fixed-stride ValueRefs or FlexBuffers' self-describing Reference
+ * API), so, unlike those two formats' _value_to_jsonb, this return value is
+ * load-bearing: callers use it to advance their own cursor and to detect
+ * trailing bytes after the top-level value.
+ */
+static size_t cbor_scalar_to_jsonb_value(
+    std::span<const uint8_t> data, size_t pos, JsonbValue& out,
+    std::deque<std::string>& blob_arena)
+{
+    CborHead head = cbor_read_head(data, pos);
+    if (head.major <= 1 && head.indefinite) {
+        throw z::DeserializationError("indefinite CBOR integer");
+    }
+
+    switch (head.major) {
+        case 0:
+            out.type = jbvNumeric;
+            out.val.numeric = jsonb_numeric_from_uint64(head.value);
+            return head.next;
+        case 1:
+            out.type = jbvNumeric;
+            out.val.numeric = jsonb_numeric_from_cbor_negative(head.value);
+            return head.next;
+        case 3:
+        {
+            std::string text_value;
+            const size_t next = cbor_parse_text(data, pos, &text_value);
+            std::string& stored = blob_arena.emplace_back(std::move(text_value));
+            std::string_view sv(stored);
+            validate_jsonb_string(sv);
+            out.type = jbvString;
+            out.val.string.val = stored.data();
+            out.val.string.len = static_cast<int>(stored.size());
+            return next;
+        }
+        case 7:
+            if (head.indefinite) {
+                throw z::DeserializationError("unexpected CBOR break marker");
+            }
+            if (head.additional == 20 || head.additional == 21) {
+                out.type = jbvBool;
+                out.val.boolean = (head.additional == 21);
+                return head.next;
+            }
+            if (head.additional == 22) {
+                out.type = jbvNull;
+                return head.next;
+            }
+            if (head.additional == 25) {
+                cbor_float_to_jsonb_value(
+                    cbor_decode_half(static_cast<uint16_t>(head.value)), out);
+                return head.next;
+            }
+            if (head.additional == 26) {
+                cbor_float_to_jsonb_value(
+                    std::bit_cast<float>(static_cast<uint32_t>(head.value)), out);
+                return head.next;
+            }
+            if (head.additional == 27) {
+                cbor_float_to_jsonb_value(std::bit_cast<double>(head.value), out);
+                return head.next;
+            }
+            throw z::DeserializationError("unsupported CBOR simple value");
+        default:
+            pg_unreachable();
+    }
+}
+
+/*
+ * Recursive CBOR-to-JsonbValue-tree walker: mirrors the former
+ * cbor_value_to_json's exact structure (indefinite-length handling for
+ * byte strings/text strings/arrays/maps, duplicate-key check) but pushes
+ * JsonbValues via pushJsonbValue instead of appending JSON text, so callers
+ * avoid the jsonb_in lex/parse round trip entirely. True scalars (major
+ * 0/1/3/7) delegate to cbor_scalar_to_jsonb_value above rather than
+ * duplicating that logic. Fills *out_value with the pushed JsonbValue*,
+ * same purpose as reader_value_to_jsonb/zera_value_to_jsonb's return value
+ * for those formats -- returned via an out-param here because the
+ * function's actual return value is the consumed-bytes cursor (see
+ * cbor_scalar_to_jsonb_value's comment above for why that's load-bearing
+ * for CBOR specifically).
+ */
+static size_t cbor_value_to_jsonb(
+    std::span<const uint8_t> data, size_t pos,
+    JsonbParseState** pstate, JsonbIteratorToken scalar_token,
+    std::deque<std::string>& blob_arena, JsonbValue** out_value)
 {
     check_stack_depth();
     CborHead head = cbor_read_head(data, pos);
@@ -1566,40 +1722,48 @@ static size_t cbor_value_to_json(
 
     switch (head.major) {
         case 0:
-            append_json_number(out, head.value);
-            return head.next;
         case 1:
-            if (head.value <= static_cast<uint64_t>(INT64_MAX)) {
-                const int64_t value = -1 - static_cast<int64_t>(head.value);
-                append_json_number(out, value);
-            } else if (head.value == UINT64_MAX) {
-                out += "-18446744073709551616";
-            } else {
-                out.push_back('-');
-                append_json_number(out, head.value + 1);
-            }
-            return head.next;
+        case 3:
+        case 7:
+        {
+            JsonbValue v;
+            const size_t next = cbor_scalar_to_jsonb_value(data, pos, v, blob_arena);
+            *out_value = pushJsonbValue(pstate, scalar_token, &v);
+            return next;
+        }
         case 2:
         {
             std::vector<std::byte> bytes;
             const size_t next = cbor_parse_bytes(data, pos, &bytes);
-            out += "[\"~b\",";
-            append_json_string(out, z::base64Encode(bytes));
-            out += ",\"base64\"]";
-            return next;
-        }
-        case 3:
-        {
-            std::string text_value;
-            const size_t next = cbor_parse_text(data, pos, &text_value);
-            append_json_string(out, text_value);
+
+            pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
+            JsonbValue tag_v;
+            tag_v.type = jbvString;
+            tag_v.val.string.val = const_cast<char*>("~b");
+            tag_v.val.string.len = 2;
+            pushJsonbValue(pstate, WJB_ELEM, &tag_v);
+
+            std::string& encoded = blob_arena.emplace_back(z::base64Encode(bytes));
+            JsonbValue enc_v;
+            enc_v.type = jbvString;
+            enc_v.val.string.val = encoded.data();
+            enc_v.val.string.len = static_cast<int>(encoded.size());
+            pushJsonbValue(pstate, WJB_ELEM, &enc_v);
+
+            JsonbValue fmt_v;
+            fmt_v.type = jbvString;
+            fmt_v.val.string.val = const_cast<char*>("base64");
+            fmt_v.val.string.len = 6;
+            pushJsonbValue(pstate, WJB_ELEM, &fmt_v);
+            *out_value = pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
             return next;
         }
         case 4:
         {
-            out.push_back('[');
+            pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
             size_t cursor = head.next;
             uint64_t index = 0;
+            JsonbValue* child = nullptr;
             if (head.indefinite) {
                 while (true) {
                     cbor_require_bytes(data, cursor, 1);
@@ -1607,34 +1771,43 @@ static size_t cbor_value_to_json(
                         cursor++;
                         break;
                     }
-                    if (index++ > 0) out.push_back(',');
-                    cursor = cbor_value_to_json(data, cursor, out);
+                    index++;
+                    cursor = cbor_value_to_jsonb(
+                        data, cursor, pstate, WJB_ELEM, blob_arena, &child);
                 }
             } else {
                 for (; index < head.value; index++) {
-                    if (index > 0) out.push_back(',');
-                    cursor = cbor_value_to_json(data, cursor, out);
+                    cursor = cbor_value_to_jsonb(
+                        data, cursor, pstate, WJB_ELEM, blob_arena, &child);
                 }
             }
-            out.push_back(']');
+            *out_value = pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
             return cursor;
         }
         case 5:
         {
-            out.push_back('{');
+            pushJsonbValue(pstate, WJB_BEGIN_OBJECT, nullptr);
             size_t cursor = head.next;
             uint64_t index = 0;
-            std::unordered_set<std::string> keys;
+            std::unordered_set<std::string_view> keys;
+            JsonbValue* child = nullptr;
             auto append_entry = [&]() {
                 std::string key;
                 cursor = cbor_parse_text(data, cursor, &key);
-                if (!keys.insert(key).second) {
+                std::string& key_stored = blob_arena.emplace_back(std::move(key));
+                std::string_view key_view(key_stored);
+                if (!keys.insert(key_view).second) {
                     throw z::DeserializationError("duplicate CBOR map key");
                 }
-                if (index++ > 0) out.push_back(',');
-                append_json_string(out, key);
-                out.push_back(':');
-                cursor = cbor_value_to_json(data, cursor, out);
+                validate_jsonb_string(key_view);
+                JsonbValue keyv;
+                keyv.type = jbvString;
+                keyv.val.string.val = key_stored.data();
+                keyv.val.string.len = static_cast<int>(key_stored.size());
+                pushJsonbValue(pstate, WJB_KEY, &keyv);
+                index++;
+                cursor = cbor_value_to_jsonb(
+                    data, cursor, pstate, WJB_VALUE, blob_arena, &child);
             };
 
             if (head.indefinite) {
@@ -1649,36 +1822,11 @@ static size_t cbor_value_to_json(
             } else {
                 while (index < head.value) append_entry();
             }
-            out.push_back('}');
+            *out_value = pushJsonbValue(pstate, WJB_END_OBJECT, nullptr);
             return cursor;
         }
         case 6:
             throw z::DeserializationError("CBOR semantic tags are not supported");
-        case 7:
-            if (head.indefinite) {
-                throw z::DeserializationError("unexpected CBOR break marker");
-            }
-            if (head.additional == 20 || head.additional == 21) {
-                out += head.additional == 21 ? "true" : "false";
-                return head.next;
-            }
-            if (head.additional == 22) {
-                out += "null";
-                return head.next;
-            }
-            if (head.additional == 25) {
-                append_cbor_float(out, cbor_decode_half(static_cast<uint16_t>(head.value)));
-                return head.next;
-            }
-            if (head.additional == 26) {
-                append_cbor_float(out, std::bit_cast<float>(static_cast<uint32_t>(head.value)));
-                return head.next;
-            }
-            if (head.additional == 27) {
-                append_cbor_float(out, std::bit_cast<double>(head.value));
-                return head.next;
-            }
-            throw z::DeserializationError("unsupported CBOR simple value");
         default:
             pg_unreachable();
     }
@@ -1699,9 +1847,126 @@ static inline void zera_require_span(
     }
 }
 
-static size_t zera_value_to_json(
-    ZeraDecodeContext& context, uint32_t ref_offset, std::string& out,
-    size_t depth)
+/*
+ * Populates `out` for scalar ZERA tags only (Null/Bool/I64/U64/F64/String)
+ * -- never Array/Object/TypedArray, which are container-shaped and handled
+ * by zera_value_to_jsonb below. Shared between that recursive walker (for
+ * nested scalars, where a pstate/token is always available to push into)
+ * and zera_decode_to_jsonb's bare-root-scalar case, which builds the
+ * JsonbValue directly via JsonbValueToJsonb without ever touching
+ * pushJsonbValue/JsonbParseState.
+ */
+static void zera_scalar_to_jsonb_value(
+    ZeraDecodeContext& context, uint32_t ref_offset, JsonbValue& out)
+{
+    zera_require_span(
+        context.envelope, ref_offset, 16, "ZERA ValueRef is out of bounds");
+    const uint8_t* ref = context.envelope.data() + ref_offset;
+    const auto tag = static_cast<z::zera::Tag>(ref[0]);
+    const uint8_t flags = ref[1];
+    const uint16_t aux = z::zera::read_u16_le(ref + 2);
+    const uint32_t a = z::zera::read_u32_le(ref + 4);
+    const uint32_t b = z::zera::read_u32_le(ref + 8);
+
+    auto require_no_flags = [&]() {
+        if (flags != 0) {
+            throw z::DeserializationError("non-string ZERA value has flags");
+        }
+    };
+
+    switch (tag) {
+        case z::zera::Tag::Null:
+            require_no_flags();
+            out.type = jbvNull;
+            return;
+        case z::zera::Tag::Bool:
+            require_no_flags();
+            if (aux > 1) throw z::DeserializationError("invalid ZERA boolean");
+            out.type = jbvBool;
+            out.val.boolean = (aux == 1);
+            return;
+        case z::zera::Tag::I64:
+        {
+            require_no_flags();
+            const uint64_t bits = static_cast<uint64_t>(a) |
+                                  (static_cast<uint64_t>(b) << 32);
+            out.type = jbvNumeric;
+            out.val.numeric = jsonb_numeric_from_int64(static_cast<int64_t>(bits));
+            return;
+        }
+        case z::zera::Tag::U64:
+        {
+            require_no_flags();
+            const uint64_t value = static_cast<uint64_t>(a) |
+                                   (static_cast<uint64_t>(b) << 32);
+            out.type = jbvNumeric;
+            out.val.numeric = jsonb_numeric_from_uint64(value);
+            return;
+        }
+        case z::zera::Tag::F64:
+        {
+            require_no_flags();
+            const uint64_t bits = static_cast<uint64_t>(a) |
+                                  (static_cast<uint64_t>(b) << 32);
+            const double number = std::bit_cast<double>(bits);
+            if (std::isfinite(number)) {
+                out.type = jbvNumeric;
+                out.val.numeric = jsonb_numeric_from_double(number);
+            } else if (std::isnan(number)) {
+                out.type = jbvString;
+                out.val.string.val = const_cast<char*>("NaN");
+                out.val.string.len = 3;
+            } else {
+                const char* text = number > 0 ? "Infinity" : "-Infinity";
+                out.type = jbvString;
+                out.val.string.val = const_cast<char*>(text);
+                out.val.string.len = static_cast<int>(std::strlen(text));
+            }
+            return;
+        }
+        case z::zera::Tag::String:
+        {
+            if ((flags & ~uint8_t{1}) != 0) {
+                throw z::DeserializationError("unknown ZERA string flags");
+            }
+            std::string_view value;
+            if ((flags & 1) != 0) {
+                if (aux > z::zera::InlineMax) {
+                    throw z::DeserializationError("ZERA inline string is too long");
+                }
+                value = std::string_view(
+                    reinterpret_cast<const char*>(ref + 4), aux);
+            } else {
+                zera_require_span(
+                    context.arena, a, b, "ZERA string arena span is out of bounds");
+                value = std::string_view(
+                    reinterpret_cast<const char*>(context.arena.data() + a), b);
+            }
+            validate_jsonb_string(value);
+            out.type = jbvString;
+            out.val.string.val = const_cast<char*>(value.data());
+            out.val.string.len = static_cast<int>(value.size());
+            return;
+        }
+        default:
+            throw z::DeserializationError("unknown ZERA value tag");
+    }
+}
+
+/*
+ * Recursive ZERA-envelope-to-JsonbValue-tree walker: mirrors
+ * zera_value_to_json's exact structure (bounds checks, cycle detection,
+ * container recursion) but pushes JsonbValues via pushJsonbValue instead
+ * of appending JSON text, so callers avoid the jsonb_in lex/parse round
+ * trip entirely. ZERA's string spans (inline-in-envelope or arena-backed)
+ * are already zero-copy views into the wire buffer, so unlike CBOR's
+ * always-materializing parser, no blob_arena entry is needed for them --
+ * only the base64-encoded TypedArray blob tag needs one.
+ */
+static JsonbValue* zera_value_to_jsonb(
+    ZeraDecodeContext& context, uint32_t ref_offset,
+    JsonbParseState** pstate, JsonbIteratorToken scalar_token,
+    size_t depth, std::deque<std::string>& blob_arena)
 {
     if (depth > 64) {
         throw z::DeserializationError("ZERA nesting depth exceeds 64");
@@ -1726,61 +1991,8 @@ static size_t zera_value_to_json(
         }
     };
 
+    JsonbValue* result = nullptr;
     switch (tag) {
-        case z::zera::Tag::Null:
-            require_no_flags();
-            out += "null";
-            break;
-        case z::zera::Tag::Bool:
-            require_no_flags();
-            if (aux > 1) throw z::DeserializationError("invalid ZERA boolean");
-            out += aux == 1 ? "true" : "false";
-            break;
-        case z::zera::Tag::I64:
-        {
-            require_no_flags();
-            const uint64_t bits = static_cast<uint64_t>(a) |
-                                  (static_cast<uint64_t>(b) << 32);
-            append_json_number(out, static_cast<int64_t>(bits));
-            break;
-        }
-        case z::zera::Tag::U64:
-        {
-            require_no_flags();
-            const uint64_t value = static_cast<uint64_t>(a) |
-                                   (static_cast<uint64_t>(b) << 32);
-            append_json_number(out, value);
-            break;
-        }
-        case z::zera::Tag::F64:
-        {
-            require_no_flags();
-            const uint64_t bits = static_cast<uint64_t>(a) |
-                                  (static_cast<uint64_t>(b) << 32);
-            append_cbor_float(out, std::bit_cast<double>(bits));
-            break;
-        }
-        case z::zera::Tag::String:
-        {
-            if ((flags & ~uint8_t{1}) != 0) {
-                throw z::DeserializationError("unknown ZERA string flags");
-            }
-            std::string_view value;
-            if ((flags & 1) != 0) {
-                if (aux > z::zera::InlineMax) {
-                    throw z::DeserializationError("ZERA inline string is too long");
-                }
-                value = std::string_view(
-                    reinterpret_cast<const char*>(ref + 4), aux);
-            } else {
-                zera_require_span(
-                    context.arena, a, b, "ZERA string arena span is out of bounds");
-                value = std::string_view(
-                    reinterpret_cast<const char*>(context.arena.data() + a), b);
-            }
-            append_json_string(out, value);
-            break;
-        }
         case z::zera::Tag::Array:
         {
             require_no_flags();
@@ -1792,15 +2004,14 @@ static size_t zera_value_to_json(
                 (context.envelope.size() - values_offset) / 16) {
                 throw z::DeserializationError("ZERA array values are out of bounds");
             }
-            out.push_back('[');
+            pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
             for (uint32_t i = 0; i < count; i++) {
-                if (i > 0) out.push_back(',');
-                zera_value_to_json(
+                zera_value_to_jsonb(
                     context,
                     static_cast<uint32_t>(values_offset + 16 * static_cast<size_t>(i)),
-                    out, depth + 1);
+                    pstate, WJB_ELEM, depth + 1, blob_arena);
             }
-            out.push_back(']');
+            result = pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
             break;
         }
         case z::zera::Tag::Object:
@@ -1810,8 +2021,8 @@ static size_t zera_value_to_json(
                 context.envelope, a, 4, "ZERA object payload is out of bounds");
             const uint32_t count = z::zera::read_u32_le(context.envelope.data() + a);
             size_t cursor = static_cast<size_t>(a) + 4;
-            std::unordered_set<std::string> keys;
-            out.push_back('{');
+            std::unordered_set<std::string_view> keys;
+            pushJsonbValue(pstate, WJB_BEGIN_OBJECT, nullptr);
             for (uint32_t i = 0; i < count; i++) {
                 zera_require_span(
                     context.envelope, cursor, 4, "ZERA object entry is truncated");
@@ -1825,21 +2036,25 @@ static size_t zera_value_to_json(
                 zera_require_span(
                     context.envelope, cursor, static_cast<size_t>(key_length) + 16,
                     "ZERA object key/value is truncated");
-                std::string key(
+                std::string_view key(
                     reinterpret_cast<const char*>(context.envelope.data() + cursor),
                     key_length);
                 if (!keys.insert(key).second) {
                     throw z::DeserializationError("duplicate ZERA object key");
                 }
-                if (i > 0) out.push_back(',');
-                append_json_string(out, key);
-                out.push_back(':');
+                validate_jsonb_string(key);
+                JsonbValue keyv;
+                keyv.type = jbvString;
+                keyv.val.string.val = const_cast<char*>(key.data());
+                keyv.val.string.len = static_cast<int>(key.size());
+                pushJsonbValue(pstate, WJB_KEY, &keyv);
                 cursor += key_length;
-                zera_value_to_json(
-                    context, static_cast<uint32_t>(cursor), out, depth + 1);
+                zera_value_to_jsonb(
+                    context, static_cast<uint32_t>(cursor), pstate, WJB_VALUE,
+                    depth + 1, blob_arena);
                 cursor += 16;
             }
-            out.push_back('}');
+            result = pushJsonbValue(pstate, WJB_END_OBJECT, nullptr);
             break;
         }
         case z::zera::Tag::TypedArray:
@@ -1860,17 +2075,40 @@ static size_t zera_value_to_json(
             }
             auto bytes = std::span<const std::byte>(
                 reinterpret_cast<const std::byte*>(context.arena.data() + a), b);
-            out += "[\"~b\",";
-            append_json_string(out, z::base64Encode(bytes));
-            out += ",\"base64\"]";
+
+            pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
+            JsonbValue tag_v;
+            tag_v.type = jbvString;
+            tag_v.val.string.val = const_cast<char*>("~b");
+            tag_v.val.string.len = 2;
+            pushJsonbValue(pstate, WJB_ELEM, &tag_v);
+
+            std::string& encoded = blob_arena.emplace_back(z::base64Encode(bytes));
+            JsonbValue enc_v;
+            enc_v.type = jbvString;
+            enc_v.val.string.val = encoded.data();
+            enc_v.val.string.len = static_cast<int>(encoded.size());
+            pushJsonbValue(pstate, WJB_ELEM, &enc_v);
+
+            JsonbValue fmt_v;
+            fmt_v.type = jbvString;
+            fmt_v.val.string.val = const_cast<char*>("base64");
+            fmt_v.val.string.len = 6;
+            pushJsonbValue(pstate, WJB_ELEM, &fmt_v);
+            result = pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
             break;
         }
         default:
-            throw z::DeserializationError("unknown ZERA value tag");
+        {
+            JsonbValue v;
+            zera_scalar_to_jsonb_value(context, ref_offset, v);
+            result = pushJsonbValue(pstate, scalar_token, &v);
+            break;
+        }
     }
 
     context.active_refs.erase(ref_offset);
-    return ref_offset + 16;
+    return result;
 }
 
 static z::dyn::Value jsonb_to_dynamic(Jsonb* jb)
@@ -5219,19 +5457,34 @@ msgpack_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
- * Shared decode core for flexbuffers_to_jsonb/flexbuffers_populate_record.
+ * Shared decode core for flexbuffers_to_jsonb/flexbuffers_populate_record
+ * (set): decodes straight to a Jsonb* via flex_value_to_jsonb -- no
+ * JSON-text/lexer round trip.
+ *
+ * A bare-scalar-root FlexBuffer document (jsonb permits a scalar document)
+ * is special-cased here rather than relying on flex_value_to_jsonb's
+ * pushJsonbValue(pstate, token, &v) path with a still-NULL pstate: that
+ * exact combination isn't something this code depends on, since
+ * JsonbValueToJsonb's documented raw-scalar path is the confirmed-safe
+ * route instead.
  */
-static std::string flex_decode_to_json_text(const uint8_t* bytes, size_t length)
+static Jsonb* flex_decode_to_jsonb(const uint8_t* bytes, size_t length)
 {
     if (!::flexbuffers::VerifyBuffer(bytes, length)) {
         throw z::DeserializationError("FlexBuffer verification failed");
     }
 
     ::flexbuffers::Reference root = ::flexbuffers::GetRoot(bytes, length);
-    std::string json;
-    json.reserve(length + 32);
-    flex_reference_to_json(root, json);
-    return json;
+    if (!root.IsMap() && !root.IsAnyVector() && !root.IsBlob()) {
+        JsonbValue v;
+        flex_scalar_to_jsonb_value(root, v);
+        return JsonbValueToJsonb(&v);
+    }
+
+    JsonbParseState* pstate = nullptr;
+    std::deque<std::string> blob_arena;
+    JsonbValue* result = flex_value_to_jsonb(root, &pstate, WJB_VALUE, blob_arena);
+    return JsonbValueToJsonb(result);
 }
 
 /*
@@ -5245,11 +5498,9 @@ flexbuffers_to_jsonb(PG_FUNCTION_ARGS)
     const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
 
     try {
-        std::string json = flex_decode_to_json_text(bytes, length);
+        Jsonb* result = flex_decode_to_jsonb(bytes, length);
         PG_FREE_IF_COPY(input, 0);
-
-        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        PG_RETURN_DATUM(result);
+        PG_RETURN_JSONB_P(result);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -5266,17 +5517,44 @@ flexbuffers_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
- * Shared decode core for cbor_to_jsonb/cbor_populate_record.
+ * Shared decode core for cbor_to_jsonb/cbor_populate_record(set): decodes
+ * straight to a Jsonb* via cbor_value_to_jsonb -- no JSON-text/lexer round
+ * trip.
+ *
+ * A bare-scalar-root CBOR document (jsonb permits a scalar document) is
+ * special-cased here rather than relying on cbor_value_to_jsonb's
+ * pushJsonbValue(pstate, token, &v) path with a still-NULL pstate: that
+ * exact combination isn't something this code depends on, since
+ * JsonbValueToJsonb's documented raw-scalar path is the confirmed-safe
+ * route instead. Peeking the one head byte to decide is cheap -- major type
+ * alone (2/4/5 = container, 6 = unsupported tag, else = scalar) is enough,
+ * no need to fully parse the value twice.
  */
-static std::string cbor_decode_to_json_text(std::span<const uint8_t> data)
+static Jsonb* cbor_decode_to_jsonb(std::span<const uint8_t> data)
 {
-    std::string json;
-    json.reserve(data.size() + 32);
-    const size_t consumed = cbor_value_to_json(data, 0, json);
+    CborHead head = cbor_read_head(data, 0);
+    if (head.major == 6) {
+        throw z::DeserializationError("CBOR semantic tags are not supported");
+    }
+
+    std::deque<std::string> blob_arena;
+    if (head.major == 2 || head.major == 4 || head.major == 5) {
+        JsonbParseState* pstate = nullptr;
+        JsonbValue* result = nullptr;
+        const size_t consumed =
+            cbor_value_to_jsonb(data, 0, &pstate, WJB_VALUE, blob_arena, &result);
+        if (consumed != data.size()) {
+            throw z::DeserializationError("trailing bytes after CBOR value");
+        }
+        return JsonbValueToJsonb(result);
+    }
+
+    JsonbValue v;
+    const size_t consumed = cbor_scalar_to_jsonb_value(data, 0, v, blob_arena);
     if (consumed != data.size()) {
         throw z::DeserializationError("trailing bytes after CBOR value");
     }
-    return json;
+    return JsonbValueToJsonb(&v);
 }
 
 /*
@@ -5291,11 +5569,9 @@ cbor_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = cbor_decode_to_json_text(data);
+        Jsonb* result = cbor_decode_to_jsonb(data);
         PG_FREE_IF_COPY(input, 0);
-
-        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        PG_RETURN_DATUM(result);
+        PG_RETURN_JSONB_P(result);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -5312,9 +5588,18 @@ cbor_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
- * Shared decode core for zera_to_jsonb/zera_populate_record.
+ * Shared decode core for zera_to_jsonb/zera_populate_record(set): decodes
+ * straight to a Jsonb* via zera_value_to_jsonb -- no JSON-text/lexer round
+ * trip.
+ *
+ * A bare-scalar-root ZERA document (jsonb permits a scalar document) is
+ * special-cased here rather than relying on zera_value_to_jsonb's
+ * pushJsonbValue(pstate, token, &v) path with a still-NULL pstate: that
+ * exact combination isn't something this code depends on, since
+ * JsonbValueToJsonb's documented raw-scalar path is the confirmed-safe
+ * route instead. Peeking the one tag byte to decide is cheap.
  */
-static std::string zera_decode_to_json_text(std::span<const uint8_t> data)
+static Jsonb* zera_decode_to_jsonb(std::span<const uint8_t> data)
 {
     if (data.size() < z::zera::HeaderSize) {
         throw z::DeserializationError("truncated ZERA header");
@@ -5352,10 +5637,22 @@ static std::string zera_decode_to_json_text(std::span<const uint8_t> data)
         data.subspan(z::zera::HeaderSize, header.env_size),
         data.subspan(header.arena_ofs),
         {}};
-    std::string json;
-    json.reserve(data.size() + 32);
-    zera_value_to_json(context, header.root_ofs, json, 0);
-    return json;
+
+    zera_require_span(
+        context.envelope, header.root_ofs, 16, "ZERA root ValueRef is out of bounds");
+    const auto root_tag = static_cast<z::zera::Tag>(context.envelope[header.root_ofs]);
+    if (root_tag != z::zera::Tag::Array && root_tag != z::zera::Tag::Object &&
+        root_tag != z::zera::Tag::TypedArray) {
+        JsonbValue v;
+        zera_scalar_to_jsonb_value(context, header.root_ofs, v);
+        return JsonbValueToJsonb(&v);
+    }
+
+    JsonbParseState* pstate = nullptr;
+    std::deque<std::string> blob_arena;
+    JsonbValue* result = zera_value_to_jsonb(
+        context, header.root_ofs, &pstate, WJB_VALUE, 0, blob_arena);
+    return JsonbValueToJsonb(result);
 }
 
 /*
@@ -5370,11 +5667,9 @@ zera_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = zera_decode_to_json_text(data);
+        Jsonb* result = zera_decode_to_jsonb(data);
         PG_FREE_IF_COPY(input, 0);
-
-        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        PG_RETURN_DATUM(result);
+        PG_RETURN_JSONB_P(result);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -5562,12 +5857,11 @@ beve_to_jsonb(PG_FUNCTION_ARGS)
 
 /*
  * Shared decode-to-composite core for X_populate_record. Reuses each
- * protocol's own X_decode_to_jsonb() (msgpack/ion/bson/beve) or
- * X_decode_to_json_text() (cbor/zera/flexbuffers) -- both already
- * validated/tested via X_to_jsonb -- to get a Jsonb*, then walks that
- * Jsonb tree directly into a PostgreSQL composite Datum using the same
- * CachedSchema/CachedColumn metadata the encode side uses, mirroring
- * jsonb_populate_record's base-row-fallback and tag-decoding semantics.
+ * protocol's own X_decode_to_jsonb() -- already validated/tested via
+ * X_to_jsonb -- to get a Jsonb*, then walks that Jsonb tree directly into a
+ * PostgreSQL composite Datum using the same CachedSchema/CachedColumn
+ * metadata the encode side uses, mirroring jsonb_populate_record's
+ * base-row-fallback and tag-decoding semantics.
  */
 static Datum populate_composite_from_jsonb_container(
     JsonbContainer* container, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec);
@@ -5930,9 +6224,7 @@ cbor_populate_record(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = cbor_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = cbor_decode_to_jsonb(data);
         PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -6088,9 +6380,7 @@ zera_populate_record(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = zera_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = zera_decode_to_jsonb(data);
         PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -6128,9 +6418,7 @@ flexbuffers_populate_record(PG_FUNCTION_ARGS)
     const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
 
     try {
-        std::string json = flex_decode_to_json_text(bytes, length);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = flex_decode_to_jsonb(bytes, length);
         PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -6268,9 +6556,7 @@ cbor_populate_recordset(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = cbor_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = cbor_decode_to_jsonb(data);
         populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -6397,9 +6683,7 @@ zera_populate_recordset(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = zera_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = zera_decode_to_jsonb(data);
         populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -6439,9 +6723,7 @@ flexbuffers_populate_recordset(PG_FUNCTION_ARGS)
     const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
 
     try {
-        std::string json = flex_decode_to_json_text(bytes, length);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = flex_decode_to_jsonb(bytes, length);
         populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
