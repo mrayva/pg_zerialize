@@ -52,6 +52,7 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #undef INVALID
 
 #include <vector>
+#include <deque>
 #include <string>
 #include <string_view>
 #include <cstring>
@@ -166,7 +167,7 @@ extern "C" {
     // BSON: a document and a bare array are wire-identical at the root (no
     // parent element header to carry the type tag there), so anything that
     // would produce or require a bare-array-root BSON value is deliberately
-    // NOT provided here -- see BSON.md and bson_decode_to_json_text()'s
+    // NOT provided here -- see BSON.md and bson_decode_to_jsonb()'s
     // comment. Only the map/document-rooted subset is exposed.
     Datum row_to_bson(PG_FUNCTION_ARGS);
     Datum bson_from_jsonb(PG_FUNCTION_ARGS);
@@ -1037,7 +1038,12 @@ static size_t msgpack_validate_value(std::span<const uint8_t> data, size_t pos)
     return pos + payload_size;
 }
 
-static void append_json_string(std::string& out, std::string_view value)
+// Shared by append_json_string (text path) and the JsonbValue-tree builders
+// below (reader_value_to_jsonb): pushJsonbValue does no validation of its
+// own -- a jbvString is just a stored {char*,int} pointer/length pair, byte-
+// copied verbatim by JsonbValueToJsonb later -- so these checks have to live
+// here rather than in the (bypassed, for the jsonb path) text-escaping step.
+static void validate_jsonb_string(std::string_view value)
 {
     if (value.find('\0') != std::string_view::npos) {
         throw z::DeserializationError("decoded string contains NUL");
@@ -1046,6 +1052,11 @@ static void append_json_string(std::string& out, std::string_view value)
         throw z::DeserializationError(
             "decoded string is invalid in the database encoding");
     }
+}
+
+static void append_json_string(std::string& out, std::string_view value)
+{
+    validate_jsonb_string(value);
     static constexpr char hex[] = "0123456789abcdef";
     out.push_back('"');
     for (unsigned char ch : value) {
@@ -1088,120 +1099,226 @@ static void append_json_number(std::string& out, Number value)
     out.append(buffer.data(), converted.ptr);
 }
 
-static void msgpack_reader_to_json(
-    const z::MsgPackDeserializer& value, std::string& out)
+// ===== Numeric -> Numeric helpers for the JsonbValue-tree builders below =====
+//
+// jbvNumeric needs an actual Numeric datum (see JsonbValue's tagged union),
+// not text -- these are the direct (no full-document JSON-text/lexer pass)
+// equivalents of what append_json_number+jsonb_in's own number lexer used
+// to do for each scalar.
+
+static inline Numeric jsonb_numeric_from_int64(int64_t v)
 {
-    check_stack_depth();
+    return int64_to_numeric(v);
+}
+
+// No uint64_to_numeric exists in PostgreSQL. Values that fit in int64 (the
+// overwhelming majority) take the exact, textless int64_to_numeric path;
+// only full-width unsigned wire integers above INT64_MAX fall back to a
+// decimal-text round trip through numeric_in -- still just one small
+// per-scalar text conversion, not the whole-document text/lexer pass this
+// project exists to eliminate.
+static inline Numeric jsonb_numeric_from_uint64(uint64_t v)
+{
+    if (v <= static_cast<uint64_t>(INT64_MAX)) {
+        return int64_to_numeric(static_cast<int64_t>(v));
+    }
+    std::array<char, 24> buffer; // uint64_t max is 20 digits
+    auto converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), v);
+    if (converted.ec != std::errc()) {
+        throw z::DeserializationError("failed to format decoded number");
+    }
+    *converted.ptr = '\0';
+    return DatumGetNumeric(DirectFunctionCall3(
+        numeric_in, CStringGetDatum(buffer.data()), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+}
+
+// PostgreSQL's own float8_numeric formats internally via "%.*g" with
+// DBL_DIG (15 significant digits) -- not guaranteed round-trip-exact for
+// every double. This extension's existing text path instead formats via
+// std::to_chars(..., max_digits10) (17 digits, round-trip-exact) before
+// jsonb_in's lexer parses it -- using float8_numeric directly here would be
+// a silent precision *regression* versus that existing behavior. Keeps the
+// same max_digits10 text formatting, then numeric_in on that text, to
+// preserve exact current precision while still skipping the whole-document
+// JSON-text/lexer pass (the actual cost driver: escaping, structural
+// parsing, one giant string buffer per document) -- just one small
+// per-float-leaf text round trip instead.
+static inline Numeric jsonb_numeric_from_double(double v)
+{
+    std::array<char, 64> buffer;
+    auto converted = std::to_chars(buffer.data(), buffer.data() + buffer.size(), v,
+                                    std::chars_format::general,
+                                    std::numeric_limits<double>::max_digits10);
+    if (converted.ec != std::errc()) {
+        throw z::DeserializationError("failed to format decoded number");
+    }
+    *converted.ptr = '\0';
+    return DatumGetNumeric(DirectFunctionCall3(
+        numeric_in, CStringGetDatum(buffer.data()), ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1)));
+}
+
+// ===== Direct Reader-to-JsonbValue tree builders (no JSON-text pass) =====
+//
+// Populates a JsonbValue for leaf kinds only (null/bool/int/uint/float/
+// string) -- NOT array/map/blob, which are container-shaped and handled by
+// reader_value_to_jsonb below. Shared between that recursive walker and
+// reader_to_jsonb's bare-root-scalar case (jsonb permits a scalar as the
+// whole document).
+template<typename V>
+    requires z::ValueView<V>
+static void reader_scalar_to_jsonb_value(JsonbValue& out, const V& value)
+{
     if (value.isNull()) {
-        out += "null";
+        out.type = jbvNull;
     } else if (value.isBool()) {
-        out += value.asBool() ? "true" : "false";
+        out.type = jbvBool;
+        out.val.boolean = value.asBool();
     } else if (value.isUInt()) {
-        append_json_number(out, value.asUInt64());
+        out.type = jbvNumeric;
+        out.val.numeric = jsonb_numeric_from_uint64(value.asUInt64());
     } else if (value.isInt()) {
-        append_json_number(out, value.asInt64());
+        out.type = jbvNumeric;
+        out.val.numeric = jsonb_numeric_from_int64(value.asInt64());
     } else if (value.isFloat()) {
         const double number = value.asDouble();
         if (std::isfinite(number)) {
-            append_json_number(out, number);
+            out.type = jbvNumeric;
+            out.val.numeric = jsonb_numeric_from_double(number);
         } else if (std::isnan(number)) {
-            append_json_string(out, "NaN");
+            out.type = jbvString;
+            out.val.string.val = const_cast<char*>("NaN");
+            out.val.string.len = 3;
         } else {
-            append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
+            const char* text = number > 0 ? "Infinity" : "-Infinity";
+            out.type = jbvString;
+            out.val.string.val = const_cast<char*>(text);
+            out.val.string.len = static_cast<int>(std::strlen(text));
         }
     } else if (value.isString()) {
-        append_json_string(out, value.asStringView());
-    } else if (value.isBlob()) {
-        out += "[\"~b\",";
-        append_json_string(out, z::base64Encode(value.asBlob()));
-        out += ",\"base64\"]";
-    } else if (value.isArray()) {
-        out.push_back('[');
-        bool first = true;
-        for (auto&& element : value.elements()) {
-            if (!first) out.push_back(',');
-            first = false;
-            msgpack_reader_to_json(element, out);
-        }
-        out.push_back(']');
-    } else if (value.isMap()) {
-        out.push_back('{');
-        bool first = true;
-        for (auto&& entry : value.mapEntries()) {
-            if (!first) out.push_back(',');
-            first = false;
-            append_json_string(out, entry.key);
-            out.push_back(':');
-            msgpack_reader_to_json(entry.value, out);
-        }
-        out.push_back('}');
+        auto sv = value.asStringView();
+        validate_jsonb_string(sv);
+        out.type = jbvString;
+        // Zero-copy: points directly into the source wire buffer. Safe
+        // because pushJsonbValue only stores the pointer -- the byte copy
+        // happens later, inside JsonbValueToJsonb -- and that buffer (the
+        // bytea PG_GETARG argument backing `value`) outlives this whole
+        // call. See reader_value_to_jsonb's isBlob() branch for the one
+        // case (derived, not source-backed, strings) that needs the
+        // blob_arena instead.
+        out.val.string.val = const_cast<char*>(sv.data());
+        out.val.string.len = static_cast<int>(sv.size());
     } else {
-        throw z::DeserializationError("unsupported MessagePack value");
+        throw z::DeserializationError("unsupported scalar value");
     }
 }
 
 /*
- * reader_value_to_json - Generic Reader-concept-to-JSON-text walker, shared
- * by ion_to_jsonb/ion_populate_record(set) and bson_to_jsonb/
- * bson_populate_record. Unlike msgpack/cbor/zera/flexbuffers (which each
- * hand-parse their own wire bytes directly for speed), Ion and BSON go
- * through zerialize's own Deserializer/Reader interface here instead of a
- * new hand-rolled byte parser per format -- the same interface msgpack's
- * own msgpack_reader_to_json above already uses. This is the generic/slow
- * path; a hand-tuned byte-level decoder can be added later per format the
- * same way it eventually was for cbor/zera/flexbuffers.
+ * reader_value_to_jsonb - direct Reader-concept-to-JsonbValue-tree walker,
+ * shared by msgpack/ion/bson/beve's X_to_jsonb/X_populate_record(set).
+ * Mirrors reader_value_to_json's exact dispatch order and conventions
+ * (including the ["~b",base64,"base64"] blob tag) but drives PostgreSQL's
+ * own pushJsonbValue directly instead of building JSON text that jsonb_in
+ * would otherwise have to re-lex -- see reader_to_jsonb below for the
+ * entry point and the scoping plan for why (skips the whole-document
+ * JSON-text/lexer round trip; only individual numeric leaves that can't
+ * map onto a direct C-to-Numeric conversion still go through a small
+ * per-scalar text round trip, see jsonb_numeric_from_{uint64,double}).
+ *
+ * Returns the JsonbValue* from its own final pushJsonbValue call: NULL for
+ * nested calls (there's still an open parent frame), non-NULL exactly at
+ * the outermost call once the whole tree is complete -- reader_to_jsonb
+ * uses that as the value to finalize.
+ *
+ * blob_arena owns any string this function derives rather than views
+ * zero-copy from the source wire bytes (currently: only the base64-encoded
+ * blob tag). pushJsonbValue's jbvString stores a {char*,int} pointer/length
+ * pair, not a copy -- the actual byte copy happens later, inside
+ * JsonbValueToJsonb -- so any derived string must stay alive until that
+ * final call. std::deque specifically: unlike std::vector, appending to it
+ * never relocates or invalidates already-constructed elements, so pointers
+ * into earlier strings stay valid as more are appended.
  */
 template<typename V>
     requires z::ValueView<V>
-static void reader_value_to_json(const V& value, std::string& out)
+static JsonbValue* reader_value_to_jsonb(
+    JsonbParseState** pstate, JsonbIteratorToken scalar_token,
+    const V& value, std::deque<std::string>& blob_arena)
 {
     check_stack_depth();
-    if (value.isNull()) {
-        out += "null";
-    } else if (value.isBool()) {
-        out += value.asBool() ? "true" : "false";
-    } else if (value.isUInt()) {
-        append_json_number(out, value.asUInt64());
-    } else if (value.isInt()) {
-        append_json_number(out, value.asInt64());
-    } else if (value.isFloat()) {
-        const double number = value.asDouble();
-        if (std::isfinite(number)) {
-            append_json_number(out, number);
-        } else if (std::isnan(number)) {
-            append_json_string(out, "NaN");
-        } else {
-            append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
-        }
-    } else if (value.isString()) {
-        append_json_string(out, value.asStringView());
-    } else if (value.isBlob()) {
-        out += "[\"~b\",";
-        append_json_string(out, z::base64Encode(value.asBlob()));
-        out += ",\"base64\"]";
+    if (value.isBlob()) {
+        pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
+
+        JsonbValue tag;
+        tag.type = jbvString;
+        tag.val.string.val = const_cast<char*>("~b");
+        tag.val.string.len = 2;
+        pushJsonbValue(pstate, WJB_ELEM, &tag);
+
+        // Derived (base64-encoded), not source-backed -- must outlive this
+        // whole tree build, not just this call. See the arena note above.
+        std::string& encoded = blob_arena.emplace_back(z::base64Encode(value.asBlob()));
+        JsonbValue enc;
+        enc.type = jbvString;
+        enc.val.string.val = encoded.data();
+        enc.val.string.len = static_cast<int>(encoded.size());
+        pushJsonbValue(pstate, WJB_ELEM, &enc);
+
+        JsonbValue fmt;
+        fmt.type = jbvString;
+        fmt.val.string.val = const_cast<char*>("base64");
+        fmt.val.string.len = 6;
+        pushJsonbValue(pstate, WJB_ELEM, &fmt);
+
+        return pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
     } else if (value.isArray()) {
-        out.push_back('[');
-        bool first = true;
+        pushJsonbValue(pstate, WJB_BEGIN_ARRAY, nullptr);
         for (auto&& element : value.elements()) {
-            if (!first) out.push_back(',');
-            first = false;
-            reader_value_to_json(element, out);
+            reader_value_to_jsonb(pstate, WJB_ELEM, element, blob_arena);
         }
-        out.push_back(']');
+        return pushJsonbValue(pstate, WJB_END_ARRAY, nullptr);
     } else if (value.isMap()) {
-        out.push_back('{');
-        bool first = true;
+        pushJsonbValue(pstate, WJB_BEGIN_OBJECT, nullptr);
         for (auto&& entry : value.mapEntries()) {
-            if (!first) out.push_back(',');
-            first = false;
-            append_json_string(out, entry.key);
-            out.push_back(':');
-            reader_value_to_json(entry.value, out);
+            validate_jsonb_string(entry.key);
+            JsonbValue key;
+            key.type = jbvString;
+            key.val.string.val = const_cast<char*>(entry.key.data());
+            key.val.string.len = static_cast<int>(entry.key.size());
+            pushJsonbValue(pstate, WJB_KEY, &key);
+            reader_value_to_jsonb(pstate, WJB_VALUE, entry.value, blob_arena);
         }
-        out.push_back('}');
+        return pushJsonbValue(pstate, WJB_END_OBJECT, nullptr);
     } else {
-        throw z::DeserializationError("unsupported value");
+        JsonbValue v;
+        reader_scalar_to_jsonb_value(v, value);
+        return pushJsonbValue(pstate, scalar_token, &v);
     }
+}
+
+/*
+ * reader_to_jsonb - top-level entry point: decode `root` (a zerialize
+ * Reader-concept value -- msgpack/ion/bson/beve's Deserializer, all of
+ * which satisfy z::ValueView) directly into a Jsonb*, with no JSON-text
+ * intermediate. Replaces X_decode_to_json_text(...) +
+ * DirectFunctionCall1(jsonb_in, ...) for these four formats.
+ */
+template<typename V>
+    requires z::ValueView<V>
+static Jsonb* reader_to_jsonb(const V& root)
+{
+    if (!root.isArray() && !root.isMap() && !root.isBlob()) {
+        // Bare scalar document (jsonb permits this, matching jsonb_in) --
+        // JsonbValueToJsonb has a documented raw-scalar path for exactly
+        // this case (wraps it in a synthetic 1-element rawScalar array);
+        // no JsonbParseState/pushJsonbValue involved at all.
+        JsonbValue v;
+        reader_scalar_to_jsonb_value(v, root);
+        return JsonbValueToJsonb(&v);
+    }
+    JsonbParseState* pstate = nullptr;
+    std::deque<std::string> blob_arena;
+    JsonbValue* result = reader_value_to_jsonb(&pstate, WJB_VALUE, root, blob_arena);
+    return JsonbValueToJsonb(result);
 }
 
 static void flex_reference_to_json(
@@ -5056,22 +5173,19 @@ msgpack_from_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
- * Shared decode core for msgpack_to_jsonb/msgpack_populate_record: validates
- * one complete MessagePack value and renders it to JSON text. Throws
+ * Shared decode core for msgpack_to_jsonb/msgpack_populate_record(set):
+ * validates one complete MessagePack value and decodes it straight to a
+ * Jsonb* via reader_to_jsonb -- no JSON-text/lexer round trip. Throws
  * z::DeserializationError (or lets one propagate) on any invalid input.
  */
-static std::string msgpack_decode_to_json_text(std::span<const uint8_t> data)
+static Jsonb* msgpack_decode_to_jsonb(std::span<const uint8_t> data)
 {
     const size_t consumed = msgpack_validate_value(data, 0);
     if (consumed != data.size()) {
         throw z::DeserializationError("trailing bytes after MessagePack value");
     }
-
     z::MsgPackDeserializer reader(data);
-    std::string json;
-    json.reserve(data.size() + 32);
-    msgpack_reader_to_json(reader, json);
-    return json;
+    return reader_to_jsonb(reader);
 }
 
 /*
@@ -5086,11 +5200,9 @@ msgpack_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = msgpack_decode_to_json_text(data);
+        Jsonb* result = msgpack_decode_to_jsonb(data);
         PG_FREE_IF_COPY(input, 0);
-
-        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        PG_RETURN_DATUM(result);
+        PG_RETURN_JSONB_P(result);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -5279,7 +5391,9 @@ zera_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
- * Shared decode core for ion_to_jsonb/ion_populate_record(set).
+ * Shared decode core for ion_to_jsonb/ion_populate_record(set): decodes
+ * straight to a Jsonb* via reader_to_jsonb -- no JSON-text/lexer round
+ * trip.
  *
  * Unlike msgpack/cbor/zera/flexbuffers -- which each encode exactly one
  * value per bytea and reject trailing bytes as corruption -- Ion's own wire
@@ -5287,13 +5401,10 @@ zera_to_jsonb(PG_FUNCTION_ARGS)
  * back. IonDeserializer decodes the first one, matching standard Ion reader
  * semantics; bytes after it are not an error here.
  */
-static std::string ion_decode_to_json_text(std::span<const uint8_t> data)
+static Jsonb* ion_decode_to_jsonb(std::span<const uint8_t> data)
 {
     z::Ion::Deserializer reader(data);
-    std::string json;
-    json.reserve(data.size() + 32);
-    reader_value_to_json(reader, json);
-    return json;
+    return reader_to_jsonb(reader);
 }
 
 /*
@@ -5308,11 +5419,9 @@ ion_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = ion_decode_to_json_text(data);
+        Jsonb* result = ion_decode_to_jsonb(data);
         PG_FREE_IF_COPY(input, 0);
-
-        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        PG_RETURN_DATUM(result);
+        PG_RETURN_JSONB_P(result);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -5329,25 +5438,27 @@ ion_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
- * Shared decode core for bson_to_jsonb/bson_populate_record.
+ * Shared decode core for bson_to_jsonb/bson_populate_record: decodes
+ * straight to a Jsonb* via reader_to_jsonb -- no JSON-text/lexer round
+ * trip.
  *
  * A BSON document's first 4 bytes are its own little-endian total length,
  * so trailing-bytes detection is a direct read rather than a parse -- no
  * need to duplicate BsonDeserializer's own internal walk just to compute
- * how many bytes the root value consumed the way ion_decode_to_json_text
- * would have to.
+ * how many bytes the root value consumed the way ion_decode_to_jsonb has
+ * to.
  *
  * A document and a bare array are physically identical on the wire (only a
  * *parent* element's header records which one a value is, and the root has
  * no parent -- see BSON.md and the forward-declaration comment above), so
  * BsonDeserializer always decodes an unannotated root as a map, exactly
  * like jsoncons' own bson_parser. That's expected here, not a bug: this
- * extension only ever hands bson_decode_to_json_text bytes that came from
+ * extension only ever hands bson_decode_to_jsonb bytes that came from
  * row_to_bson/bson_from_jsonb/bson_build_object (always map-rooted) or an
  * external, spec-compliant BSON document (also always map-rooted, since a
  * standalone BSON document is defined to be a document, not a bare array).
  */
-static std::string bson_decode_to_json_text(std::span<const uint8_t> data)
+static void bson_check_no_trailing_bytes(std::span<const uint8_t> data)
 {
     if (data.size() < 4) {
         throw z::DeserializationError("truncated BSON document");
@@ -5358,12 +5469,13 @@ static std::string bson_decode_to_json_text(std::span<const uint8_t> data)
     if (declared_len != data.size()) {
         throw z::DeserializationError("trailing bytes after BSON document");
     }
+}
 
+static Jsonb* bson_decode_to_jsonb(std::span<const uint8_t> data)
+{
+    bson_check_no_trailing_bytes(data);
     z::Bson::Deserializer reader(data);
-    std::string json;
-    json.reserve(data.size() + 32);
-    reader_value_to_json(reader, json);
-    return json;
+    return reader_to_jsonb(reader);
 }
 
 /*
@@ -5378,11 +5490,9 @@ bson_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = bson_decode_to_json_text(data);
+        Jsonb* result = bson_decode_to_jsonb(data);
         PG_FREE_IF_COPY(input, 0);
-
-        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        PG_RETURN_DATUM(result);
+        PG_RETURN_JSONB_P(result);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -5399,7 +5509,9 @@ bson_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
- * Shared decode core for beve_to_jsonb/beve_populate_record(set).
+ * Shared decode core for beve_to_jsonb/beve_populate_record(set): decodes
+ * straight to a Jsonb* via reader_to_jsonb -- no JSON-text/lexer round
+ * trip.
  *
  * Unlike msgpack/cbor/zera/flexbuffers/BSON, this does NOT reject trailing
  * bytes after a complete top-level document (confirmed empirically: bytes
@@ -5412,13 +5524,10 @@ bson_to_jsonb(PG_FUNCTION_ARGS)
  * (Ion's is deliberate stream semantics; BEVE's is simply that nothing in
  * the reader looks at what's left in the buffer).
  */
-static std::string beve_decode_to_json_text(std::span<const uint8_t> data)
+static Jsonb* beve_decode_to_jsonb(std::span<const uint8_t> data)
 {
     z::Beve::Deserializer reader(data);
-    std::string json;
-    json.reserve(data.size() + 32);
-    reader_value_to_json(reader, json);
-    return json;
+    return reader_to_jsonb(reader);
 }
 
 /*
@@ -5433,11 +5542,9 @@ beve_to_jsonb(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = beve_decode_to_json_text(data);
+        Jsonb* result = beve_decode_to_jsonb(data);
         PG_FREE_IF_COPY(input, 0);
-
-        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        PG_RETURN_DATUM(result);
+        PG_RETURN_JSONB_P(result);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -5455,11 +5562,12 @@ beve_to_jsonb(PG_FUNCTION_ARGS)
 
 /*
  * Shared decode-to-composite core for X_populate_record. Reuses each
- * protocol's own X_decode_to_json_text() (already validated/tested via
- * X_to_jsonb) to get a Jsonb*, then walks that Jsonb tree directly into a
- * PostgreSQL composite Datum using the same CachedSchema/CachedColumn
- * metadata the encode side uses, mirroring jsonb_populate_record's
- * base-row-fallback and tag-decoding semantics.
+ * protocol's own X_decode_to_jsonb() (msgpack/ion/bson/beve) or
+ * X_decode_to_json_text() (cbor/zera/flexbuffers) -- both already
+ * validated/tested via X_to_jsonb -- to get a Jsonb*, then walks that
+ * Jsonb tree directly into a PostgreSQL composite Datum using the same
+ * CachedSchema/CachedColumn metadata the encode side uses, mirroring
+ * jsonb_populate_record's base-row-fallback and tag-decoding semantics.
  */
 static Datum populate_composite_from_jsonb_container(
     JsonbContainer* container, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec);
@@ -5783,9 +5891,7 @@ msgpack_populate_record(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = msgpack_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = msgpack_decode_to_jsonb(data);
         PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -5865,9 +5971,7 @@ ion_populate_record(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = ion_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = ion_decode_to_jsonb(data);
         PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -5906,9 +6010,7 @@ bson_populate_record(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = bson_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = bson_decode_to_jsonb(data);
         PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -5947,9 +6049,7 @@ beve_populate_record(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = beve_decode_to_json_text(data);
-        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        Jsonb* jb = beve_decode_to_jsonb(data);
         PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
     } catch (const std::exception& ex) {
         ereport(ERROR,
@@ -6079,12 +6179,9 @@ static Tuplestorestate* populate_recordset_begin(FunctionCallInfo fcinfo, Oid tu
     return tupstore;
 }
 
-static void populate_recordset_from_json_text(
-    Tuplestorestate* tupstore, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec, const std::string& json)
+static void populate_recordset_from_jsonb_container(
+    Tuplestorestate* tupstore, Oid tupType, int32 tupTypmod, HeapTupleHeader base_rec, JsonbContainer* root)
 {
-    Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
-    Jsonb* jb = DatumGetJsonbP(jsonb_datum);
-    JsonbContainer* root = &jb->root;
     if (!JsonContainerIsArray(root) || JsonContainerIsScalar(root)) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
@@ -6130,8 +6227,8 @@ msgpack_populate_recordset(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = msgpack_decode_to_json_text(data);
-        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+        Jsonb* jb = msgpack_decode_to_jsonb(data);
+        populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -6172,7 +6269,9 @@ cbor_populate_recordset(PG_FUNCTION_ARGS)
 
     try {
         std::string json = cbor_decode_to_json_text(data);
-        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -6193,7 +6292,7 @@ cbor_populate_recordset(PG_FUNCTION_ARGS)
  * typed composites, using base for columns each document omits.
  *
  * No bson_populate_recordset: it would require decoding a bare-array-root
- * BSON document, which bson_decode_to_json_text cannot distinguish from a
+ * BSON document, which bson_decode_to_jsonb cannot distinguish from a
  * document (see BSON.md and the forward-declaration comment above).
  */
 extern "C" Datum
@@ -6216,8 +6315,8 @@ ion_populate_recordset(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = ion_decode_to_json_text(data);
-        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+        Jsonb* jb = ion_decode_to_jsonb(data);
+        populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -6257,8 +6356,8 @@ beve_populate_recordset(PG_FUNCTION_ARGS)
     std::span<const uint8_t> data(bytes, length);
 
     try {
-        std::string json = beve_decode_to_json_text(data);
-        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+        Jsonb* jb = beve_decode_to_jsonb(data);
+        populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -6299,7 +6398,9 @@ zera_populate_recordset(PG_FUNCTION_ARGS)
 
     try {
         std::string json = zera_decode_to_json_text(data);
-        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -6339,7 +6440,9 @@ flexbuffers_populate_recordset(PG_FUNCTION_ARGS)
 
     try {
         std::string json = flex_decode_to_json_text(bytes, length);
-        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        populate_recordset_from_jsonb_container(tupstore, tupType, tupTypmod, base_rec, &jb->root);
     } catch (const std::exception& ex) {
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
@@ -7324,7 +7427,7 @@ rows_to_zera(PG_FUNCTION_ARGS)
  * rows_to_ion - Convert array of PostgreSQL records to Ion binary format
  *
  * No rows_to_bson: array_to_binary<z::Bson> would produce a bare-array-root
- * BSON document, which bson_decode_to_json_text (and so
+ * BSON document, which bson_decode_to_jsonb (and so
  * bson_populate_recordset) cannot read back as an array -- see BSON.md and
  * the forward-declaration comment above.
  */
