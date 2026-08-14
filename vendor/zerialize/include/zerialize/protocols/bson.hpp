@@ -264,7 +264,24 @@ public:
     bool isNull()   const { using namespace jsoncons::bson::bson_type; return type_ == null_type || type_ == undefined_type; }
     bool isBool()   const { return type_ == jsoncons::bson::bson_type::bool_type; }
     bool isInt()    const { using namespace jsoncons::bson::bson_type; return type_ == int32_type || type_ == int64_type; }
-    bool isUInt()   const { return isInt() && rawInt64() >= 0; } // BSON has no unsigned wire type; see BSON.md
+    // BSON has no unsigned wire type (see BSON.md): int32_type/int64_type
+    // do double duty, and "is this actually non-negative" is the only
+    // question this needs answered. Peeks the sign bit directly (BSON is
+    // little-endian, so it's the top bit of the last byte) instead of
+    // calling rawInt64() to assemble the full magnitude just to throw it
+    // away -- asUInt64() below still does that full decode, once.
+    bool isUInt() const {
+        using namespace jsoncons::bson::bson_type;
+        if (type_ == int32_type) {
+            ensure(pos_ + 4 <= buf_.size(), "BSON: truncated int32");
+            return (buf_[pos_ + 3] & 0x80) == 0;
+        }
+        if (type_ == int64_type) {
+            ensure(pos_ + 8 <= buf_.size(), "BSON: truncated int64");
+            return (buf_[pos_ + 7] & 0x80) == 0;
+        }
+        return false;
+    }
     bool isFloat()  const { return type_ == jsoncons::bson::bson_type::double_type; }
     bool isString() const { using namespace jsoncons::bson::bson_type; return type_ == string_type || type_ == symbol_type; }
     bool isBlob()   const { return type_ == jsoncons::bson::bson_type::binary_type; }
