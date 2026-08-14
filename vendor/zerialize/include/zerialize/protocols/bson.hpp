@@ -352,6 +352,15 @@ public:
         return KeysView{ buf_, pos_ };
     }
 
+    // Like KeysView, but each dereference also hands back the value at that
+    // same position -- avoids the O(n) re-scan-from-start that operator[]
+    // does when a caller wants (key, value) for every entry (walking the
+    // whole document via mapKeys()+operator[] is O(n^2); this is O(n)).
+    // Defined out-of-line below: Entry holds a BsonDeserializer by value,
+    // which needs the class to be complete first.
+    struct EntriesView;
+    EntriesView mapEntries() const;
+
     bool contains(std::string_view key) const {
         if (!isMap()) return false;
         auto cs = container_span(buf_, pos_);
@@ -435,6 +444,45 @@ private:
         os << "?";
     }
 };
+
+struct BsonDeserializer::EntriesView {
+    std::span<const uint8_t> buf;
+    std::size_t value_off;
+
+    struct Entry { std::string_view key; BsonDeserializer value; };
+
+    struct iterator {
+        std::span<const uint8_t> buf{};
+        std::size_t q = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = Entry;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = Entry;
+
+        iterator() = default;
+
+        reference operator*() const {
+            auto e = BsonDeserializer::read_elem(buf, q);
+            return Entry{ e.name, BsonDeserializer(buf, e.value_off, e.type) };
+        }
+        iterator& operator++() {
+            if (q < buf.size() && buf[q] != 0x00) q = BsonDeserializer::read_elem(buf, q).end_off;
+            return *this;
+        }
+        iterator operator++(int) { auto tmp = *this; ++(*this); return tmp; }
+        friend bool operator==(const iterator& a, const iterator& b) { return a.q == b.q && a.buf.data() == b.buf.data(); }
+    };
+
+    iterator begin() const { auto cs = BsonDeserializer::container_span(buf, value_off); iterator it; it.buf = buf; it.q = cs.first; return it; }
+    iterator end()   const { auto cs = BsonDeserializer::container_span(buf, value_off); iterator it; it.buf = buf; it.q = cs.term;  return it; }
+};
+
+inline BsonDeserializer::EntriesView BsonDeserializer::mapEntries() const {
+    ensure(isMap(), "BSON: value is not a document");
+    return EntriesView{ buf_, pos_ };
+}
 
 } // namespace bsonjc
 

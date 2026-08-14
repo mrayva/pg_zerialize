@@ -449,6 +449,15 @@ public:
         return KeysView{ view_, n, off };
     }
 
+    // Like KeysView, but each dereference also hands back the value at that
+    // same position -- avoids the O(n) re-scan-from-start that operator[]
+    // does when a caller wants (key, value) for every entry (walking the
+    // whole map via mapKeys()+operator[] is O(n^2); this is O(n)). Defined
+    // out-of-line below: Entry holds a MsgPackDeserializer by value, which
+    // needs the class to be complete first.
+    struct EntriesView;
+    EntriesView mapEntries() const;
+
     bool contains(std::string_view key) const {
         if (!isMap()) return false;
         size_t n=0, off=0; map_info(view_, n, off);
@@ -506,6 +515,70 @@ public:
     // expose raw view if you need it
     std::span<const uint8_t> raw_view() const { return view_; }
 };
+
+struct MsgPackDeserializer::EntriesView {
+    std::span<const uint8_t> v{};
+    size_t count = 0;
+    size_t payload_off = 0;
+
+    struct Entry { std::string_view key; MsgPackDeserializer value; };
+
+    struct iterator {
+        std::span<const uint8_t> v{};
+        size_t i = 0;
+        size_t off = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = Entry;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = Entry;
+
+        iterator() = default;
+        iterator(std::span<const uint8_t> vv, size_t idx, size_t start_off)
+            : v(vv), i(idx), off(start_off) {}
+
+        reference operator*() const {
+            auto key_span = v.subspan(off);
+            size_t key_sz = mp_skip(key_span);
+            MsgPackDeserializer kd(key_span.first(key_sz), true);
+            auto val_span = v.subspan(off + key_sz);
+            size_t val_sz = mp_skip(val_span);
+            return Entry{ kd.asStringView(), MsgPackDeserializer(val_span.first(val_sz), true) };
+        }
+        iterator& operator++() {
+            auto key_span = v.subspan(off);
+            size_t key_sz = mp_skip(key_span);
+            size_t val_sz = mp_skip(v.subspan(off + key_sz));
+            off += key_sz + val_sz;
+            ++i;
+            return *this;
+        }
+        iterator operator++(int){ auto tmp=*this; ++(*this); return tmp; }
+
+        friend bool operator==(const iterator& a, const iterator& b) {
+            return a.v.data()==b.v.data() && a.i==b.i && a.off==b.off;
+        }
+    };
+
+    iterator begin() const { return iterator{ v, 0, payload_off }; }
+    iterator end()   const {
+        size_t off = payload_off;
+        for (size_t i=0;i<count;++i) {
+            size_t ks = mp_skip(v.subspan(off));
+            off += ks;
+            size_t vs = mp_skip(v.subspan(off));
+            off += vs;
+        }
+        return iterator{ v, count, off };
+    }
+};
+
+inline MsgPackDeserializer::EntriesView MsgPackDeserializer::mapEntries() const {
+    if (!isMap()) throw DeserializationError("not map");
+    size_t n=0, off=0; map_info(view_, n, off);
+    return EntriesView{ view_, n, off };
+}
 
 // ===== Writer (msgpack-c) =====================================================
 class MsgPackRootSerializer {

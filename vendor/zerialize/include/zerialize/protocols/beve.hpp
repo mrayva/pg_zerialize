@@ -294,6 +294,19 @@ public:
         return KeysView{view_};
     }
 
+    // Like KeysView, but each dereference also hands back the value at that
+    // same position -- avoids the O(n) re-scan-from-start that operator[]
+    // does when a caller wants (key, value) for every entry (walking the
+    // whole map via mapKeys()+operator[] is O(n^2); this is O(n)). Cheap
+    // here because glz::lazy_beve_iterator::operator*() already returns a
+    // view carrying both the key (view.key()) and the value in one step --
+    // this just adapts that into a BeveDeserializer subview instead of
+    // discarding the value half the way KeysView::iterator does. Defined
+    // out-of-line below: Entry holds a BeveDeserializer by value, which
+    // needs the class to be complete first.
+    struct EntriesView;
+    EntriesView mapEntries() const;
+
     bool contains(std::string_view key) const {
         return isMap() && view_.contains(key);
     }
@@ -357,6 +370,46 @@ public:
         return "?";
     }
 };
+
+struct BeveDeserializer::EntriesView {
+    std::shared_ptr<const std::vector<uint8_t>> owned;
+    std::shared_ptr<BeveDeserializer::Doc> doc;
+    BeveDeserializer::View v;
+
+    struct Entry { std::string_view key; BeveDeserializer value; };
+
+    struct iterator {
+        std::shared_ptr<const std::vector<uint8_t>> owned;
+        std::shared_ptr<BeveDeserializer::Doc> doc;
+        BeveDeserializer::Iter it{};
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = Entry;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = Entry;
+
+        iterator() = default;
+        iterator(std::shared_ptr<const std::vector<uint8_t>> o, std::shared_ptr<BeveDeserializer::Doc> d, BeveDeserializer::Iter i)
+            : owned(std::move(o)), doc(std::move(d)), it(std::move(i)) {}
+
+        reference operator*() const {
+            BeveDeserializer::View child = *it;
+            return Entry{ child.key(), BeveDeserializer(owned, doc, child, BeveDeserializer::SynthKind::None) };
+        }
+        iterator& operator++() { ++it; return *this; }
+        iterator operator++(int) { auto tmp = *this; ++(*this); return tmp; }
+        friend bool operator==(const iterator& a, const iterator& b) { return a.it == b.it; }
+    };
+
+    iterator begin() const { return iterator{owned, doc, v.begin()}; }
+    iterator end()   const { return iterator{owned, doc, v.end()}; }
+};
+
+inline BeveDeserializer::EntriesView BeveDeserializer::mapEntries() const {
+    if (!isMap()) throw DeserializationError("beve: value is not a map");
+    return EntriesView{owned_bytes_, doc_, view_};
+}
 
 // ===== Serializer (hand-rolled BEVE byte writer, no glaze dependency) ========
 namespace beve_detail {

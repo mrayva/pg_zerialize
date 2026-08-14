@@ -1127,12 +1127,12 @@ static void msgpack_reader_to_json(
     } else if (value.isMap()) {
         out.push_back('{');
         bool first = true;
-        for (std::string_view key : value.mapKeys()) {
+        for (auto&& entry : value.mapEntries()) {
             if (!first) out.push_back(',');
             first = false;
-            append_json_string(out, key);
+            append_json_string(out, entry.key);
             out.push_back(':');
-            msgpack_reader_to_json(value[key], out);
+            msgpack_reader_to_json(entry.value, out);
         }
         out.push_back('}');
     } else {
@@ -1190,12 +1190,12 @@ static void reader_value_to_json(const V& value, std::string& out)
     } else if (value.isMap()) {
         out.push_back('{');
         bool first = true;
-        for (std::string_view key : value.mapKeys()) {
+        for (auto&& entry : value.mapEntries()) {
             if (!first) out.push_back(',');
             first = false;
-            append_json_string(out, key);
+            append_json_string(out, entry.key);
             out.push_back(':');
-            reader_value_to_json(value[key], out);
+            reader_value_to_json(entry.value, out);
         }
         out.push_back('}');
     } else {

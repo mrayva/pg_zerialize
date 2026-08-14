@@ -510,6 +510,15 @@ public:
         return KeysView{ ctx_, h.content_off, h.content_off + h.content_len };
     }
 
+    // Like KeysView, but each dereference also hands back the value at that
+    // same position -- avoids the O(n) re-scan-from-start that operator[]
+    // does when a caller wants (key, value) for every entry (walking the
+    // whole struct via mapKeys()+operator[] is O(n^2); this is O(n)). Defined
+    // out-of-line below: Entry holds an IonDeserializer by value, which
+    // needs the class to be complete first.
+    struct EntriesView;
+    EntriesView mapEntries() const;
+
     bool contains(std::string_view key) const {
         auto h = header();
         if (h.is_null || h.type != ionb::kTypeStruct) return false;
@@ -595,6 +604,51 @@ private:
         os << "?";
     }
 };
+
+struct IonDeserializer::EntriesView {
+    std::shared_ptr<const Context> ctx;
+    std::size_t content_off = 0, content_end = 0;
+
+    struct Entry { std::string_view key; IonDeserializer value; };
+
+    struct iterator {
+        std::shared_ptr<const Context> ctx;
+        std::size_t q = 0, end = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = Entry;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = Entry;
+
+        iterator() = default;
+
+        reference operator*() const {
+            auto [sid, vpos] = ionb::read_varuint(ctx->buf, q);
+            return Entry{ IonDeserializer::resolve_symbol(*ctx, std::uint32_t(sid)), IonDeserializer(ctx, vpos) };
+        }
+        iterator& operator++() {
+            if (q < end) {
+                auto [sid, vpos] = ionb::read_varuint(ctx->buf, q);
+                (void)sid;
+                ionb::Header vh = ionb::read_header(ctx->buf, vpos);
+                q = vh.content_off + vh.content_len;
+            }
+            return *this;
+        }
+        iterator operator++(int) { auto tmp = *this; ++(*this); return tmp; }
+        friend bool operator==(const iterator& a, const iterator& b) { return a.q == b.q; }
+    };
+
+    iterator begin() const { iterator it; it.ctx = ctx; it.q = content_off; it.end = content_end; return it; }
+    iterator end()   const { iterator it; it.ctx = ctx; it.q = content_end; it.end = content_end; return it; }
+};
+
+inline IonDeserializer::EntriesView IonDeserializer::mapEntries() const {
+    auto h = header();
+    ensure(!h.is_null && h.type == ionb::kTypeStruct, "Ion: value is not a struct");
+    return EntriesView{ ctx_, h.content_off, h.content_off + h.content_len };
+}
 
 // ===== Writer ===================================================================
 
