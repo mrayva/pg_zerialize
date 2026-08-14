@@ -335,6 +335,24 @@ public:
         return BeveDeserializer(owned_bytes_, doc_, child, childKind);
     }
 
+    // Sequential single-pass array walk for GENERIC arrays -- avoids the
+    // O(n) re-scan-from-start that glz::lazy_beve_view::operator[](idx)
+    // does for a generic (heterogeneous) array when a caller wants every
+    // element (walking the whole array via arraySize()+operator[] is
+    // O(n^2); this is O(n)). Numeric typed arrays already get true O(1)
+    // random access from glz (fixed element width, direct pointer math --
+    // see lazy.hpp's operator[](size_t)), so this falls back to per-index
+    // operator[] for typed arrays: no worse than before, and glz's own
+    // iterator can't be reused there anyway -- it doesn't stamp the
+    // synthetic element tag onto the views it yields (advance_to_current_
+    // element() builds each current_view_ with the 3-arg ctor, which
+    // leaves synthetic_tag_ at its default 0), so is_number()/is_string()
+    // (which peek *data_ directly, not synthetic_tag_) would misclassify
+    // a typed array's untagged element bytes. Defined out-of-line below,
+    // alongside EntriesView.
+    struct ElementsView;
+    ElementsView elements() const;
+
     // ---- debug ----
     std::string to_string() const {
         if (isNull())   return "null";
@@ -409,6 +427,73 @@ struct BeveDeserializer::EntriesView {
 inline BeveDeserializer::EntriesView BeveDeserializer::mapEntries() const {
     if (!isMap()) throw DeserializationError("beve: value is not a map");
     return EntriesView{owned_bytes_, doc_, view_};
+}
+
+struct BeveDeserializer::ElementsView {
+    std::shared_ptr<const std::vector<uint8_t>> owned;
+    std::shared_ptr<BeveDeserializer::Doc> doc;
+    BeveDeserializer::View v;
+    bool typed = false;
+    BeveDeserializer::SynthKind elemKind = BeveDeserializer::SynthKind::None;
+
+    struct iterator {
+        std::shared_ptr<const std::vector<uint8_t>> owned;
+        std::shared_ptr<BeveDeserializer::Doc> doc;
+        BeveDeserializer::View v{};
+        BeveDeserializer::Iter git{};
+        bool typed = false;
+        BeveDeserializer::SynthKind elemKind = BeveDeserializer::SynthKind::None;
+        std::size_t index = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = BeveDeserializer;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = BeveDeserializer;
+
+        iterator() = default;
+
+        reference operator*() const {
+            if (!typed) {
+                BeveDeserializer::View child = *git;
+                return BeveDeserializer(owned, doc, child, BeveDeserializer::SynthKind::None);
+            }
+            BeveDeserializer::View child = v[index];
+            BeveDeserializer::checkChild(child, "array index out of range");
+            return BeveDeserializer(owned, doc, child, elemKind);
+        }
+        iterator& operator++() {
+            if (!typed) ++git; else ++index;
+            return *this;
+        }
+        iterator operator++(int) { auto tmp = *this; ++(*this); return tmp; }
+        friend bool operator==(const iterator& a, const iterator& b) {
+            if (a.typed != b.typed) return false;
+            return a.typed ? (a.index == b.index) : (a.git == b.git);
+        }
+    };
+
+    iterator begin() const {
+        iterator it;
+        it.owned = owned; it.doc = doc; it.typed = typed; it.elemKind = elemKind;
+        if (typed) { it.v = v; it.index = 0; }
+        else { it.git = v.begin(); }
+        return it;
+    }
+    iterator end() const {
+        iterator it;
+        it.owned = owned; it.doc = doc; it.typed = typed; it.elemKind = elemKind;
+        if (typed) { it.v = v; it.index = v.size(); }
+        else { it.git = v.end(); }
+        return it;
+    }
+};
+
+inline BeveDeserializer::ElementsView BeveDeserializer::elements() const {
+    if (synth_ != SynthKind::None || !view_.is_array()) throw DeserializationError("beve: value is not an array");
+    bool isTypedArr = view_.is_typed_array();
+    SynthKind childKind = isTypedArr ? synthKindFor(elementInfo()) : SynthKind::None;
+    return ElementsView{owned_bytes_, doc_, view_, isTypedArr, childKind};
 }
 
 // ===== Serializer (hand-rolled BEVE byte writer, no glaze dependency) ========

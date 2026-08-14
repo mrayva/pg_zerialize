@@ -404,6 +404,13 @@ public:
         throw DeserializationError("BSON: array index out of range");
     }
 
+    // Sequential single-pass array walk -- avoids the O(n) re-scan-from-
+    // start that operator[](idx) does when a caller wants every element
+    // (walking the whole array via arraySize()+operator[] is O(n^2); this
+    // is O(n)). Defined out-of-line below, alongside EntriesView.
+    struct ElementsView;
+    ElementsView elements() const;
+
     // ---- debug ----
     std::string to_string() const {
         std::ostringstream os;
@@ -482,6 +489,43 @@ struct BsonDeserializer::EntriesView {
 inline BsonDeserializer::EntriesView BsonDeserializer::mapEntries() const {
     ensure(isMap(), "BSON: value is not a document");
     return EntriesView{ buf_, pos_ };
+}
+
+struct BsonDeserializer::ElementsView {
+    std::span<const uint8_t> buf;
+    std::size_t value_off;
+
+    struct iterator {
+        std::span<const uint8_t> buf{};
+        std::size_t q = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = BsonDeserializer;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = BsonDeserializer;
+
+        iterator() = default;
+
+        reference operator*() const {
+            auto e = BsonDeserializer::read_elem(buf, q);
+            return BsonDeserializer(buf, e.value_off, e.type);
+        }
+        iterator& operator++() {
+            if (q < buf.size() && buf[q] != 0x00) q = BsonDeserializer::read_elem(buf, q).end_off;
+            return *this;
+        }
+        iterator operator++(int) { auto tmp = *this; ++(*this); return tmp; }
+        friend bool operator==(const iterator& a, const iterator& b) { return a.q == b.q && a.buf.data() == b.buf.data(); }
+    };
+
+    iterator begin() const { auto cs = BsonDeserializer::container_span(buf, value_off); iterator it; it.buf = buf; it.q = cs.first; return it; }
+    iterator end()   const { auto cs = BsonDeserializer::container_span(buf, value_off); iterator it; it.buf = buf; it.q = cs.term;  return it; }
+};
+
+inline BsonDeserializer::ElementsView BsonDeserializer::elements() const {
+    ensure(isArray(), "BSON: value is not an array");
+    return ElementsView{ buf_, pos_ };
 }
 
 } // namespace bsonjc

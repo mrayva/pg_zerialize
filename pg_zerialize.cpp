@@ -1118,10 +1118,11 @@ static void msgpack_reader_to_json(
         out += ",\"base64\"]";
     } else if (value.isArray()) {
         out.push_back('[');
-        const size_t count = value.arraySize();
-        for (size_t i = 0; i < count; i++) {
-            if (i > 0) out.push_back(',');
-            msgpack_reader_to_json(value[i], out);
+        bool first = true;
+        for (auto&& element : value.elements()) {
+            if (!first) out.push_back(',');
+            first = false;
+            msgpack_reader_to_json(element, out);
         }
         out.push_back(']');
     } else if (value.isMap()) {
@@ -1181,10 +1182,11 @@ static void reader_value_to_json(const V& value, std::string& out)
         out += ",\"base64\"]";
     } else if (value.isArray()) {
         out.push_back('[');
-        const size_t count = value.arraySize();
-        for (size_t i = 0; i < count; i++) {
-            if (i > 0) out.push_back(',');
-            reader_value_to_json(value[i], out);
+        bool first = true;
+        for (auto&& element : value.elements()) {
+            if (!first) out.push_back(',');
+            first = false;
+            reader_value_to_json(element, out);
         }
         out.push_back(']');
     } else if (value.isMap()) {

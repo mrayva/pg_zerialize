@@ -507,6 +507,15 @@ public:
         return MsgPackDeserializer(view_.subspan(off, sz), true);
     }
 
+    // Sequential single-pass array walk -- avoids the O(n) re-scan-from-
+    // start that operator[](idx) does when a caller wants every element
+    // (walking the whole array via arraySize()+operator[] is O(n^2); this
+    // is O(n)). Defined out-of-line below: iterator::operator*() returns a
+    // MsgPackDeserializer by value, which needs the class to be complete
+    // first.
+    struct ElementsView;
+    ElementsView elements() const;
+
     // ---- debug ----
     std::string to_string() const {
         std::ostringstream os; dump(os, *this, 0); return os.str();
@@ -578,6 +587,55 @@ inline MsgPackDeserializer::EntriesView MsgPackDeserializer::mapEntries() const 
     if (!isMap()) throw DeserializationError("not map");
     size_t n=0, off=0; map_info(view_, n, off);
     return EntriesView{ view_, n, off };
+}
+
+struct MsgPackDeserializer::ElementsView {
+    std::span<const uint8_t> v{};
+    size_t count = 0;
+    size_t payload_off = 0;
+
+    struct iterator {
+        std::span<const uint8_t> v{};
+        size_t i = 0;
+        size_t off = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = MsgPackDeserializer;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = MsgPackDeserializer;
+
+        iterator() = default;
+        iterator(std::span<const uint8_t> vv, size_t idx, size_t start_off)
+            : v(vv), i(idx), off(start_off) {}
+
+        reference operator*() const {
+            size_t sz = mp_skip(v.subspan(off));
+            return MsgPackDeserializer(v.subspan(off, sz), true);
+        }
+        iterator& operator++() {
+            off += mp_skip(v.subspan(off));
+            ++i;
+            return *this;
+        }
+        iterator operator++(int){ auto tmp=*this; ++(*this); return tmp; }
+
+        friend bool operator==(const iterator& a, const iterator& b) {
+            return a.v.data()==b.v.data() && a.i==b.i && a.off==b.off;
+        }
+    };
+
+    iterator begin() const { return iterator{ v, 0, payload_off }; }
+    iterator end()   const {
+        size_t off = payload_off;
+        for (size_t i=0;i<count;++i) off += mp_skip(v.subspan(off));
+        return iterator{ v, count, off };
+    }
+};
+
+inline MsgPackDeserializer::ElementsView MsgPackDeserializer::elements() const {
+    size_t n=0, off=0; arr_info(view_, n, off);
+    return ElementsView{ view_, n, off };
 }
 
 // ===== Writer (msgpack-c) =====================================================

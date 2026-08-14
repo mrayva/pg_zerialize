@@ -567,6 +567,13 @@ public:
         throw DeserializationError("Ion: array index out of range");
     }
 
+    // Sequential single-pass array walk -- avoids the O(n) re-scan-from-
+    // start that operator[](idx) does when a caller wants every element
+    // (walking the whole array via arraySize()+operator[] is O(n^2); this
+    // is O(n)). Defined out-of-line below, alongside EntriesView.
+    struct ElementsView;
+    ElementsView elements() const;
+
     // ---- debug ----
     std::string to_string() const { std::ostringstream os; dump(os); return os.str(); }
 
@@ -648,6 +655,44 @@ inline IonDeserializer::EntriesView IonDeserializer::mapEntries() const {
     auto h = header();
     ensure(!h.is_null && h.type == ionb::kTypeStruct, "Ion: value is not a struct");
     return EntriesView{ ctx_, h.content_off, h.content_off + h.content_len };
+}
+
+struct IonDeserializer::ElementsView {
+    std::shared_ptr<const Context> ctx;
+    std::size_t content_off = 0, content_end = 0;
+
+    struct iterator {
+        std::shared_ptr<const Context> ctx;
+        std::size_t q = 0, end = 0;
+
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept  = std::forward_iterator_tag;
+        using value_type        = IonDeserializer;
+        using difference_type   = std::ptrdiff_t;
+        using reference         = IonDeserializer;
+
+        iterator() = default;
+
+        reference operator*() const { return IonDeserializer(ctx, q); }
+        iterator& operator++() {
+            if (q < end) {
+                ionb::Header eh = ionb::read_header(ctx->buf, q);
+                q = eh.content_off + eh.content_len;
+            }
+            return *this;
+        }
+        iterator operator++(int) { auto tmp = *this; ++(*this); return tmp; }
+        friend bool operator==(const iterator& a, const iterator& b) { return a.q == b.q; }
+    };
+
+    iterator begin() const { iterator it; it.ctx = ctx; it.q = content_off; it.end = content_end; return it; }
+    iterator end()   const { iterator it; it.ctx = ctx; it.q = content_end; it.end = content_end; return it; }
+};
+
+inline IonDeserializer::ElementsView IonDeserializer::elements() const {
+    auto h = header();
+    ensure(!h.is_null && (h.type == ionb::kTypeList || h.type == ionb::kTypeSexp), "Ion: value is not an array");
+    return ElementsView{ ctx_, h.content_off, h.content_off + h.content_len };
 }
 
 // ===== Writer ===================================================================
