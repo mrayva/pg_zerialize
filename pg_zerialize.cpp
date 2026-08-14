@@ -362,10 +362,10 @@ struct CachedSchema {
     // try_serialize_*_row_fast/try_serialize_*_array_fast. Protocol-independent:
     // recursion support is the same regardless of wire format.
     bool has_recursive_columns;
-    bool msgpack_fast_supported;
-    bool cbor_fast_supported;
-    bool zera_fast_supported;
-    bool flex_fast_supported;
+    // All fast-path writers (msgpack/cbor/zera/flex/ion/bson/beve) accept
+    // exactly the same set of column kinds -- is_fast_column() doesn't vary
+    // by protocol -- so one flag gates all of them. See is_fast_column().
+    bool fast_supported;
 };
 
 static bool is_fast_kind(ConverterKind kind);
@@ -561,10 +561,7 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
     schema.tupdesc = cached_tupdesc;
     schema.use_deform_access = false;
     schema.has_recursive_columns = false;
-    schema.msgpack_fast_supported = true;
-    schema.cbor_fast_supported = true;
-    schema.zera_fast_supported = true;
-    schema.flex_fast_supported = true;
+    schema.fast_supported = true;
     schema.columns.reserve(cached_tupdesc->natts);
 
     for (int i = 0; i < cached_tupdesc->natts; i++) {
@@ -610,15 +607,12 @@ static const CachedSchema& get_cached_schema(Oid tupType, int32 tupTypmod)
             }
         }
 
-        // All four protocols' fast writers accept the same column kinds
+        // All protocols' fast writers accept the same column kinds
         // (including Composite/Array-of-Composite, handled recursively via
-        // each protocol's own schema-graph capability check below), so a
-        // single is_fast_column() gate applies uniformly.
+        // schema_recursive_supported() below), so a single is_fast_column()
+        // gate applies uniformly.
         if (!is_fast_column(col)) {
-            schema.msgpack_fast_supported = false;
-            schema.cbor_fast_supported = false;
-            schema.zera_fast_supported = false;
-            schema.flex_fast_supported = false;
+            schema.fast_supported = false;
         }
         if (col.kind == ConverterKind::Composite ||
             (col.kind == ConverterKind::Array &&
@@ -3176,10 +3170,15 @@ static inline bytea* msgpack_result_from_reusable_root(z::MsgPackRootSerializer&
     return result;
 }
 
-static bool msgpack_schema_recursive_supported(
+// Shared by every protocol's try_serialize_*_row_fast/_array_fast: whether
+// a schema, AND every composite/array-of-composite column it recursively
+// contains, is fast-path eligible. Nothing here is protocol-specific --
+// fast_supported and column kinds don't vary by wire format -- so one
+// implementation serves msgpack/cbor/zera/flex/ion/bson/beve alike.
+static bool schema_recursive_supported(
     const CachedSchema& schema, std::unordered_set<Oid>& active_types)
 {
-    if (!schema.msgpack_fast_supported) {
+    if (!schema.fast_supported) {
         return false;
     }
     for (const CachedColumn& col : schema.columns) {
@@ -3194,7 +3193,7 @@ static bool msgpack_schema_recursive_supported(
             continue;
         }
         const CachedSchema& nested = get_cached_schema(nested_type, -1);
-        const bool supported = msgpack_schema_recursive_supported(nested, active_types);
+        const bool supported = schema_recursive_supported(nested, active_types);
         active_types.erase(nested_type);
         if (!supported) {
             return false;
@@ -3209,12 +3208,12 @@ static bytea* try_serialize_msgpack_row_fast(HeapTupleHeader rec)
     int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
     const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-    if (!schema.msgpack_fast_supported) {
+    if (!schema.fast_supported) {
         return nullptr;
     }
     if (schema.has_recursive_columns) {
         std::unordered_set<Oid> active_types{tupType};
-        if (!msgpack_schema_recursive_supported(schema, active_types)) {
+        if (!schema_recursive_supported(schema, active_types)) {
             return nullptr;
         }
     }
@@ -3264,12 +3263,12 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
         int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
         const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-        if (!schema.msgpack_fast_supported) {
+        if (!schema.fast_supported) {
             return nullptr;
         }
         if (schema.has_recursive_columns) {
             std::unordered_set<Oid> active_types{tupType};
-            if (!msgpack_schema_recursive_supported(schema, active_types)) {
+            if (!schema_recursive_supported(schema, active_types)) {
                 return nullptr;
             }
         }
@@ -3311,7 +3310,26 @@ static bytea* try_serialize_msgpack_array_fast(Datum* elements, bool* nulls, int
     return nullptr;
 }
 
-static inline void cbor_write_text(z::cborjc::Serializer& writer, Datum value)
+// ===== Generic Writer-concept-only fast-path writers =========================
+//
+// Shared by every protocol whose Serializer needs nothing beyond the
+// standard zerialize Writer concept (begin_map(n)/key(sv)/int64(v)/
+// double_(v)/string(sv)/binary(b)/begin_array(n)/end_array()/end_map()):
+// cbor, zera (arrays only -- its record-map writer needs key_preencoded,
+// see zera_write_record_map below), flex, ion, bson, beve. msgpack stays
+// fully specialized (reserve_raw_append/commit_raw_append,
+// begin_map_preencoded/key_preencoded, plus the raw-memory fixed-width
+// array optimization with no counterpart here).
+//
+// Originally cbor's own fast-path writer; templatized in place once the
+// same logic was confirmed identical for flex and directly reusable for
+// ion/bson/beve (none of the five need anything beyond the Writer
+// concept). See vendor/zerialize/UPSTREAM.md-style provenance note: this
+// is not a rewrite, just the existing cbor implementation with its
+// concrete Serializer type replaced by a template parameter.
+
+template<typename Serializer>
+static inline void write_text_generic(Serializer& writer, Datum value)
 {
     text* txt = DatumGetTextPP(value);
     const char* ptr = VARDATA_ANY(txt);
@@ -3319,14 +3337,16 @@ static inline void cbor_write_text(z::cborjc::Serializer& writer, Datum value)
     writer.string(std::string_view(ptr, static_cast<size_t>(len)));
 }
 
-static inline void cbor_write_record_map(
-    z::cborjc::Serializer& writer,
+template<typename Serializer>
+static inline void write_record_map_generic(
+    Serializer& writer,
     HeapTupleHeader rec,
     const CachedSchema& schema,
     TupleDeformScratch* scratch);
 
-static inline void cbor_write_array_element(
-    z::cborjc::Serializer& writer,
+template<typename Serializer>
+static inline void write_array_element_generic(
+    Serializer& writer,
     ConverterKind elem_kind,
     Datum value,
     bool isnull)
@@ -3357,7 +3377,7 @@ static inline void cbor_write_array_element(
             return;
         case ConverterKind::Text:
         case ConverterKind::JsonText:
-            cbor_write_text(writer, value);
+            write_text_generic(writer, value);
             return;
         case ConverterKind::Uuid:
         {
@@ -3411,7 +3431,7 @@ static inline void cbor_write_array_element(
             const CachedSchema& schema = get_cached_schema(
                 HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
             TupleDeformScratch scratch;
-            cbor_write_record_map(writer, rec, schema, &scratch);
+            write_record_map_generic(writer, rec, schema, &scratch);
             return;
         }
         default:
@@ -3420,14 +3440,15 @@ static inline void cbor_write_array_element(
 
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("unsupported array element type for fast CBOR path")));
+             errmsg("unsupported array element type for fast serialization path")));
 }
 
 // Hoists the elem_kind switch outside the loop for the common case of an
 // array with no null elements, instead of re-dispatching per element inside
-// cbor_write_array_element. Mirrors msgpack_write_array_no_nulls.
-static inline void cbor_write_array_no_nulls(
-    z::cborjc::Serializer& writer,
+// write_array_element_generic. Mirrors msgpack_write_array_no_nulls.
+template<typename Serializer>
+static inline void write_array_no_nulls_generic(
+    Serializer& writer,
     ConverterKind elem_kind,
     Datum* elements,
     int nitems)
@@ -3466,7 +3487,7 @@ static inline void cbor_write_array_no_nulls(
         case ConverterKind::Text:
         case ConverterKind::JsonText:
             for (int i = 0; i < nitems; i++) {
-                cbor_write_text(writer, elements[i]);
+                write_text_generic(writer, elements[i]);
             }
             return;
         case ConverterKind::Uuid:
@@ -3539,19 +3560,20 @@ static inline void cbor_write_array_no_nulls(
             return;
         case ConverterKind::Composite:
             for (int i = 0; i < nitems; i++) {
-                cbor_write_array_element(writer, ConverterKind::Composite, elements[i], false);
+                write_array_element_generic(writer, ConverterKind::Composite, elements[i], false);
             }
             return;
         default:
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("unsupported array element type for fast CBOR path")));
+                     errmsg("unsupported array element type for fast serialization path")));
     }
 }
 
 // See msgpack_write_array_dim for why this is decided per-value, not per-schema.
-static void cbor_write_array_dim(
-    z::cborjc::Serializer& writer,
+template<typename Serializer>
+static void write_array_dim_generic(
+    Serializer& writer,
     const CachedColumn& col,
     Datum* elements,
     bool* nulls,
@@ -3568,19 +3590,20 @@ static void cbor_write_array_dim(
             } else if (col.array_element_kind == ConverterKind::Fallback) {
                 write_output_string(writer, col.array_element_typoutput, elements[*offset]);
             } else {
-                cbor_write_array_element(writer, col.array_element_kind, elements[*offset], false);
+                write_array_element_generic(writer, col.array_element_kind, elements[*offset], false);
             }
         }
     } else {
         for (int i = 0; i < dims[depth]; i++) {
-            cbor_write_array_dim(writer, col, elements, nulls, dims, ndim, depth + 1, offset);
+            write_array_dim_generic(writer, col, elements, nulls, dims, ndim, depth + 1, offset);
         }
     }
     writer.end_array();
 }
 
-static inline void cbor_write_array(
-    z::cborjc::Serializer& writer,
+template<typename Serializer>
+static inline void write_array_generic(
+    Serializer& writer,
     const CachedColumn& col,
     Datum value)
 {
@@ -3607,7 +3630,7 @@ static inline void cbor_write_array(
                           &nitems);
 
         int offset = 0;
-        cbor_write_array_dim(writer, col, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
+        write_array_dim_generic(writer, col, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
 
         pfree(elements);
         pfree(nulls);
@@ -3636,10 +3659,10 @@ static inline void cbor_write_array(
             }
         }
     } else if (!ARR_HASNULL(arr)) {
-        cbor_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
+        write_array_no_nulls_generic(writer, col.array_element_kind, elements, nitems);
     } else {
         for (int i = 0; i < nitems; i++) {
-            cbor_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
+            write_array_element_generic(writer, col.array_element_kind, elements[i], nulls[i]);
         }
     }
     writer.end_array();
@@ -3648,8 +3671,9 @@ static inline void cbor_write_array(
     pfree(nulls);
 }
 
-static inline void cbor_write_scalar(
-    z::cborjc::Serializer& writer,
+template<typename Serializer>
+static inline void write_scalar_generic(
+    Serializer& writer,
     const CachedColumn& col,
     Datum value,
     bool isnull)
@@ -3680,7 +3704,7 @@ static inline void cbor_write_scalar(
             return;
         case ConverterKind::Text:
         case ConverterKind::JsonText:
-            cbor_write_text(writer, value);
+            write_text_generic(writer, value);
             return;
         case ConverterKind::Uuid:
         {
@@ -3729,7 +3753,7 @@ static inline void cbor_write_scalar(
             writer.binary(datum_bytea_span(value));
             return;
         case ConverterKind::Array:
-            cbor_write_array(writer, col, value);
+            write_array_generic(writer, col, value);
             return;
         case ConverterKind::Composite:
         {
@@ -3737,7 +3761,7 @@ static inline void cbor_write_scalar(
             const CachedSchema& schema = get_cached_schema(
                 HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
             TupleDeformScratch scratch;
-            cbor_write_record_map(writer, rec, schema, &scratch);
+            write_record_map_generic(writer, rec, schema, &scratch);
             return;
         }
         case ConverterKind::Fallback:
@@ -3753,12 +3777,13 @@ static inline void cbor_write_scalar(
 
     ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("unsupported type for fast CBOR path"),
+             errmsg("unsupported type for fast serialization path"),
              errdetail("column type OID %u", col.typid)));
 }
 
-static inline void cbor_write_record_map(
-    z::cborjc::Serializer& writer,
+template<typename Serializer>
+static inline void write_record_map_generic(
+    Serializer& writer,
     HeapTupleHeader rec,
     const CachedSchema& schema,
     TupleDeformScratch* scratch)
@@ -3773,7 +3798,7 @@ static inline void cbor_write_record_map(
             bool isnull;
             Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
             writer.key(col.name);
-            cbor_write_scalar(writer, col, value, isnull);
+            write_scalar_generic(writer, col, value, isnull);
         }
     } else {
         const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
@@ -3782,37 +3807,10 @@ static inline void cbor_write_record_map(
         for (const CachedColumn& col : schema.columns) {
             const int idx = col.attnum - 1;
             writer.key(col.name);
-            cbor_write_scalar(writer, col, scratch->values[idx], scratch->nulls[idx]);
+            write_scalar_generic(writer, col, scratch->values[idx], scratch->nulls[idx]);
         }
     }
     writer.end_map();
-}
-
-static bool cbor_schema_recursive_supported(
-    const CachedSchema& schema, std::unordered_set<Oid>& active_types)
-{
-    if (!schema.cbor_fast_supported) {
-        return false;
-    }
-    for (const CachedColumn& col : schema.columns) {
-        Oid nested_type = InvalidOid;
-        if (col.kind == ConverterKind::Composite) {
-            nested_type = col.typid;
-        } else if (col.kind == ConverterKind::Array &&
-                   col.array_element_kind == ConverterKind::Composite) {
-            nested_type = col.array_element_typid;
-        }
-        if (!OidIsValid(nested_type) || !active_types.insert(nested_type).second) {
-            continue;
-        }
-        const CachedSchema& nested = get_cached_schema(nested_type, -1);
-        const bool supported = cbor_schema_recursive_supported(nested, active_types);
-        active_types.erase(nested_type);
-        if (!supported) {
-            return false;
-        }
-    }
-    return true;
 }
 
 static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec)
@@ -3821,12 +3819,12 @@ static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec)
     int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
     const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-    if (!schema.cbor_fast_supported) {
+    if (!schema.fast_supported) {
         return nullptr;
     }
     if (schema.has_recursive_columns) {
         std::unordered_set<Oid> active_types{tupType};
-        if (!cbor_schema_recursive_supported(schema, active_types)) {
+        if (!schema_recursive_supported(schema, active_types)) {
             return nullptr;
         }
     }
@@ -3835,10 +3833,10 @@ static bytea* try_serialize_cbor_row_fast(HeapTupleHeader rec)
         z::cborjc::RootSerializer rs;
         z::cborjc::Serializer writer(rs);
         if (!schema.use_deform_access) {
-            cbor_write_record_map(writer, rec, schema, nullptr);
+            write_record_map_generic(writer, rec, schema, nullptr);
         } else {
             TupleDeformScratch scratch;
-            cbor_write_record_map(writer, rec, schema, &scratch);
+            write_record_map_generic(writer, rec, schema, &scratch);
         }
 
         z::ZBuffer buffer = rs.finish();
@@ -3878,12 +3876,12 @@ static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int ni
         int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
         const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-        if (!schema.cbor_fast_supported) {
+        if (!schema.fast_supported) {
             return nullptr;
         }
         if (schema.has_recursive_columns) {
             std::unordered_set<Oid> active_types{tupType};
-            if (!cbor_schema_recursive_supported(schema, active_types)) {
+            if (!schema_recursive_supported(schema, active_types)) {
                 return nullptr;
             }
         }
@@ -3901,7 +3899,7 @@ static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int ni
                 writer.null();
             } else {
                 HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
-                cbor_write_record_map(writer, rec, *schemas[i], &scratch);
+                write_record_map_generic(writer, rec, *schemas[i], &scratch);
             }
         }
         writer.end_array();
@@ -3940,329 +3938,6 @@ static inline void zera_write_record_map(
     HeapTupleHeader rec,
     const CachedSchema& schema,
     TupleDeformScratch* scratch);
-
-static inline void zera_write_array_element(
-    z::zera::Serializer& writer,
-    ConverterKind elem_kind,
-    Datum value,
-    bool isnull)
-{
-    if (isnull) {
-        writer.null();
-        return;
-    }
-
-    switch (elem_kind) {
-        case ConverterKind::Int2:
-            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
-            return;
-        case ConverterKind::Int4:
-            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
-            return;
-        case ConverterKind::Int8:
-            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
-            return;
-        case ConverterKind::Float4:
-            writer.double_(static_cast<double>(DatumGetFloat4(value)));
-            return;
-        case ConverterKind::Float8:
-            writer.double_(DatumGetFloat8(value));
-            return;
-        case ConverterKind::Bool:
-            writer.boolean(DatumGetBool(value));
-            return;
-        case ConverterKind::Text:
-        case ConverterKind::JsonText:
-            zera_write_text(writer, value);
-            return;
-        case ConverterKind::Uuid:
-        {
-            char out[36];
-            format_uuid(value, out);
-            writer.string(std::string_view(out, sizeof(out)));
-            return;
-        }
-        case ConverterKind::NameText:
-            writer.string(name_text_view(value));
-            return;
-        case ConverterKind::CharText:
-        {
-            char ch = DatumGetChar(value);
-            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
-            return;
-        }
-        case ConverterKind::EnumText:
-            writer.string(enum_label_view(value));
-            return;
-        case ConverterKind::InetText:
-            write_network_string(writer, value, false);
-            return;
-        case ConverterKind::CidrText:
-            write_network_string(writer, value, true);
-            return;
-        case ConverterKind::IntervalText:
-            write_interval_string(writer, value);
-            return;
-        case ConverterKind::Numeric:
-            numeric_write_fast(writer, value);
-            return;
-        case ConverterKind::Date:
-            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
-            return;
-        case ConverterKind::Timestamp:
-            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
-            return;
-        case ConverterKind::Timestamptz:
-            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
-            return;
-        case ConverterKind::Jsonb:
-            writer.binary(datum_jsonb_span(value));
-            return;
-        case ConverterKind::Bytea:
-            writer.binary(datum_bytea_span(value));
-            return;
-        case ConverterKind::Composite:
-        {
-            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
-            const CachedSchema& schema = get_cached_schema(
-                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
-            TupleDeformScratch scratch;
-            zera_write_record_map(writer, rec, schema, &scratch);
-            return;
-        }
-        default:
-            break;
-    }
-
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("unsupported array element type for fast ZERA path")));
-}
-
-// Hoists the elem_kind switch outside the loop for the common case of an
-// array with no null elements, instead of re-dispatching per element inside
-// zera_write_array_element. Mirrors msgpack_write_array_no_nulls.
-static inline void zera_write_array_no_nulls(
-    z::zera::Serializer& writer,
-    ConverterKind elem_kind,
-    Datum* elements,
-    int nitems)
-{
-    switch (elem_kind) {
-        case ConverterKind::Int2:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetInt16(elements[i])));
-            }
-            return;
-        case ConverterKind::Int4:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetInt32(elements[i])));
-            }
-            return;
-        case ConverterKind::Int8:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetInt64(elements[i])));
-            }
-            return;
-        case ConverterKind::Float4:
-            for (int i = 0; i < nitems; i++) {
-                writer.double_(static_cast<double>(DatumGetFloat4(elements[i])));
-            }
-            return;
-        case ConverterKind::Float8:
-            for (int i = 0; i < nitems; i++) {
-                writer.double_(DatumGetFloat8(elements[i]));
-            }
-            return;
-        case ConverterKind::Bool:
-            for (int i = 0; i < nitems; i++) {
-                writer.boolean(DatumGetBool(elements[i]));
-            }
-            return;
-        case ConverterKind::Text:
-        case ConverterKind::JsonText:
-            for (int i = 0; i < nitems; i++) {
-                zera_write_text(writer, elements[i]);
-            }
-            return;
-        case ConverterKind::Uuid:
-            for (int i = 0; i < nitems; i++) {
-                char out[36];
-                format_uuid(elements[i], out);
-                writer.string(std::string_view(out, sizeof(out)));
-            }
-            return;
-        case ConverterKind::NameText:
-            for (int i = 0; i < nitems; i++) {
-                writer.string(name_text_view(elements[i]));
-            }
-            return;
-        case ConverterKind::CharText:
-            for (int i = 0; i < nitems; i++) {
-                char ch = DatumGetChar(elements[i]);
-                writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
-            }
-            return;
-        case ConverterKind::EnumText:
-            for (int i = 0; i < nitems; i++) {
-                writer.string(enum_label_view(elements[i]));
-            }
-            return;
-        case ConverterKind::InetText:
-            for (int i = 0; i < nitems; i++) {
-                write_network_string(writer, elements[i], false);
-            }
-            return;
-        case ConverterKind::CidrText:
-            for (int i = 0; i < nitems; i++) {
-                write_network_string(writer, elements[i], true);
-            }
-            return;
-        case ConverterKind::IntervalText:
-            for (int i = 0; i < nitems; i++) {
-                write_interval_string(writer, elements[i]);
-            }
-            return;
-        case ConverterKind::Numeric:
-            for (int i = 0; i < nitems; i++) {
-                numeric_write_fast(writer, elements[i]);
-            }
-            return;
-        case ConverterKind::Date:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetDateADT(elements[i])));
-            }
-            return;
-        case ConverterKind::Timestamp:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetTimestamp(elements[i])));
-            }
-            return;
-        case ConverterKind::Timestamptz:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetTimestampTz(elements[i])));
-            }
-            return;
-        case ConverterKind::Jsonb:
-            for (int i = 0; i < nitems; i++) {
-                writer.binary(datum_jsonb_span(elements[i]));
-            }
-            return;
-        case ConverterKind::Bytea:
-            for (int i = 0; i < nitems; i++) {
-                writer.binary(datum_bytea_span(elements[i]));
-            }
-            return;
-        case ConverterKind::Composite:
-            for (int i = 0; i < nitems; i++) {
-                zera_write_array_element(writer, ConverterKind::Composite, elements[i], false);
-            }
-            return;
-        default:
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("unsupported array element type for fast ZERA path")));
-    }
-}
-
-// See msgpack_write_array_dim for why this is decided per-value, not per-schema.
-static void zera_write_array_dim(
-    z::zera::Serializer& writer,
-    const CachedColumn& col,
-    Datum* elements,
-    bool* nulls,
-    const int* dims,
-    int ndim,
-    int depth,
-    int* offset)
-{
-    writer.begin_array(static_cast<size_t>(dims[depth]));
-    if (depth == ndim - 1) {
-        for (int i = 0; i < dims[depth]; i++, (*offset)++) {
-            if (nulls[*offset]) {
-                writer.null();
-            } else if (col.array_element_kind == ConverterKind::Fallback) {
-                write_output_string(writer, col.array_element_typoutput, elements[*offset]);
-            } else {
-                zera_write_array_element(writer, col.array_element_kind, elements[*offset], false);
-            }
-        }
-    } else {
-        for (int i = 0; i < dims[depth]; i++) {
-            zera_write_array_dim(writer, col, elements, nulls, dims, ndim, depth + 1, offset);
-        }
-    }
-    writer.end_array();
-}
-
-static inline void zera_write_array(
-    z::zera::Serializer& writer,
-    const CachedColumn& col,
-    Datum value)
-{
-    ArrayType* arr = DatumGetArrayTypeP(value);
-    int ndim = ARR_NDIM(arr);
-
-    if (ndim == 0) {
-        writer.begin_array(0);
-        writer.end_array();
-        return;
-    }
-
-    if (ndim != 1) {
-        Datum* elements;
-        bool* nulls;
-        int nitems;
-        deconstruct_array(arr,
-                          col.array_element_typid,
-                          col.array_typlen,
-                          col.array_typbyval,
-                          col.array_typalign,
-                          &elements,
-                          &nulls,
-                          &nitems);
-
-        int offset = 0;
-        zera_write_array_dim(writer, col, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
-
-        pfree(elements);
-        pfree(nulls);
-        return;
-    }
-
-    Datum* elements;
-    bool* nulls;
-    int nitems;
-    deconstruct_array(arr,
-                      col.array_element_typid,
-                      col.array_typlen,
-                      col.array_typbyval,
-                      col.array_typalign,
-                      &elements,
-                      &nulls,
-                      &nitems);
-
-    writer.begin_array(static_cast<size_t>(nitems));
-    if (col.array_element_kind == ConverterKind::Fallback) {
-        for (int i = 0; i < nitems; i++) {
-            if (nulls[i]) {
-                writer.null();
-            } else {
-                write_output_string(writer, col.array_element_typoutput, elements[i]);
-            }
-        }
-    } else if (!ARR_HASNULL(arr)) {
-        zera_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
-    } else {
-        for (int i = 0; i < nitems; i++) {
-            zera_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
-        }
-    }
-    writer.end_array();
-
-    pfree(elements);
-    pfree(nulls);
-}
 
 static inline void zera_write_scalar(
     z::zera::Serializer& writer,
@@ -4345,7 +4020,7 @@ static inline void zera_write_scalar(
             writer.binary(datum_bytea_span(value));
             return;
         case ConverterKind::Array:
-            zera_write_array(writer, col, value);
+            write_array_generic(writer, col, value);
             return;
         case ConverterKind::Composite:
         {
@@ -4404,45 +4079,18 @@ static inline void zera_write_record_map(
     writer.end_map();
 }
 
-static bool zera_schema_recursive_supported(
-    const CachedSchema& schema, std::unordered_set<Oid>& active_types)
-{
-    if (!schema.zera_fast_supported) {
-        return false;
-    }
-    for (const CachedColumn& col : schema.columns) {
-        Oid nested_type = InvalidOid;
-        if (col.kind == ConverterKind::Composite) {
-            nested_type = col.typid;
-        } else if (col.kind == ConverterKind::Array &&
-                   col.array_element_kind == ConverterKind::Composite) {
-            nested_type = col.array_element_typid;
-        }
-        if (!OidIsValid(nested_type) || !active_types.insert(nested_type).second) {
-            continue;
-        }
-        const CachedSchema& nested = get_cached_schema(nested_type, -1);
-        const bool supported = zera_schema_recursive_supported(nested, active_types);
-        active_types.erase(nested_type);
-        if (!supported) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bytea* try_serialize_zera_row_fast(HeapTupleHeader rec)
 {
     Oid tupType = HeapTupleHeaderGetTypeId(rec);
     int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
     const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-    if (!schema.zera_fast_supported) {
+    if (!schema.fast_supported) {
         return nullptr;
     }
     if (schema.has_recursive_columns) {
         std::unordered_set<Oid> active_types{tupType};
-        if (!zera_schema_recursive_supported(schema, active_types)) {
+        if (!schema_recursive_supported(schema, active_types)) {
             return nullptr;
         }
     }
@@ -4494,12 +4142,12 @@ static bytea* try_serialize_zera_array_fast(Datum* elements, bool* nulls, int ni
         int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
         const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-        if (!schema.zera_fast_supported) {
+        if (!schema.fast_supported) {
             return nullptr;
         }
         if (schema.has_recursive_columns) {
             std::unordered_set<Oid> active_types{tupType};
-            if (!zera_schema_recursive_supported(schema, active_types)) {
+            if (!schema_recursive_supported(schema, active_types)) {
                 return nullptr;
             }
         }
@@ -4543,522 +4191,18 @@ static bytea* try_serialize_zera_array_fast(Datum* elements, bool* nulls, int ni
     return nullptr;
 }
 
-static inline void flex_write_text(z::flex::Serializer& writer, Datum value)
-{
-    text* txt = DatumGetTextPP(value);
-    const char* ptr = VARDATA_ANY(txt);
-    int len = VARSIZE_ANY_EXHDR(txt);
-    writer.string(std::string_view(ptr, static_cast<size_t>(len)));
-}
-
-static inline void flex_write_record_map(
-    z::flex::Serializer& writer,
-    HeapTupleHeader rec,
-    const CachedSchema& schema,
-    TupleDeformScratch* scratch);
-
-static inline void flex_write_array_element(
-    z::flex::Serializer& writer,
-    ConverterKind elem_kind,
-    Datum value,
-    bool isnull)
-{
-    if (isnull) {
-        writer.null();
-        return;
-    }
-
-    switch (elem_kind) {
-        case ConverterKind::Int2:
-            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
-            return;
-        case ConverterKind::Int4:
-            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
-            return;
-        case ConverterKind::Int8:
-            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
-            return;
-        case ConverterKind::Float4:
-            writer.double_(static_cast<double>(DatumGetFloat4(value)));
-            return;
-        case ConverterKind::Float8:
-            writer.double_(DatumGetFloat8(value));
-            return;
-        case ConverterKind::Bool:
-            writer.boolean(DatumGetBool(value));
-            return;
-        case ConverterKind::Text:
-        case ConverterKind::JsonText:
-            flex_write_text(writer, value);
-            return;
-        case ConverterKind::Uuid:
-        {
-            char out[36];
-            format_uuid(value, out);
-            writer.string(std::string_view(out, sizeof(out)));
-            return;
-        }
-        case ConverterKind::NameText:
-            writer.string(name_text_view(value));
-            return;
-        case ConverterKind::CharText:
-        {
-            char ch = DatumGetChar(value);
-            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
-            return;
-        }
-        case ConverterKind::EnumText:
-            writer.string(enum_label_view(value));
-            return;
-        case ConverterKind::InetText:
-            write_network_string(writer, value, false);
-            return;
-        case ConverterKind::CidrText:
-            write_network_string(writer, value, true);
-            return;
-        case ConverterKind::IntervalText:
-            write_interval_string(writer, value);
-            return;
-        case ConverterKind::Numeric:
-            numeric_write_fast(writer, value);
-            return;
-        case ConverterKind::Date:
-            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
-            return;
-        case ConverterKind::Timestamp:
-            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
-            return;
-        case ConverterKind::Timestamptz:
-            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
-            return;
-        case ConverterKind::Jsonb:
-            writer.binary(datum_jsonb_span(value));
-            return;
-        case ConverterKind::Bytea:
-            writer.binary(datum_bytea_span(value));
-            return;
-        case ConverterKind::Composite:
-        {
-            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
-            const CachedSchema& schema = get_cached_schema(
-                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
-            TupleDeformScratch scratch;
-            flex_write_record_map(writer, rec, schema, &scratch);
-            return;
-        }
-        default:
-            break;
-    }
-
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("unsupported array element type for fast Flex path")));
-}
-
-// Hoists the elem_kind switch outside the loop for the common case of an
-// array with no null elements, instead of re-dispatching per element inside
-// flex_write_array_element. Mirrors msgpack_write_array_no_nulls.
-static inline void flex_write_array_no_nulls(
-    z::flex::Serializer& writer,
-    ConverterKind elem_kind,
-    Datum* elements,
-    int nitems)
-{
-    switch (elem_kind) {
-        case ConverterKind::Int2:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetInt16(elements[i])));
-            }
-            return;
-        case ConverterKind::Int4:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetInt32(elements[i])));
-            }
-            return;
-        case ConverterKind::Int8:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetInt64(elements[i])));
-            }
-            return;
-        case ConverterKind::Float4:
-            for (int i = 0; i < nitems; i++) {
-                writer.double_(static_cast<double>(DatumGetFloat4(elements[i])));
-            }
-            return;
-        case ConverterKind::Float8:
-            for (int i = 0; i < nitems; i++) {
-                writer.double_(DatumGetFloat8(elements[i]));
-            }
-            return;
-        case ConverterKind::Bool:
-            for (int i = 0; i < nitems; i++) {
-                writer.boolean(DatumGetBool(elements[i]));
-            }
-            return;
-        case ConverterKind::Text:
-        case ConverterKind::JsonText:
-            for (int i = 0; i < nitems; i++) {
-                flex_write_text(writer, elements[i]);
-            }
-            return;
-        case ConverterKind::Uuid:
-            for (int i = 0; i < nitems; i++) {
-                char out[36];
-                format_uuid(elements[i], out);
-                writer.string(std::string_view(out, sizeof(out)));
-            }
-            return;
-        case ConverterKind::NameText:
-            for (int i = 0; i < nitems; i++) {
-                writer.string(name_text_view(elements[i]));
-            }
-            return;
-        case ConverterKind::CharText:
-            for (int i = 0; i < nitems; i++) {
-                char ch = DatumGetChar(elements[i]);
-                writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
-            }
-            return;
-        case ConverterKind::EnumText:
-            for (int i = 0; i < nitems; i++) {
-                writer.string(enum_label_view(elements[i]));
-            }
-            return;
-        case ConverterKind::InetText:
-            for (int i = 0; i < nitems; i++) {
-                write_network_string(writer, elements[i], false);
-            }
-            return;
-        case ConverterKind::CidrText:
-            for (int i = 0; i < nitems; i++) {
-                write_network_string(writer, elements[i], true);
-            }
-            return;
-        case ConverterKind::IntervalText:
-            for (int i = 0; i < nitems; i++) {
-                write_interval_string(writer, elements[i]);
-            }
-            return;
-        case ConverterKind::Numeric:
-            for (int i = 0; i < nitems; i++) {
-                numeric_write_fast(writer, elements[i]);
-            }
-            return;
-        case ConverterKind::Date:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetDateADT(elements[i])));
-            }
-            return;
-        case ConverterKind::Timestamp:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetTimestamp(elements[i])));
-            }
-            return;
-        case ConverterKind::Timestamptz:
-            for (int i = 0; i < nitems; i++) {
-                writer.int64(static_cast<int64_t>(DatumGetTimestampTz(elements[i])));
-            }
-            return;
-        case ConverterKind::Jsonb:
-            for (int i = 0; i < nitems; i++) {
-                writer.binary(datum_jsonb_span(elements[i]));
-            }
-            return;
-        case ConverterKind::Bytea:
-            for (int i = 0; i < nitems; i++) {
-                writer.binary(datum_bytea_span(elements[i]));
-            }
-            return;
-        case ConverterKind::Composite:
-            for (int i = 0; i < nitems; i++) {
-                flex_write_array_element(writer, ConverterKind::Composite, elements[i], false);
-            }
-            return;
-        default:
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("unsupported array element type for fast Flex path")));
-    }
-}
-
-// See msgpack_write_array_dim for why this is decided per-value, not per-schema.
-static void flex_write_array_dim(
-    z::flex::Serializer& writer,
-    const CachedColumn& col,
-    Datum* elements,
-    bool* nulls,
-    const int* dims,
-    int ndim,
-    int depth,
-    int* offset)
-{
-    writer.begin_array(static_cast<size_t>(dims[depth]));
-    if (depth == ndim - 1) {
-        for (int i = 0; i < dims[depth]; i++, (*offset)++) {
-            if (nulls[*offset]) {
-                writer.null();
-            } else if (col.array_element_kind == ConverterKind::Fallback) {
-                write_output_string(writer, col.array_element_typoutput, elements[*offset]);
-            } else {
-                flex_write_array_element(writer, col.array_element_kind, elements[*offset], false);
-            }
-        }
-    } else {
-        for (int i = 0; i < dims[depth]; i++) {
-            flex_write_array_dim(writer, col, elements, nulls, dims, ndim, depth + 1, offset);
-        }
-    }
-    writer.end_array();
-}
-
-static inline void flex_write_array(
-    z::flex::Serializer& writer,
-    const CachedColumn& col,
-    Datum value)
-{
-    ArrayType* arr = DatumGetArrayTypeP(value);
-    int ndim = ARR_NDIM(arr);
-
-    if (ndim == 0) {
-        writer.begin_array(0);
-        writer.end_array();
-        return;
-    }
-
-    if (ndim != 1) {
-        Datum* elements;
-        bool* nulls;
-        int nitems;
-        deconstruct_array(arr,
-                          col.array_element_typid,
-                          col.array_typlen,
-                          col.array_typbyval,
-                          col.array_typalign,
-                          &elements,
-                          &nulls,
-                          &nitems);
-
-        int offset = 0;
-        flex_write_array_dim(writer, col, elements, nulls, ARR_DIMS(arr), ndim, 0, &offset);
-
-        pfree(elements);
-        pfree(nulls);
-        return;
-    }
-
-    Datum* elements;
-    bool* nulls;
-    int nitems;
-    deconstruct_array(arr,
-                      col.array_element_typid,
-                      col.array_typlen,
-                      col.array_typbyval,
-                      col.array_typalign,
-                      &elements,
-                      &nulls,
-                      &nitems);
-
-    writer.begin_array(static_cast<size_t>(nitems));
-    if (col.array_element_kind == ConverterKind::Fallback) {
-        for (int i = 0; i < nitems; i++) {
-            if (nulls[i]) {
-                writer.null();
-            } else {
-                write_output_string(writer, col.array_element_typoutput, elements[i]);
-            }
-        }
-    } else if (!ARR_HASNULL(arr)) {
-        flex_write_array_no_nulls(writer, col.array_element_kind, elements, nitems);
-    } else {
-        for (int i = 0; i < nitems; i++) {
-            flex_write_array_element(writer, col.array_element_kind, elements[i], nulls[i]);
-        }
-    }
-    writer.end_array();
-
-    pfree(elements);
-    pfree(nulls);
-}
-
-static inline void flex_write_scalar(
-    z::flex::Serializer& writer,
-    const CachedColumn& col,
-    Datum value,
-    bool isnull)
-{
-    if (isnull) {
-        writer.null();
-        return;
-    }
-
-    switch (col.kind) {
-        case ConverterKind::Int2:
-            writer.int64(static_cast<int64_t>(DatumGetInt16(value)));
-            return;
-        case ConverterKind::Int4:
-            writer.int64(static_cast<int64_t>(DatumGetInt32(value)));
-            return;
-        case ConverterKind::Int8:
-            writer.int64(static_cast<int64_t>(DatumGetInt64(value)));
-            return;
-        case ConverterKind::Float4:
-            writer.double_(static_cast<double>(DatumGetFloat4(value)));
-            return;
-        case ConverterKind::Float8:
-            writer.double_(DatumGetFloat8(value));
-            return;
-        case ConverterKind::Bool:
-            writer.boolean(DatumGetBool(value));
-            return;
-        case ConverterKind::Text:
-        case ConverterKind::JsonText:
-            flex_write_text(writer, value);
-            return;
-        case ConverterKind::Uuid:
-        {
-            char out[36];
-            format_uuid(value, out);
-            writer.string(std::string_view(out, sizeof(out)));
-            return;
-        }
-        case ConverterKind::NameText:
-            writer.string(name_text_view(value));
-            return;
-        case ConverterKind::CharText:
-        {
-            char ch = DatumGetChar(value);
-            writer.string(std::string_view(&ch, ch == '\0' ? 0 : 1));
-            return;
-        }
-        case ConverterKind::EnumText:
-            writer.string(enum_label_view(value));
-            return;
-        case ConverterKind::InetText:
-            write_network_string(writer, value, false);
-            return;
-        case ConverterKind::CidrText:
-            write_network_string(writer, value, true);
-            return;
-        case ConverterKind::IntervalText:
-            write_interval_string(writer, value);
-            return;
-        case ConverterKind::Numeric:
-            numeric_write_fast(writer, value);
-            return;
-        case ConverterKind::Date:
-            writer.int64(static_cast<int64_t>(DatumGetDateADT(value)));
-            return;
-        case ConverterKind::Timestamp:
-            writer.int64(static_cast<int64_t>(DatumGetTimestamp(value)));
-            return;
-        case ConverterKind::Timestamptz:
-            writer.int64(static_cast<int64_t>(DatumGetTimestampTz(value)));
-            return;
-        case ConverterKind::Jsonb:
-            writer.binary(datum_jsonb_span(value));
-            return;
-        case ConverterKind::Bytea:
-            writer.binary(datum_bytea_span(value));
-            return;
-        case ConverterKind::Array:
-            flex_write_array(writer, col, value);
-            return;
-        case ConverterKind::Composite:
-        {
-            HeapTupleHeader rec = DatumGetHeapTupleHeader(value);
-            const CachedSchema& schema = get_cached_schema(
-                HeapTupleHeaderGetTypeId(rec), HeapTupleHeaderGetTypMod(rec));
-            TupleDeformScratch scratch;
-            flex_write_record_map(writer, rec, schema, &scratch);
-            return;
-        }
-        case ConverterKind::Fallback:
-        {
-            char* str = OidOutputFunctionCall(col.typoutput, value);
-            writer.string(std::string_view(str));
-            pfree(str);
-            return;
-        }
-        default:
-            break;
-    }
-
-    ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-             errmsg("unsupported type for fast Flex path"),
-             errdetail("column type OID %u", col.typid)));
-}
-
-static inline void flex_write_record_map(
-    z::flex::Serializer& writer,
-    HeapTupleHeader rec,
-    const CachedSchema& schema,
-    TupleDeformScratch* scratch)
-{
-    HeapTupleData tuple;
-    tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
-    tuple.t_data = rec;
-
-    writer.begin_map(schema.columns.size());
-    if (!schema.use_deform_access) {
-        for (const CachedColumn& col : schema.columns) {
-            bool isnull;
-            Datum value = heap_getattr(&tuple, col.attnum, schema.tupdesc, &isnull);
-            writer.key(col.name);
-            flex_write_scalar(writer, col, value, isnull);
-        }
-    } else {
-        const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
-        scratch->ensure(nattrs);
-        heap_deform_tuple(&tuple, schema.tupdesc, scratch->values, scratch->nulls);
-        for (const CachedColumn& col : schema.columns) {
-            const int idx = col.attnum - 1;
-            writer.key(col.name);
-            flex_write_scalar(writer, col, scratch->values[idx], scratch->nulls[idx]);
-        }
-    }
-    writer.end_map();
-}
-
-static bool flex_schema_recursive_supported(
-    const CachedSchema& schema, std::unordered_set<Oid>& active_types)
-{
-    if (!schema.flex_fast_supported) {
-        return false;
-    }
-    for (const CachedColumn& col : schema.columns) {
-        Oid nested_type = InvalidOid;
-        if (col.kind == ConverterKind::Composite) {
-            nested_type = col.typid;
-        } else if (col.kind == ConverterKind::Array &&
-                   col.array_element_kind == ConverterKind::Composite) {
-            nested_type = col.array_element_typid;
-        }
-        if (!OidIsValid(nested_type) || !active_types.insert(nested_type).second) {
-            continue;
-        }
-        const CachedSchema& nested = get_cached_schema(nested_type, -1);
-        const bool supported = flex_schema_recursive_supported(nested, active_types);
-        active_types.erase(nested_type);
-        if (!supported) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bytea* try_serialize_flex_row_fast(HeapTupleHeader rec)
 {
     Oid tupType = HeapTupleHeaderGetTypeId(rec);
     int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
     const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-    if (!schema.flex_fast_supported) {
+    if (!schema.fast_supported) {
         return nullptr;
     }
     if (schema.has_recursive_columns) {
         std::unordered_set<Oid> active_types{tupType};
-        if (!flex_schema_recursive_supported(schema, active_types)) {
+        if (!schema_recursive_supported(schema, active_types)) {
             return nullptr;
         }
     }
@@ -5067,10 +4211,10 @@ static bytea* try_serialize_flex_row_fast(HeapTupleHeader rec)
         z::flex::RootSerializer rs;
         z::flex::Serializer writer(rs);
         if (!schema.use_deform_access) {
-            flex_write_record_map(writer, rec, schema, nullptr);
+            write_record_map_generic(writer, rec, schema, nullptr);
         } else {
             TupleDeformScratch scratch;
-            flex_write_record_map(writer, rec, schema, &scratch);
+            write_record_map_generic(writer, rec, schema, &scratch);
         }
 
         z::ZBuffer buffer = rs.finish();
@@ -5110,12 +4254,12 @@ static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int ni
         int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
         const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
 
-        if (!schema.flex_fast_supported) {
+        if (!schema.fast_supported) {
             return nullptr;
         }
         if (schema.has_recursive_columns) {
             std::unordered_set<Oid> active_types{tupType};
-            if (!flex_schema_recursive_supported(schema, active_types)) {
+            if (!schema_recursive_supported(schema, active_types)) {
                 return nullptr;
             }
         }
@@ -5133,7 +4277,7 @@ static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int ni
                 writer.null();
             } else {
                 HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
-                flex_write_record_map(writer, rec, *schemas[i], &scratch);
+                write_record_map_generic(writer, rec, *schemas[i], &scratch);
             }
         }
         writer.end_array();
