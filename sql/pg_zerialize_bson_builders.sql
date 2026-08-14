@@ -1,0 +1,77 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+
+-- Mirrors pg_zerialize_cbor_builders.sql for the BSON builder API, minus
+-- bson_build_array and bson_agg: both would only ever produce a
+-- bare-array-root BSON document, which cannot be read back as an array
+-- (see BSON.md and pg_zerialize.cpp's forward-declaration comment).
+-- bson_object_agg is unaffected, since jsonb_object_agg_finalfn always
+-- produces a JSON object.
+
+SELECT bson_build_object('id', 1, 'name', 'alice', 'active', true) IS NOT NULL AS build_object_ok;
+
+SELECT bson_build_object('a', 1, 'b', 'x', 'c', true)
+       = bson_from_jsonb(jsonb_build_object('a', 1, 'b', 'x', 'c', true)) AS object_parity;
+
+-- Nested semantics parity (via bson_from_jsonb, which recurses; bson_build_object
+-- treats a raw jsonb-typed variadic argument as opaque -- see README's
+-- "JSON text is not recursively parsed" note).
+SELECT bson_from_jsonb(
+           jsonb_build_object(
+               'a', jsonb_build_array(1,2,3),
+               'b', jsonb_build_object('x', true, 'y', NULL),
+               'c', jsonb_build_array(jsonb_build_object('k', 1), jsonb_build_object('k', 2))
+           )
+       )
+       = bson_from_jsonb(
+           jsonb_build_object(
+               'a', jsonb_build_array(1,2,3),
+               'b', jsonb_build_object('x', true, 'y', NULL),
+               'c', jsonb_build_array(jsonb_build_object('k', 1), jsonb_build_object('k', 2))
+           )
+       ) AS nested_stable;
+
+-- Cross-check against MessagePack's independently-tested builder, decoded
+-- through each protocol's own JSONB decoder.
+SELECT (bson_to_jsonb(bson_build_object('id', 7, 'active', true))
+        = msgpack_to_jsonb(msgpack_build_object('id', 7, 'active', true))) AS matches_msgpack;
+
+CREATE TABLE pgz_bson_bld_emp(id int, dept int, name text, role text);
+INSERT INTO pgz_bson_bld_emp VALUES
+    (1, 10, 'ann', 'dev'),
+    (2, 10, 'bob', 'lead'),
+    (3, 20, 'cam', 'ae');
+
+SELECT bson_object_agg(name, role ORDER BY name) IS NOT NULL AS object_agg_ok
+FROM pgz_bson_bld_emp;
+
+SELECT bson_object_agg(name, role ORDER BY name)
+       = bson_from_jsonb(jsonb_object_agg(name, role ORDER BY name)) AS object_agg_parity
+FROM pgz_bson_bld_emp;
+
+-- Join-shaped nested build, same pattern as the msgpack builder tests.
+WITH nested_employees AS (
+  SELECT
+    dept,
+    jsonb_object_agg(id, jsonb_build_object('name', name, 'role', role)) AS staff
+  FROM pgz_bson_bld_emp
+  GROUP BY dept
+)
+SELECT bson_from_jsonb(
+         jsonb_build_object(
+           'dept_id', d.dept,
+           'dept_name', d.dept_name,
+           'staff', COALESCE(ne.staff, '{}'::jsonb)
+         )
+       ) IS NOT NULL AS join_nested_not_null
+FROM (VALUES (10,'eng'), (20,'sales'), (30,'ops')) AS d(dept, dept_name)
+LEFT JOIN nested_employees ne ON ne.dept = d.dept
+ORDER BY d.dept;
+
+-- Invalid input checks for builder-style APIs.
+SELECT bson_build_object('a', 1, 'b');
+SELECT bson_build_object(NULL, 1);
+
+DROP TABLE pgz_bson_bld_emp;
+DROP EXTENSION pg_zerialize;

@@ -4,8 +4,19 @@ The vendored source is synchronized with:
 
 - Repository: <https://github.com/mrayva/zerialize> (fork of
   <https://github.com/colinator/zerialize>)
-- Commit: `32d9d9447c9ce725ba0ea9d1a5d25005066a0cd8`
-- Commit date: 2026-08-04
+- Commit: `13f6383043a47231a097a5a9bee14f2b332f67f7`
+- Commit date: 2026-08-13
+
+Bumped from the previous pin, `32d9d9447c9ce725ba0ea9d1a5d25005066a0cd8`
+(2026-08-04): that bump added `include/zerialize/protocols/ion.hpp` and
+`bson.hpp` (plus their `Ion.md`/`BSON.md` docs) to this tree — both are new
+files upstream, so the patches below (all against `cbor.hpp`/`msgpack.hpp`/
+`zera.hpp`/`flex.hpp`/`zbuffer.hpp`) needed no rework: `git diff 32d9d944
+13f6383 --stat` in the fork shows zero changes to any of those five files
+between the two pins. `include/zerialize/protocols/beve.hpp` was
+deliberately NOT vendored in this bump — it requires a C++23 compiler
+(this extension targets C++20) and pulls in glaze, a separate, larger
+change to take on its own.
 
 The fork carries these bug fixes on top of upstream commit `aedaaf2` (the
 commit this vendor tree previously tracked):
@@ -31,12 +42,23 @@ commit this vendor tree previously tracked):
 - `include/zerialize/zbuffer.hpp`: includes `<memory>` for owned buffers
   (this fix landed upstream in the fork; kept here for clarity).
 - `include/zerialize/protocols/cbor.hpp`: replaces the jsoncons-based
-  `RootSerializer`/`Serializer` with a direct RFC 8949 byte encoder. Upstream's
-  CBOR writer requires the jsoncons headers, which are not vendored anywhere
-  in this tree and have no apt package, so every build of this extension
-  failed before this change (confirmed via this repo's CI history). The
-  hand-rolled encoder removes that dependency entirely; `CborDeserializer`
-  (used by `cbor_to_jsonb`) is untouched.
+  `RootSerializer`/`Serializer` with a direct RFC 8949 byte encoder. At the
+  time this was written, upstream's CBOR writer's jsoncons dependency
+  wasn't vendored anywhere in this tree and (it was believed) had no apt
+  package, so every build of this extension failed before this change
+  (confirmed via this repo's CI history). The hand-rolled encoder removes
+  that dependency entirely; `CborDeserializer` (used by `cbor_to_jsonb`) is
+  untouched. Note: as of the 2026-08-13 bump, `libjsoncons-dev` turned out
+  to be apt-installable after all (verified on Ubuntu 24.04/25.10) and is
+  now a build dependency anyway for `bson.hpp`'s writer (see below) — but
+  this hand-rolled CBOR encoder is being left as-is rather than reverted,
+  since it works and reverting isn't in scope here.
+- `include/zerialize/protocols/bson.hpp` and `ion.hpp`: vendored verbatim,
+  unmodified, from the fork. `ion.hpp` is genuinely dependency-free.
+  `bson.hpp`'s reader is hand-rolled and dependency-free; its writer wraps
+  `jsoncons::bson::bson_bytes_encoder`, so `libjsoncons-dev` is now a build
+  dependency of this extension (see `.github/workflows/ci.yml` and
+  `README.md`'s Requirements section).
 
 When updating, compare the fork against this directory and reapply these
 changes deliberately. Do not replace the vendored tree wholesale.

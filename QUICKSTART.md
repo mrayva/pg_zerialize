@@ -11,6 +11,8 @@ sudo apt-get install \
   postgresql-server-dev-18 \
   libflatbuffers-dev \
   libfast-float-dev \
+  libmsgpack-dev \
+  libjsoncons-dev \
   python3-msgpack
 ```
 

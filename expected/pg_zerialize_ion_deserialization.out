@@ -1,0 +1,135 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+BEGIN;
+-- Mirrors pg_zerialize_cbor_deserialization.sql for Ion. Ion goes through
+-- zerialize's own Deserializer/Reader interface (reader_value_to_json in
+-- pg_zerialize.cpp) rather than a hand-rolled wire-byte parser, but the
+-- externally-observable contract -- round-trip semantics, NaN/Infinity
+-- tagging, blob tagging, corruption rejection -- is the same.
+CREATE TYPE pg_temp.pgz_ion_leaf AS (
+    label text,
+    payload bytea
+);
+CREATE TYPE pg_temp.pgz_ion_holder AS (
+    id bigint,
+    active boolean,
+    score double precision,
+    special double precision,
+    title text,
+    matrix integer[],
+    child pg_temp.pgz_ion_leaf,
+    children pg_temp.pgz_ion_leaf[]
+);
+CREATE TEMP TABLE pgz_ion_values AS
+SELECT ROW(
+    9223372036854775807::bigint,
+    true,
+    1.25::double precision,
+    'Infinity'::double precision,
+    E'quoted " text \\ newline\n Ω',
+    ARRAY[[1, NULL], [3, 4]],
+    ROW('root', decode('00ff10', 'hex'))::pg_temp.pgz_ion_leaf,
+    ARRAY[
+        ROW('first', decode('deadbeef', 'hex'))::pg_temp.pgz_ion_leaf,
+        NULL::pg_temp.pgz_ion_leaf
+    ]
+)::pg_temp.pgz_ion_holder AS value;
+SELECT ion_to_jsonb(row_to_ion(value)) =
+       '{
+          "id":9223372036854775807,
+          "active":true,
+          "score":1.25,
+          "special":"Infinity",
+          "title":"quoted \" text \\ newline\n Ω",
+          "matrix":[[1,null],[3,4]],
+          "child":{"label":"root","payload":["~b","AP8Q","base64"]},
+          "children":[
+            {"label":"first","payload":["~b","3q2+7w==","base64"]},
+            null
+          ]
+        }'::jsonb AS nested_row_semantics
+FROM pgz_ion_values;
+ nested_row_semantics 
+----------------------
+ t
+(1 row)
+
+SELECT ion_to_jsonb(rows_to_ion(
+           ARRAY[value, NULL::pg_temp.pgz_ion_holder]
+       )) =
+       jsonb_build_array(ion_to_jsonb(row_to_ion(value)), NULL)
+       AS batch_semantics
+FROM pgz_ion_values;
+ batch_semantics 
+-----------------
+ t
+(1 row)
+
+-- NaN/negative-infinity tagging (positive Infinity already covered above).
+SELECT ion_to_jsonb(ion_from_jsonb('"NaN"'::jsonb)) = '"NaN"'::jsonb AS nan_roundtrips_as_tag,
+       ion_to_jsonb(ion_from_jsonb(to_jsonb('-Infinity'::double precision))) = '"-Infinity"'::jsonb
+           AS neg_infinity_tag;
+ nan_roundtrips_as_tag | neg_infinity_tag 
+-----------------------+------------------
+ t                     | t
+(1 row)
+
+-- Bare-array-root and scalar-root both work at the top level -- unlike
+-- BSON, Ion has no such ambiguity (see pg_zerialize_bson_deserialization.sql).
+SELECT ion_to_jsonb(ion_from_jsonb(jsonb_build_array(10, 20, 30))) =
+       jsonb_build_array(10, 20, 30) AS bare_array_root_roundtrips;
+ bare_array_root_roundtrips 
+----------------------------
+ t
+(1 row)
+
+SELECT ion_to_jsonb(ion_from_jsonb('42'::jsonb)) = '42'::jsonb AS bare_scalar_root_roundtrips;
+ bare_scalar_root_roundtrips 
+-----------------------------
+ t
+(1 row)
+
+-- Multiple top-level values in one stream: Ion's own reader semantics take
+-- the first one rather than treating the rest as trailing-byte corruption
+-- (contrast with the "trailing bytes" rejection tests below, and with
+-- every other protocol in this extension).
+SELECT ion_to_jsonb(ion_from_jsonb('1'::jsonb) || ion_from_jsonb('2'::jsonb)) = '1'::jsonb
+       AS multi_value_stream_takes_first;
+ multi_value_stream_takes_first 
+--------------------------------
+ t
+(1 row)
+
+SELECT ion_to_jsonb(NULL::bytea) IS NULL AS strict_null;
+ strict_null 
+-------------
+ t
+(1 row)
+
+CREATE FUNCTION pg_temp.pgz_ion_is_invalid(value bytea)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM ion_to_jsonb(value);
+    RETURN false;
+EXCEPTION
+    WHEN invalid_binary_representation THEN RETURN true;
+END
+$$;
+-- e00100ea (BVM) + 8183 (struct len 3, sid 1="a") + d487b28161d38a2101... is
+-- overkill; use the compact fixture below instead: Ion encoding of {"a":1}.
+SELECT encode(ion_from_jsonb('{"a":1}'::jsonb), 'hex') AS ion_a1_hex \gset
+SELECT pg_temp.pgz_ion_is_invalid(decode('', 'hex')) AS empty_rejected,
+       pg_temp.pgz_ion_is_invalid(decode('00', 'hex')) AS missing_bvm_rejected,
+       pg_temp.pgz_ion_is_invalid(decode('e0010000', 'hex')) AS wrong_bvm_rejected,
+       pg_temp.pgz_ion_is_invalid(
+           decode(substring(:'ion_a1_hex' from 1 for length(:'ion_a1_hex') - 2), 'hex')
+       ) AS truncated_rejected;
+ empty_rejected | missing_bvm_rejected | wrong_bvm_rejected | truncated_rejected 
+----------------+----------------------+--------------------+--------------------
+ t              | t                    | t                  | t
+(1 row)
+
+ROLLBACK;
+DROP EXTENSION pg_zerialize;

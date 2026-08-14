@@ -73,7 +73,11 @@ SELECT (msgpack_to_jsonb(row_to_msgpack(msgpack_populate_record(NULL::pg_temp.pr
        (msgpack_to_jsonb(row_to_msgpack(zera_populate_record(NULL::pg_temp.pr_wide, row_to_zera(value)))) =
         msgpack_to_jsonb(row_to_msgpack(value))) AS zera_roundtrip,
        (msgpack_to_jsonb(row_to_msgpack(flexbuffers_populate_record(NULL::pg_temp.pr_wide, row_to_flexbuffers(value)))) =
-        msgpack_to_jsonb(row_to_msgpack(value))) AS flex_roundtrip
+        msgpack_to_jsonb(row_to_msgpack(value))) AS flex_roundtrip,
+       (msgpack_to_jsonb(row_to_msgpack(ion_populate_record(NULL::pg_temp.pr_wide, row_to_ion(value)))) =
+        msgpack_to_jsonb(row_to_msgpack(value))) AS ion_roundtrip,
+       (msgpack_to_jsonb(row_to_msgpack(bson_populate_record(NULL::pg_temp.pr_wide, row_to_bson(value)))) =
+        msgpack_to_jsonb(row_to_msgpack(value))) AS bson_roundtrip
 FROM pr_values;
 
 -- base = NULL, data supplied via a plain JSON bridge (msgpack_from_jsonb),
@@ -176,7 +180,9 @@ SELECT ROW(decode('00FF10AB', 'hex'), '{"nested":[1,2,3]}'::jsonb)::pg_temp.pr_b
 SELECT (msgpack_populate_record(NULL::pg_temp.pr_binary, row_to_msgpack(value)) = value) AS msgpack_binary_ok,
        (cbor_populate_record(NULL::pg_temp.pr_binary, row_to_cbor(value)) = value) AS cbor_binary_ok,
        (zera_populate_record(NULL::pg_temp.pr_binary, row_to_zera(value)) = value) AS zera_binary_ok,
-       (flexbuffers_populate_record(NULL::pg_temp.pr_binary, row_to_flexbuffers(value)) = value) AS flex_binary_ok
+       (flexbuffers_populate_record(NULL::pg_temp.pr_binary, row_to_flexbuffers(value)) = value) AS flex_binary_ok,
+       (ion_populate_record(NULL::pg_temp.pr_binary, row_to_ion(value)) = value) AS ion_binary_ok,
+       (bson_populate_record(NULL::pg_temp.pr_binary, row_to_bson(value)) = value) AS bson_binary_ok
 FROM pr_binary_values;
 
 -- A malformed document (wrong shape for a scalar column) is rejected cleanly.
