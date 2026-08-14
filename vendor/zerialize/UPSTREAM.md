@@ -4,8 +4,22 @@ The vendored source is synchronized with:
 
 - Repository: <https://github.com/mrayva/zerialize> (fork of
   <https://github.com/colinator/zerialize>)
-- Commit: `13f6383043a47231a097a5a9bee14f2b332f67f7`
-- Commit date: 2026-08-13
+- Commit: `f0f07a182fa139f8085d9ddbe71df3f3ed9ab422` (upstream: `Add
+  mapEntries() to fix O(n^2) map decoding for consumers`)
+- Commit date: 2026-08-14
+
+`f0f07a1` adds one thing on top of `13f6383`: `mapEntries()` on
+`MsgPackDeserializer`/`IonDeserializer`/`BsonDeserializer`/`BeveDeserializer`
+(single-pass key+value iteration, vs. `mapKeys()` + `operator[](key)`'s
+O(n) re-scan per lookup). Found while auditing this extension's own
+`reader_value_to_json`/`msgpack_reader_to_json` (`pg_zerialize.cpp`) for an
+O(n^2) map-decode pattern in a per-row hot path, fixed locally here first
+(verified: all 28 REGRESS tests, ~3.5x on a 200-key object), then ported
+upstream and pulled back in as this bump -- so `ion.hpp`/`bson.hpp`/
+`beve.hpp` are, once again, vendored verbatim with no local patch, and
+`msgpack.hpp`'s reader-side `mapEntries()` addition is upstream-identical
+too (its writer remains locally patched, see below, unaffected by this
+change since it's reader-only).
 
 Bumped from the previous pin, `32d9d9447c9ce725ba0ea9d1a5d25005066a0cd8`
 (2026-08-04): that bump added `include/zerialize/protocols/ion.hpp` and
