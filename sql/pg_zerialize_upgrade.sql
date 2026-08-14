@@ -88,4 +88,18 @@ FROM msgpack_populate_recordset(
 ) AS r;
 DROP TYPE pg_temp.upgrade_row;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.10';
+SELECT extversion = '1.10' AS upgraded_to_1_10
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('ion_to_jsonb(bytea)') IS NOT NULL AS ion_decoder_present,
+       to_regprocedure('ion_populate_recordset(anyelement,bytea)') IS NOT NULL AS ion_populate_recordset_present,
+       to_regprocedure('bson_to_jsonb(bytea)') IS NOT NULL AS bson_decoder_present,
+       to_regprocedure('bson_populate_record(anyelement,bytea)') IS NOT NULL AS bson_populate_record_present,
+       to_regprocedure('bson_populate_recordset(anyelement,bytea)') IS NULL AS bson_populate_recordset_absent;
+SELECT ion_to_jsonb(ion_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS ion_builder_works;
+SELECT bson_to_jsonb(bson_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS bson_builder_works;
+
 DROP EXTENSION pg_zerialize;

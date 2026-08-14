@@ -49,6 +49,7 @@ jobs:
             libflatbuffers-dev \
             libfast-float-dev \
             libmsgpack-dev \
+            libjsoncons-dev \
             python3-msgpack \
             "postgresql-${PG_MAJOR}" \
             "postgresql-server-dev-${PG_MAJOR}"

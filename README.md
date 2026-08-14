@@ -1,8 +1,9 @@
 # pg_zerialize
 
 PostgreSQL extension for serializing rows and batches of rows to MessagePack,
-CBOR, ZERA, and FlexBuffers. Each protocol also includes SQL builders and
-aggregates for constructing nested binary values from scratch.
+CBOR, ZERA, FlexBuffers, Ion, and BSON. Each protocol also includes SQL
+builders and aggregates for constructing nested binary values from scratch
+(BSON's builder API is a reduced subset -- see Current Limitations).
 
 ## Support
 
@@ -20,6 +21,7 @@ and performance work use PostgreSQL 18.
 - FlatBuffers development package (`libflatbuffers-dev`)
 - fast_float development package (`libfast-float-dev`)
 - MessagePack C development package (`libmsgpack-dev`)
+- jsoncons development package (`libjsoncons-dev`) -- used by BSON's writer
 - Python `msgpack` package for independent MessagePack semantic tests
 
 The zerialize headers are vendored under `vendor/`. See
@@ -192,11 +194,20 @@ SELECT * FROM msgpack_populate_recordset(
 
 Schema metadata, converter selection, protocol keys, and map headers are cached
 per PostgreSQL backend. Flat supported schemas use protocol-specific direct
-writers. All four protocols also directly write nested composite fields,
-one-dimensional composite arrays, and multidimensional arrays of any
-directly-writable element type, recursing through the same cached writer
-plans at every level; schemas with a descendant column that has no direct
-writer (recursively) fall back to the generic dynamic tree.
+writers. MessagePack, CBOR, ZERA, and FlexBuffers also directly write nested
+composite fields, one-dimensional composite arrays, and multidimensional
+arrays of any directly-writable element type, recursing through the same
+cached writer plans at every level; schemas with a descendant column that has
+no direct writer (recursively) fall back to the generic dynamic tree.
+
+Ion and BSON don't have a direct writer yet -- every `row_to_ion`/
+`row_to_bson`/`rows_to_ion` call goes through the same generic dynamic-tree
+path those other four fall back to. Their `X_to_jsonb`/`X_populate_record(set)`
+read side is likewise generic: rather than a hand-rolled wire-byte parser per
+format (what MessagePack/CBOR/ZERA/FlexBuffers each have), they decode
+through zerialize's own `Reader`/`Deserializer` interface via one shared
+walker. Both are correct and fully tested, just not yet performance-tuned to
+the same degree as the original four.
 
 The following test helpers force MessagePack's generic path for byte-parity
 checks:
@@ -218,12 +229,31 @@ result format. Benchmark output under `results/` is intentionally untracked.
 ## Current Limitations
 
 - Deserialization targets JSONB (`X_to_jsonb`) and typed composites, single
-  (`X_populate_record`) or batch (`X_populate_recordset`), for all four
-  binary protocols.
+  (`X_populate_record`) or batch (`X_populate_recordset`), for MessagePack,
+  CBOR, ZERA, FlexBuffers, and Ion. BSON has `X_to_jsonb`/`X_populate_record`
+  but not `X_populate_recordset` -- see below.
 - Exact decimals use an opt-in tagged-array convention rather than a native
   protocol scalar, so non-pg_zerialize consumers must interpret that tag.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON
   semantics are required.
+- **BSON has no bare-array-root support.** A BSON document and a BSON array
+  are physically identical on the wire -- only a *parent* element's header
+  records which one a value is, and the root has no parent, so that
+  information doesn't exist to recover on read (confirmed against jsoncons'
+  own `bson_parser`, which has the same behavior). Concretely: `bson_to_jsonb`
+  always decodes an unannotated root as a JSON object, never an array.
+  Because of this, `bson_build_array`, `bson_agg`, `rows_to_bson`, and
+  `bson_populate_recordset` are not provided -- each would only ever produce
+  or require a bare-array-root document. Arrays nested anywhere below the
+  root (inside a document) are unaffected and round-trip normally; use
+  `bson_build_object`/`bson_object_agg`/`row_to_bson`/`bson_populate_record`
+  instead. See [`vendor/zerialize/include/zerialize/protocols/BSON.md`](vendor/zerialize/include/zerialize/protocols/BSON.md).
+- **Ion decodes only the first top-level value in a stream.** Unlike the
+  other five protocols here (one value per `bytea`, trailing bytes rejected
+  as corruption), Ion's own wire format legitimately allows multiple
+  top-level values back to back; `ion_to_jsonb`/`ion_populate_record(set)`
+  take the first one and don't treat what follows as an error, matching
+  standard Ion reader semantics.
 
 ## Maintained Documentation
 

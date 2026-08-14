@@ -63,6 +63,8 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <zerialize/protocols/msgpack.hpp>
 #include <zerialize/protocols/cbor.hpp>
 #include <zerialize/protocols/zera.hpp>
+#include <zerialize/protocols/ion.hpp>
+#include <zerialize/protocols/bson.hpp>
 #include <zerialize/dynamic.hpp>
 #include <zerialize/internals/base64.hpp>
 
@@ -138,6 +140,31 @@ extern "C" {
     Datum flexbuffers_agg_final(PG_FUNCTION_ARGS);
     Datum flexbuffers_object_agg_final(PG_FUNCTION_ARGS);
 
+    // Ion: full parity with msgpack/cbor/zera/flexbuffers -- Ion has no
+    // root-level type ambiguity (see BSON below for the contrast).
+    Datum row_to_ion(PG_FUNCTION_ARGS);
+    Datum ion_from_jsonb(PG_FUNCTION_ARGS);
+    Datum ion_to_jsonb(PG_FUNCTION_ARGS);
+    Datum ion_populate_record(PG_FUNCTION_ARGS);
+    Datum ion_populate_recordset(PG_FUNCTION_ARGS);
+    Datum ion_build_object(PG_FUNCTION_ARGS);
+    Datum ion_build_array(PG_FUNCTION_ARGS);
+    Datum ion_agg_final(PG_FUNCTION_ARGS);
+    Datum ion_object_agg_final(PG_FUNCTION_ARGS);
+    Datum rows_to_ion(PG_FUNCTION_ARGS);
+
+    // BSON: a document and a bare array are wire-identical at the root (no
+    // parent element header to carry the type tag there), so anything that
+    // would produce or require a bare-array-root BSON value is deliberately
+    // NOT provided here -- see BSON.md and bson_decode_to_json_text()'s
+    // comment. Only the map/document-rooted subset is exposed.
+    Datum row_to_bson(PG_FUNCTION_ARGS);
+    Datum bson_from_jsonb(PG_FUNCTION_ARGS);
+    Datum bson_to_jsonb(PG_FUNCTION_ARGS);
+    Datum bson_populate_record(PG_FUNCTION_ARGS);
+    Datum bson_build_object(PG_FUNCTION_ARGS);
+    Datum bson_object_agg_final(PG_FUNCTION_ARGS);
+
     // Batch processing functions
     Datum rows_to_flexbuffers(PG_FUNCTION_ARGS);
     Datum rows_to_msgpack(PG_FUNCTION_ARGS);
@@ -182,6 +209,24 @@ extern "C" {
     PG_FUNCTION_INFO_V1(flexbuffers_build_array);
     PG_FUNCTION_INFO_V1(flexbuffers_agg_final);
     PG_FUNCTION_INFO_V1(flexbuffers_object_agg_final);
+
+    PG_FUNCTION_INFO_V1(row_to_ion);
+    PG_FUNCTION_INFO_V1(ion_from_jsonb);
+    PG_FUNCTION_INFO_V1(ion_to_jsonb);
+    PG_FUNCTION_INFO_V1(ion_populate_record);
+    PG_FUNCTION_INFO_V1(ion_populate_recordset);
+    PG_FUNCTION_INFO_V1(ion_build_object);
+    PG_FUNCTION_INFO_V1(ion_build_array);
+    PG_FUNCTION_INFO_V1(ion_agg_final);
+    PG_FUNCTION_INFO_V1(ion_object_agg_final);
+    PG_FUNCTION_INFO_V1(rows_to_ion);
+
+    PG_FUNCTION_INFO_V1(row_to_bson);
+    PG_FUNCTION_INFO_V1(bson_from_jsonb);
+    PG_FUNCTION_INFO_V1(bson_to_jsonb);
+    PG_FUNCTION_INFO_V1(bson_populate_record);
+    PG_FUNCTION_INFO_V1(bson_build_object);
+    PG_FUNCTION_INFO_V1(bson_object_agg_final);
 
     PG_FUNCTION_INFO_V1(rows_to_flexbuffers);
     PG_FUNCTION_INFO_V1(rows_to_msgpack);
@@ -1057,6 +1102,69 @@ static void msgpack_reader_to_json(
         out.push_back('}');
     } else {
         throw z::DeserializationError("unsupported MessagePack value");
+    }
+}
+
+/*
+ * reader_value_to_json - Generic Reader-concept-to-JSON-text walker, shared
+ * by ion_to_jsonb/ion_populate_record(set) and bson_to_jsonb/
+ * bson_populate_record. Unlike msgpack/cbor/zera/flexbuffers (which each
+ * hand-parse their own wire bytes directly for speed), Ion and BSON go
+ * through zerialize's own Deserializer/Reader interface here instead of a
+ * new hand-rolled byte parser per format -- the same interface msgpack's
+ * own msgpack_reader_to_json above already uses. This is the generic/slow
+ * path; a hand-tuned byte-level decoder can be added later per format the
+ * same way it eventually was for cbor/zera/flexbuffers.
+ */
+template<typename V>
+    requires z::ValueView<V>
+static void reader_value_to_json(const V& value, std::string& out)
+{
+    check_stack_depth();
+    if (value.isNull()) {
+        out += "null";
+    } else if (value.isBool()) {
+        out += value.asBool() ? "true" : "false";
+    } else if (value.isUInt()) {
+        append_json_number(out, value.asUInt64());
+    } else if (value.isInt()) {
+        append_json_number(out, value.asInt64());
+    } else if (value.isFloat()) {
+        const double number = value.asDouble();
+        if (std::isfinite(number)) {
+            append_json_number(out, number);
+        } else if (std::isnan(number)) {
+            append_json_string(out, "NaN");
+        } else {
+            append_json_string(out, number > 0 ? "Infinity" : "-Infinity");
+        }
+    } else if (value.isString()) {
+        append_json_string(out, value.asStringView());
+    } else if (value.isBlob()) {
+        out += "[\"~b\",";
+        append_json_string(out, z::base64Encode(value.asBlob()));
+        out += ",\"base64\"]";
+    } else if (value.isArray()) {
+        out.push_back('[');
+        const size_t count = value.arraySize();
+        for (size_t i = 0; i < count; i++) {
+            if (i > 0) out.push_back(',');
+            reader_value_to_json(value[i], out);
+        }
+        out.push_back(']');
+    } else if (value.isMap()) {
+        out.push_back('{');
+        bool first = true;
+        for (std::string_view key : value.mapKeys()) {
+            if (!first) out.push_back(',');
+            first = false;
+            append_json_string(out, key);
+            out.push_back(':');
+            reader_value_to_json(value[key], out);
+        }
+        out.push_back('}');
+    } else {
+        throw z::DeserializationError("unsupported value");
     }
 }
 
@@ -5167,6 +5275,16 @@ static inline bytea* dynamic_to_msgpack_binary(const z::dyn::Value& v)
     return dynamic_to_binary<z::MsgPack>(v);
 }
 
+static inline bytea* dynamic_to_ion_binary(const z::dyn::Value& v)
+{
+    return dynamic_to_binary<z::Ion>(v);
+}
+
+static inline bytea* dynamic_to_bson_binary(const z::dyn::Value& v)
+{
+    return dynamic_to_binary<z::Bson>(v);
+}
+
 /*
  * Generic helper function to convert array of PostgreSQL tuples to binary format
  * This is the batch processing version for improved performance
@@ -5658,6 +5776,126 @@ zera_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Shared decode core for ion_to_jsonb/ion_populate_record(set).
+ *
+ * Unlike msgpack/cbor/zera/flexbuffers -- which each encode exactly one
+ * value per bytea and reject trailing bytes as corruption -- Ion's own wire
+ * format legitimately allows a stream of multiple top-level values back to
+ * back. IonDeserializer decodes the first one, matching standard Ion reader
+ * semantics; bytes after it are not an error here.
+ */
+static std::string ion_decode_to_json_text(std::span<const uint8_t> data)
+{
+    z::Ion::Deserializer reader(data);
+    std::string json;
+    json.reserve(data.size() + 32);
+    reader_value_to_json(reader, json);
+    return json;
+}
+
+/*
+ * ion_to_jsonb - Decode one Ion value (the first in the stream) to jsonb.
+ */
+extern "C" Datum
+ion_to_jsonb(PG_FUNCTION_ARGS)
+{
+    bytea* input = PG_GETARG_BYTEA_PP(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = ion_decode_to_json_text(data);
+        PG_FREE_IF_COPY(input, 0);
+
+        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        PG_RETURN_DATUM(result);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid Ion input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid Ion input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * Shared decode core for bson_to_jsonb/bson_populate_record.
+ *
+ * A BSON document's first 4 bytes are its own little-endian total length,
+ * so trailing-bytes detection is a direct read rather than a parse -- no
+ * need to duplicate BsonDeserializer's own internal walk just to compute
+ * how many bytes the root value consumed the way ion_decode_to_json_text
+ * would have to.
+ *
+ * A document and a bare array are physically identical on the wire (only a
+ * *parent* element's header records which one a value is, and the root has
+ * no parent -- see BSON.md and the forward-declaration comment above), so
+ * BsonDeserializer always decodes an unannotated root as a map, exactly
+ * like jsoncons' own bson_parser. That's expected here, not a bug: this
+ * extension only ever hands bson_decode_to_json_text bytes that came from
+ * row_to_bson/bson_from_jsonb/bson_build_object (always map-rooted) or an
+ * external, spec-compliant BSON document (also always map-rooted, since a
+ * standalone BSON document is defined to be a document, not a bare array).
+ */
+static std::string bson_decode_to_json_text(std::span<const uint8_t> data)
+{
+    if (data.size() < 4) {
+        throw z::DeserializationError("truncated BSON document");
+    }
+    const std::uint32_t declared_len =
+        std::uint32_t(data[0]) | (std::uint32_t(data[1]) << 8) |
+        (std::uint32_t(data[2]) << 16) | (std::uint32_t(data[3]) << 24);
+    if (declared_len != data.size()) {
+        throw z::DeserializationError("trailing bytes after BSON document");
+    }
+
+    z::Bson::Deserializer reader(data);
+    std::string json;
+    json.reserve(data.size() + 32);
+    reader_value_to_json(reader, json);
+    return json;
+}
+
+/*
+ * bson_to_jsonb - Decode one BSON document to jsonb.
+ */
+extern "C" Datum
+bson_to_jsonb(PG_FUNCTION_ARGS)
+{
+    bytea* input = PG_GETARG_BYTEA_PP(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = bson_decode_to_json_text(data);
+        PG_FREE_IF_COPY(input, 0);
+
+        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        PG_RETURN_DATUM(result);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BSON input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BSON input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
  * Shared decode-to-composite core for X_populate_record. Reuses each
  * protocol's own X_decode_to_json_text() (already validated/tested via
  * X_to_jsonb) to get a Jsonb*, then walks that Jsonb tree directly into a
@@ -6048,6 +6286,88 @@ cbor_populate_record(PG_FUNCTION_ARGS)
 }
 
 /*
+ * ion_populate_record - Decode an Ion document into a typed composite,
+ * falling back to base's columns for keys the document omits.
+ */
+extern "C" Datum
+ion_populate_record(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    if (PG_ARGISNULL(1)) {
+        PG_RETURN_DATUM(populate_record_null_data(tupType, tupTypmod, base_rec));
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = ion_decode_to_json_text(data);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid Ion input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid Ion input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
+ * bson_populate_record - Decode a BSON document into a typed composite,
+ * falling back to base's columns for keys the document omits.
+ */
+extern "C" Datum
+bson_populate_record(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    if (PG_ARGISNULL(1)) {
+        PG_RETURN_DATUM(populate_record_null_data(tupType, tupTypmod, base_rec));
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = bson_decode_to_json_text(data);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BSON input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BSON input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
  * zera_populate_record - Decode a ZERA document into a typed composite,
  * falling back to base's columns for keys the document omits.
  */
@@ -6263,6 +6583,51 @@ cbor_populate_recordset(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
                  errmsg("invalid CBOR input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    return (Datum) 0;
+}
+
+/*
+ * ion_populate_recordset - Decode an Ion array of documents into a set of
+ * typed composites, using base for columns each document omits.
+ *
+ * No bson_populate_recordset: it would require decoding a bare-array-root
+ * BSON document, which bson_decode_to_json_text cannot distinguish from a
+ * document (see BSON.md and the forward-declaration comment above).
+ */
+extern "C" Datum
+ion_populate_recordset(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    Tuplestorestate* tupstore = populate_recordset_begin(fcinfo, tupType, tupTypmod);
+
+    if (PG_ARGISNULL(1)) {
+        return (Datum) 0;
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = ion_decode_to_json_text(data);
+        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid Ion input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid Ion input"),
                  errdetail("unknown decoding error")));
     }
 
@@ -6575,6 +6940,215 @@ cbor_object_agg_final(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Ion builder API - mirrors the msgpack_* builder family above.
+ */
+
+/*
+ * ion_from_jsonb - Convert nested jsonb to nested Ion.
+ */
+extern "C" Datum
+ion_from_jsonb(PG_FUNCTION_ARGS)
+{
+    Jsonb* jb = PG_GETARG_JSONB_P(0);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_ion_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * ion_build_object - Build an Ion struct from variadic key/value args.
+ * Mirrors json_build_object semantics at SQL layer.
+ */
+extern "C" Datum
+ion_build_object(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    if ((nargs % 2) != 0) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("ion_build_object requires an even number of arguments")));
+    }
+
+    z::dyn::Value::Map entries;
+    entries.reserve(static_cast<size_t>(nargs / 2));
+
+    for (int i = 0; i < nargs; i += 2) {
+        if (PG_ARGISNULL(i)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("ion_build_object key must not be null")));
+        }
+
+        Oid key_typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(key_typid)) {
+            key_typid = TEXTOID;
+        }
+        std::string key = datum_to_string_output(PG_GETARG_DATUM(i), key_typid);
+
+        Oid val_typid = get_fn_expr_argtype(fcinfo->flinfo, i + 1);
+        if (!OidIsValid(val_typid)) {
+            val_typid = TEXTOID;
+        }
+        Datum val = (i + 1 < nargs && !PG_ARGISNULL(i + 1)) ? PG_GETARG_DATUM(i + 1) : (Datum) 0;
+        entries.emplace_back(std::move(key), datum_to_dynamic(val, val_typid, PG_ARGISNULL(i + 1)));
+    }
+
+    bytea* result = dynamic_to_ion_binary(z::dyn::Value::map(std::move(entries)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * ion_build_array - Build an Ion list from variadic arguments.
+ * Mirrors json_build_array semantics at SQL layer.
+ */
+extern "C" Datum
+ion_build_array(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    z::dyn::Value::Array arr;
+    arr.reserve(static_cast<size_t>(nargs));
+
+    for (int i = 0; i < nargs; i++) {
+        Oid typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(typid)) {
+            typid = TEXTOID;
+        }
+        Datum val = (!PG_ARGISNULL(i)) ? PG_GETARG_DATUM(i) : (Datum) 0;
+        arr.push_back(datum_to_dynamic(val, typid, PG_ARGISNULL(i)));
+    }
+
+    bytea* result = dynamic_to_ion_binary(z::dyn::Value::array(std::move(arr)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * ion_agg_final - Finalize jsonb_agg state and convert to Ion.
+ */
+extern "C" Datum
+ion_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_ion_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * ion_object_agg_final - Finalize jsonb_object_agg state and convert.
+ */
+extern "C" Datum
+ion_object_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_object_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_ion_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * BSON builder API - a reduced subset of the msgpack_* builder family
+ * above. No bson_build_array and no bson_agg: both would only ever produce
+ * a bare-array-root BSON document, which cannot be told apart from a
+ * document on read (see BSON.md and the forward-declaration comment
+ * above). bson_object_agg is unaffected -- jsonb_object_agg_finalfn always
+ * produces a JSON object, so its BSON encoding is always map-rooted.
+ */
+
+/*
+ * bson_from_jsonb - Convert nested jsonb to a BSON document.
+ *
+ * A jsonb array or scalar argument will still encode (zerialize's BSON
+ * writer accepts any z::dyn::Value), but decoding the result back via
+ * bson_to_jsonb will not reproduce an array (see above), and a bare scalar
+ * has no BSON encoding at all -- the writer throws, surfaced here as a
+ * normal serialization-failure ERROR via dynamic_to_binary<z::Bson>'s own
+ * try/catch.
+ */
+extern "C" Datum
+bson_from_jsonb(PG_FUNCTION_ARGS)
+{
+    Jsonb* jb = PG_GETARG_JSONB_P(0);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_bson_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * bson_build_object - Build a BSON document from variadic key/value args.
+ * Mirrors json_build_object semantics at SQL layer.
+ */
+extern "C" Datum
+bson_build_object(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    if ((nargs % 2) != 0) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("bson_build_object requires an even number of arguments")));
+    }
+
+    z::dyn::Value::Map entries;
+    entries.reserve(static_cast<size_t>(nargs / 2));
+
+    for (int i = 0; i < nargs; i += 2) {
+        if (PG_ARGISNULL(i)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("bson_build_object key must not be null")));
+        }
+
+        Oid key_typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(key_typid)) {
+            key_typid = TEXTOID;
+        }
+        std::string key = datum_to_string_output(PG_GETARG_DATUM(i), key_typid);
+
+        Oid val_typid = get_fn_expr_argtype(fcinfo->flinfo, i + 1);
+        if (!OidIsValid(val_typid)) {
+            val_typid = TEXTOID;
+        }
+        Datum val = (i + 1 < nargs && !PG_ARGISNULL(i + 1)) ? PG_GETARG_DATUM(i + 1) : (Datum) 0;
+        entries.emplace_back(std::move(key), datum_to_dynamic(val, val_typid, PG_ARGISNULL(i + 1)));
+    }
+
+    bytea* result = dynamic_to_bson_binary(z::dyn::Value::map(std::move(entries)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * bson_object_agg_final - Finalize jsonb_object_agg state and convert.
+ */
+extern "C" Datum
+bson_object_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_object_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_bson_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
  * ZERA builder API - mirrors the msgpack_* builder family above.
  */
 
@@ -6851,6 +7425,36 @@ row_to_zera(PG_FUNCTION_ARGS)
 }
 
 /*
+ * row_to_ion - Convert PostgreSQL record to Ion binary format
+ */
+extern "C" Datum
+row_to_ion(PG_FUNCTION_ARGS)
+{
+    HeapTupleHeader rec;
+    bytea* result;
+
+    rec = PG_GETARG_HEAPTUPLEHEADER(0);
+    result = tuple_to_binary<z::Ion>(rec);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * row_to_bson - Convert PostgreSQL record to a BSON document
+ */
+extern "C" Datum
+row_to_bson(PG_FUNCTION_ARGS)
+{
+    HeapTupleHeader rec;
+    bytea* result;
+
+    rec = PG_GETARG_HEAPTUPLEHEADER(0);
+    result = tuple_to_binary<z::Bson>(rec);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
  * Batch processing functions (multiple records at once)
  */
 
@@ -6937,6 +7541,29 @@ rows_to_zera(PG_FUNCTION_ARGS)
 
     // Convert to ZERA array
     result = array_to_binary<z::Zera>(arr);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * rows_to_ion - Convert array of PostgreSQL records to Ion binary format
+ *
+ * No rows_to_bson: array_to_binary<z::Bson> would produce a bare-array-root
+ * BSON document, which bson_decode_to_json_text (and so
+ * bson_populate_recordset) cannot read back as an array -- see BSON.md and
+ * the forward-declaration comment above.
+ */
+extern "C" Datum
+rows_to_ion(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr;
+    bytea* result;
+
+    // Get the array argument
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+
+    // Convert to Ion array
+    result = array_to_binary<z::Ion>(arr);
 
     PG_RETURN_BYTEA_P(result);
 }
