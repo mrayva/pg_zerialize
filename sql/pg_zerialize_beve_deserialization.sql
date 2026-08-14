@@ -1,0 +1,110 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+BEGIN;
+
+-- Mirrors pg_zerialize_ion_deserialization.sql for BEVE. Like Ion, BEVE
+-- goes through zerialize's own Deserializer/Reader interface
+-- (reader_value_to_json in pg_zerialize.cpp) rather than a hand-rolled
+-- wire-byte parser -- here wrapping glaze's zero-copy lazy BEVE reader
+-- (vendor/glaze). Also like Ion (but unlike msgpack/cbor/zera/flexbuffers/
+-- BSON), BEVE does NOT reject trailing bytes after a complete top-level
+-- document: glaze's lazy reader parses however much of the buffer the
+-- declared structure needs and simply doesn't look past it -- confirmed
+-- empirically (appending garbage after a valid document decodes the
+-- document fine, silently ignoring the extra bytes), not something
+-- zerialize's beve.hpp or this extension chooses. See beve_to_jsonb()'s
+-- comment in pg_zerialize.cpp.
+
+CREATE TYPE pg_temp.pgz_beve_leaf AS (
+    label text,
+    payload bytea
+);
+
+CREATE TYPE pg_temp.pgz_beve_holder AS (
+    id bigint,
+    active boolean,
+    score double precision,
+    special double precision,
+    title text,
+    matrix integer[],
+    child pg_temp.pgz_beve_leaf,
+    children pg_temp.pgz_beve_leaf[]
+);
+
+CREATE TEMP TABLE pgz_beve_values AS
+SELECT ROW(
+    9223372036854775807::bigint,
+    true,
+    1.25::double precision,
+    'Infinity'::double precision,
+    E'quoted " text \\ newline\n Ω',
+    ARRAY[[1, NULL], [3, 4]],
+    ROW('root', decode('00ff10', 'hex'))::pg_temp.pgz_beve_leaf,
+    ARRAY[
+        ROW('first', decode('deadbeef', 'hex'))::pg_temp.pgz_beve_leaf,
+        NULL::pg_temp.pgz_beve_leaf
+    ]
+)::pg_temp.pgz_beve_holder AS value;
+
+SELECT beve_to_jsonb(row_to_beve(value)) =
+       '{
+          "id":9223372036854775807,
+          "active":true,
+          "score":1.25,
+          "special":"Infinity",
+          "title":"quoted \" text \\ newline\n Ω",
+          "matrix":[[1,null],[3,4]],
+          "child":{"label":"root","payload":["~b","AP8Q","base64"]},
+          "children":[
+            {"label":"first","payload":["~b","3q2+7w==","base64"]},
+            null
+          ]
+        }'::jsonb AS nested_row_semantics
+FROM pgz_beve_values;
+
+SELECT beve_to_jsonb(rows_to_beve(
+           ARRAY[value, NULL::pg_temp.pgz_beve_holder]
+       )) =
+       jsonb_build_array(beve_to_jsonb(row_to_beve(value)), NULL)
+       AS batch_semantics
+FROM pgz_beve_values;
+
+-- NaN/negative-infinity tagging (positive Infinity already covered above).
+SELECT beve_to_jsonb(beve_from_jsonb('"NaN"'::jsonb)) = '"NaN"'::jsonb AS nan_roundtrips_as_tag,
+       beve_to_jsonb(beve_from_jsonb(to_jsonb('-Infinity'::double precision))) = '"-Infinity"'::jsonb
+           AS neg_infinity_tag;
+
+-- Bare-array-root and scalar-root both work at the top level -- BEVE has
+-- explicit type tags everywhere, so there's no BSON-style root ambiguity.
+SELECT beve_to_jsonb(beve_from_jsonb(jsonb_build_array(10, 20, 30))) =
+       jsonb_build_array(10, 20, 30) AS bare_array_root_roundtrips;
+SELECT beve_to_jsonb(beve_from_jsonb('42'::jsonb)) = '42'::jsonb AS bare_scalar_root_roundtrips;
+
+SELECT beve_to_jsonb(NULL::bytea) IS NULL AS strict_null;
+
+CREATE FUNCTION pg_temp.pgz_beve_is_invalid(value bytea)
+RETURNS boolean
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM beve_to_jsonb(value);
+    RETURN false;
+EXCEPTION
+    WHEN invalid_binary_representation THEN RETURN true;
+END
+$$;
+
+SELECT encode(beve_from_jsonb('{"a":1}'::jsonb), 'hex') AS beve_a1_hex \gset
+
+SELECT pg_temp.pgz_beve_is_invalid(decode('', 'hex')) AS empty_rejected,
+       pg_temp.pgz_beve_is_invalid(
+           decode(substring(:'beve_a1_hex' from 1 for length(:'beve_a1_hex') - 2), 'hex')
+       ) AS truncated_rejected;
+
+-- Trailing bytes are NOT rejected (see the file header comment) -- pin
+-- that contract down explicitly rather than leaving it untested.
+SELECT beve_to_jsonb(decode(:'beve_a1_hex' || 'ff', 'hex')) = '{"a":1}'::jsonb
+       AS trailing_byte_silently_ignored;
+
+ROLLBACK;
+DROP EXTENSION pg_zerialize;

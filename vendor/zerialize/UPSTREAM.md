@@ -14,9 +14,10 @@ files upstream, so the patches below (all against `cbor.hpp`/`msgpack.hpp`/
 `zera.hpp`/`flex.hpp`/`zbuffer.hpp`) needed no rework: `git diff 32d9d944
 13f6383 --stat` in the fork shows zero changes to any of those five files
 between the two pins. `include/zerialize/protocols/beve.hpp` was
-deliberately NOT vendored in this bump — it requires a C++23 compiler
-(this extension targets C++20) and pulls in glaze, a separate, larger
-change to take on its own.
+deliberately NOT vendored in that bump — it requires a C++23 compiler
+(this extension targeted C++20 at the time) and pulls in glaze, a separate,
+larger change taken on its own afterward: see the `beve.hpp`/glaze entry
+below and `vendor/glaze/UPSTREAM.md`.
 
 The fork carries these bug fixes on top of upstream commit `aedaaf2` (the
 commit this vendor tree previously tracked):
@@ -59,6 +60,14 @@ commit this vendor tree previously tracked):
   `jsoncons::bson::bson_bytes_encoder`, so `libjsoncons-dev` is now a build
   dependency of this extension (see `.github/workflows/ci.yml` and
   `README.md`'s Requirements section).
+- `include/zerialize/protocols/beve.hpp`: vendored verbatim, unmodified,
+  from the fork (2026-08-14). Wraps glaze's zero-copy `lazy_beve_document`/
+  `lazy_beve_view` for the reader; the writer is zerialize's own hand-rolled
+  code, no glaze dependency there. Requires `-std=c++23` (this extension's
+  `PG_CPPFLAGS` was bumped from `-std=c++20`) and glaze v8.0.0, vendored
+  under `vendor/glaze/` — see `vendor/glaze/UPSTREAM.md` for why that's
+  vendored from source rather than via apt, and why only a pruned subset of
+  glaze is included.
 
 When updating, compare the fork against this directory and reapply these
 changes deliberately. Do not replace the vendored tree wholesale.

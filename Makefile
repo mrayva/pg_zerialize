@@ -7,16 +7,22 @@ EXTENSION = pg_zerialize
 DATA = pg_zerialize--1.0.sql pg_zerialize--1.1.sql pg_zerialize--1.2.sql \
 	pg_zerialize--1.3.sql pg_zerialize--1.4.sql pg_zerialize--1.5.sql \
 	pg_zerialize--1.6.sql pg_zerialize--1.7.sql pg_zerialize--1.8.sql \
-	pg_zerialize--1.9.sql pg_zerialize--1.10.sql \
+	pg_zerialize--1.9.sql pg_zerialize--1.10.sql pg_zerialize--1.11.sql \
 	pg_zerialize--1.0--1.1.sql pg_zerialize--1.1--1.2.sql \
 	pg_zerialize--1.2--1.3.sql pg_zerialize--1.3--1.4.sql \
 	pg_zerialize--1.4--1.5.sql pg_zerialize--1.5--1.6.sql \
 	pg_zerialize--1.6--1.7.sql pg_zerialize--1.7--1.8.sql \
-	pg_zerialize--1.8--1.9.sql pg_zerialize--1.9--1.10.sql
-REGRESS = pg_zerialize pg_zerialize_core pg_zerialize_parity pg_zerialize_cache pg_zerialize_deterministic pg_zerialize_builders pg_zerialize_builders_semantics pg_zerialize_cbor_builders pg_zerialize_zera_builders pg_zerialize_flex_builders pg_zerialize_ion_builders pg_zerialize_bson_builders pg_zerialize_semantics_exhaustive pg_zerialize_nested_composites pg_zerialize_multidimensional_arrays pg_zerialize_array_no_nulls pg_zerialize_numeric_policy pg_zerialize_deserialization pg_zerialize_flex_deserialization pg_zerialize_cbor_deserialization pg_zerialize_zera_deserialization pg_zerialize_ion_deserialization pg_zerialize_bson_deserialization pg_zerialize_populate_record pg_zerialize_populate_recordset pg_zerialize_upgrade
+	pg_zerialize--1.8--1.9.sql pg_zerialize--1.9--1.10.sql \
+	pg_zerialize--1.10--1.11.sql
+REGRESS = pg_zerialize pg_zerialize_core pg_zerialize_parity pg_zerialize_cache pg_zerialize_deterministic pg_zerialize_builders pg_zerialize_builders_semantics pg_zerialize_cbor_builders pg_zerialize_zera_builders pg_zerialize_flex_builders pg_zerialize_ion_builders pg_zerialize_bson_builders pg_zerialize_beve_builders pg_zerialize_semantics_exhaustive pg_zerialize_nested_composites pg_zerialize_multidimensional_arrays pg_zerialize_array_no_nulls pg_zerialize_numeric_policy pg_zerialize_deserialization pg_zerialize_flex_deserialization pg_zerialize_cbor_deserialization pg_zerialize_zera_deserialization pg_zerialize_ion_deserialization pg_zerialize_bson_deserialization pg_zerialize_beve_deserialization pg_zerialize_populate_record pg_zerialize_populate_recordset pg_zerialize_upgrade
 
 # C++ compilation flags
-PG_CPPFLAGS = -std=c++20 -fPIC -Ivendor/zerialize/include
+#
+# -std=c++23 (bumped from c++20): required by beve.hpp, which uses glaze's
+# zero-copy lazy BEVE reader (vendor/glaze; see vendor/glaze/UPSTREAM.md and
+# vendor/zerialize/UPSTREAM.md for why glaze can't come from apt). Verified
+# the rest of this file compiles unchanged under c++23 before bumping.
+PG_CPPFLAGS = -std=c++23 -fPIC -Ivendor/zerialize/include -Ivendor/glaze/include
 SHLIB_LINK = -lstdc++ -lflatbuffers
 
 # Use C++ compiler
@@ -35,7 +41,7 @@ override CFLAGS :=
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
-pg_zerialize.o pg_zerialize.bc: vendor/zerialize/include/zerialize/protocols/msgpack.hpp vendor/zerialize/include/zerialize/protocols/ion.hpp vendor/zerialize/include/zerialize/protocols/bson.hpp
+pg_zerialize.o pg_zerialize.bc: vendor/zerialize/include/zerialize/protocols/msgpack.hpp vendor/zerialize/include/zerialize/protocols/ion.hpp vendor/zerialize/include/zerialize/protocols/bson.hpp vendor/zerialize/include/zerialize/protocols/beve.hpp
 
 .PHONY: bench bench-quick bench-isolated bench-isolated-quick bench-numeric-float semantic-check
 

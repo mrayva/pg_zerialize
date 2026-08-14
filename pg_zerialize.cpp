@@ -42,6 +42,15 @@ Datum jsonb_agg_finalfn(PG_FUNCTION_ARGS);
 Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 }
 
+// utils/datetime.h (pulled in above) #defines INVALID "invalid" as a bare
+// text macro; glaze/forward.hpp (via beve.hpp, included below) declares an
+// unrelated `inline constexpr std::uint32_t INVALID = 0` at namespace
+// scope, and the macro clobbers that declaration into a syntax error. This
+// file never uses PostgreSQL's INVALID macro itself, so it's safe to drop
+// once its only legitimate use (parsing PG_MODULE_MAGIC/date-time internals
+// above) is done.
+#undef INVALID
+
 #include <vector>
 #include <string>
 #include <string_view>
@@ -65,6 +74,7 @@ Datum jsonb_object_agg_finalfn(PG_FUNCTION_ARGS);
 #include <zerialize/protocols/zera.hpp>
 #include <zerialize/protocols/ion.hpp>
 #include <zerialize/protocols/bson.hpp>
+#include <zerialize/protocols/beve.hpp>
 #include <zerialize/dynamic.hpp>
 #include <zerialize/internals/base64.hpp>
 
@@ -165,6 +175,20 @@ extern "C" {
     Datum bson_build_object(PG_FUNCTION_ARGS);
     Datum bson_object_agg_final(PG_FUNCTION_ARGS);
 
+    // BEVE: full parity with msgpack/cbor/zera/flexbuffers/Ion -- unlike
+    // BSON, BEVE has explicit type tags at every position including the
+    // root, so there's no bare-array-root ambiguity to work around.
+    Datum row_to_beve(PG_FUNCTION_ARGS);
+    Datum beve_from_jsonb(PG_FUNCTION_ARGS);
+    Datum beve_to_jsonb(PG_FUNCTION_ARGS);
+    Datum beve_populate_record(PG_FUNCTION_ARGS);
+    Datum beve_populate_recordset(PG_FUNCTION_ARGS);
+    Datum beve_build_object(PG_FUNCTION_ARGS);
+    Datum beve_build_array(PG_FUNCTION_ARGS);
+    Datum beve_agg_final(PG_FUNCTION_ARGS);
+    Datum beve_object_agg_final(PG_FUNCTION_ARGS);
+    Datum rows_to_beve(PG_FUNCTION_ARGS);
+
     // Batch processing functions
     Datum rows_to_flexbuffers(PG_FUNCTION_ARGS);
     Datum rows_to_msgpack(PG_FUNCTION_ARGS);
@@ -227,6 +251,17 @@ extern "C" {
     PG_FUNCTION_INFO_V1(bson_populate_record);
     PG_FUNCTION_INFO_V1(bson_build_object);
     PG_FUNCTION_INFO_V1(bson_object_agg_final);
+
+    PG_FUNCTION_INFO_V1(row_to_beve);
+    PG_FUNCTION_INFO_V1(beve_from_jsonb);
+    PG_FUNCTION_INFO_V1(beve_to_jsonb);
+    PG_FUNCTION_INFO_V1(beve_populate_record);
+    PG_FUNCTION_INFO_V1(beve_populate_recordset);
+    PG_FUNCTION_INFO_V1(beve_build_object);
+    PG_FUNCTION_INFO_V1(beve_build_array);
+    PG_FUNCTION_INFO_V1(beve_agg_final);
+    PG_FUNCTION_INFO_V1(beve_object_agg_final);
+    PG_FUNCTION_INFO_V1(rows_to_beve);
 
     PG_FUNCTION_INFO_V1(rows_to_flexbuffers);
     PG_FUNCTION_INFO_V1(rows_to_msgpack);
@@ -5285,6 +5320,11 @@ static inline bytea* dynamic_to_bson_binary(const z::dyn::Value& v)
     return dynamic_to_binary<z::Bson>(v);
 }
 
+static inline bytea* dynamic_to_beve_binary(const z::dyn::Value& v)
+{
+    return dynamic_to_binary<z::Beve>(v);
+}
+
 /*
  * Generic helper function to convert array of PostgreSQL tuples to binary format
  * This is the batch processing version for improved performance
@@ -5896,6 +5936,61 @@ bson_to_jsonb(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Shared decode core for beve_to_jsonb/beve_populate_record(set).
+ *
+ * Unlike msgpack/cbor/zera/flexbuffers/BSON, this does NOT reject trailing
+ * bytes after a complete top-level document (confirmed empirically: bytes
+ * appended after a valid document are silently ignored, decoding the
+ * document fine). glaze's lazy BEVE reader parses however much of the
+ * buffer the declared structure needs and never checks that the buffer
+ * ends there -- zerialize's beve.hpp wraps that reader as-is, and this
+ * extension doesn't add a check on top of it. Same class of behavior as
+ * Ion's multi-value-stream semantics, though the underlying reason differs
+ * (Ion's is deliberate stream semantics; BEVE's is simply that nothing in
+ * the reader looks at what's left in the buffer).
+ */
+static std::string beve_decode_to_json_text(std::span<const uint8_t> data)
+{
+    z::Beve::Deserializer reader(data);
+    std::string json;
+    json.reserve(data.size() + 32);
+    reader_value_to_json(reader, json);
+    return json;
+}
+
+/*
+ * beve_to_jsonb - Decode one BEVE document to jsonb.
+ */
+extern "C" Datum
+beve_to_jsonb(PG_FUNCTION_ARGS)
+{
+    bytea* input = PG_GETARG_BYTEA_PP(0);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = beve_decode_to_json_text(data);
+        PG_FREE_IF_COPY(input, 0);
+
+        Datum result = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        PG_RETURN_DATUM(result);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BEVE input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BEVE input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
  * Shared decode-to-composite core for X_populate_record. Reuses each
  * protocol's own X_decode_to_json_text() (already validated/tested via
  * X_to_jsonb) to get a Jsonb*, then walks that Jsonb tree directly into a
@@ -6368,6 +6463,47 @@ bson_populate_record(PG_FUNCTION_ARGS)
 }
 
 /*
+ * beve_populate_record - Decode a BEVE document into a typed composite,
+ * falling back to base's columns for keys the document omits.
+ */
+extern "C" Datum
+beve_populate_record(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    if (PG_ARGISNULL(1)) {
+        PG_RETURN_DATUM(populate_record_null_data(tupType, tupTypmod, base_rec));
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = beve_decode_to_json_text(data);
+        Datum jsonb_datum = DirectFunctionCall1(jsonb_in, CStringGetDatum(json.c_str()));
+        Jsonb* jb = DatumGetJsonbP(jsonb_datum);
+        PG_RETURN_DATUM(populate_composite_from_jsonb_container(&jb->root, tupType, tupTypmod, base_rec));
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BEVE input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BEVE input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    PG_RETURN_NULL();
+}
+
+/*
  * zera_populate_record - Decode a ZERA document into a typed composite,
  * falling back to base's columns for keys the document omits.
  */
@@ -6628,6 +6764,47 @@ ion_populate_recordset(PG_FUNCTION_ARGS)
         ereport(ERROR,
                 (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
                  errmsg("invalid Ion input"),
+                 errdetail("unknown decoding error")));
+    }
+
+    return (Datum) 0;
+}
+
+/*
+ * beve_populate_recordset - Decode a BEVE array of documents into a set of
+ * typed composites, using base for columns each document omits.
+ */
+extern "C" Datum
+beve_populate_recordset(PG_FUNCTION_ARGS)
+{
+    Oid tupType;
+    int32 tupTypmod;
+    HeapTupleHeader base_rec;
+    populate_record_resolve_target(fcinfo, &tupType, &tupTypmod, &base_rec);
+
+    Tuplestorestate* tupstore = populate_recordset_begin(fcinfo, tupType, tupTypmod);
+
+    if (PG_ARGISNULL(1)) {
+        return (Datum) 0;
+    }
+
+    bytea* input = PG_GETARG_BYTEA_PP(1);
+    const auto* bytes = reinterpret_cast<const uint8_t*>(VARDATA_ANY(input));
+    const size_t length = static_cast<size_t>(VARSIZE_ANY_EXHDR(input));
+    std::span<const uint8_t> data(bytes, length);
+
+    try {
+        std::string json = beve_decode_to_json_text(data);
+        populate_recordset_from_json_text(tupstore, tupType, tupTypmod, base_rec, json);
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BEVE input"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+                 errmsg("invalid BEVE input"),
                  errdetail("unknown decoding error")));
     }
 
@@ -7149,6 +7326,126 @@ bson_object_agg_final(PG_FUNCTION_ARGS)
 }
 
 /*
+ * BEVE builder API - mirrors the msgpack_* builder family above.
+ */
+
+/*
+ * beve_from_jsonb - Convert nested jsonb to nested BEVE.
+ */
+extern "C" Datum
+beve_from_jsonb(PG_FUNCTION_ARGS)
+{
+    Jsonb* jb = PG_GETARG_JSONB_P(0);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_beve_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * beve_build_object - Build a BEVE object from variadic key/value args.
+ * Mirrors json_build_object semantics at SQL layer.
+ */
+extern "C" Datum
+beve_build_object(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    if ((nargs % 2) != 0) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("beve_build_object requires an even number of arguments")));
+    }
+
+    z::dyn::Value::Map entries;
+    entries.reserve(static_cast<size_t>(nargs / 2));
+
+    for (int i = 0; i < nargs; i += 2) {
+        if (PG_ARGISNULL(i)) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmsg("beve_build_object key must not be null")));
+        }
+
+        Oid key_typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(key_typid)) {
+            key_typid = TEXTOID;
+        }
+        std::string key = datum_to_string_output(PG_GETARG_DATUM(i), key_typid);
+
+        Oid val_typid = get_fn_expr_argtype(fcinfo->flinfo, i + 1);
+        if (!OidIsValid(val_typid)) {
+            val_typid = TEXTOID;
+        }
+        Datum val = (i + 1 < nargs && !PG_ARGISNULL(i + 1)) ? PG_GETARG_DATUM(i + 1) : (Datum) 0;
+        entries.emplace_back(std::move(key), datum_to_dynamic(val, val_typid, PG_ARGISNULL(i + 1)));
+    }
+
+    bytea* result = dynamic_to_beve_binary(z::dyn::Value::map(std::move(entries)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * beve_build_array - Build a BEVE array from variadic arguments.
+ * Mirrors json_build_array semantics at SQL layer.
+ */
+extern "C" Datum
+beve_build_array(PG_FUNCTION_ARGS)
+{
+    const int nargs = PG_NARGS();
+    z::dyn::Value::Array arr;
+    arr.reserve(static_cast<size_t>(nargs));
+
+    for (int i = 0; i < nargs; i++) {
+        Oid typid = get_fn_expr_argtype(fcinfo->flinfo, i);
+        if (!OidIsValid(typid)) {
+            typid = TEXTOID;
+        }
+        Datum val = (!PG_ARGISNULL(i)) ? PG_GETARG_DATUM(i) : (Datum) 0;
+        arr.push_back(datum_to_dynamic(val, typid, PG_ARGISNULL(i)));
+    }
+
+    bytea* result = dynamic_to_beve_binary(z::dyn::Value::array(std::move(arr)));
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * beve_agg_final - Finalize jsonb_agg state and convert to BEVE.
+ */
+extern "C" Datum
+beve_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_beve_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * beve_object_agg_final - Finalize jsonb_object_agg state and convert.
+ */
+extern "C" Datum
+beve_object_agg_final(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        PG_RETURN_NULL();
+    }
+    Datum agg = DirectFunctionCall1(jsonb_object_agg_finalfn, PG_GETARG_DATUM(0));
+    if (DatumGetPointer(agg) == nullptr) {
+        PG_RETURN_NULL();
+    }
+    Jsonb* jb = DatumGetJsonbP(agg);
+    z::dyn::Value v = jsonb_to_dynamic(jb);
+    bytea* result = dynamic_to_beve_binary(v);
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
  * ZERA builder API - mirrors the msgpack_* builder family above.
  */
 
@@ -7455,6 +7752,21 @@ row_to_bson(PG_FUNCTION_ARGS)
 }
 
 /*
+ * row_to_beve - Convert PostgreSQL record to BEVE binary format
+ */
+extern "C" Datum
+row_to_beve(PG_FUNCTION_ARGS)
+{
+    HeapTupleHeader rec;
+    bytea* result;
+
+    rec = PG_GETARG_HEAPTUPLEHEADER(0);
+    result = tuple_to_binary<z::Beve>(rec);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
  * Batch processing functions (multiple records at once)
  */
 
@@ -7564,6 +7876,24 @@ rows_to_ion(PG_FUNCTION_ARGS)
 
     // Convert to Ion array
     result = array_to_binary<z::Ion>(arr);
+
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * rows_to_beve - Convert array of PostgreSQL records to BEVE binary format
+ */
+extern "C" Datum
+rows_to_beve(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr;
+    bytea* result;
+
+    // Get the array argument
+    arr = PG_GETARG_ARRAYTYPE_P(0);
+
+    // Convert to BEVE array
+    result = array_to_binary<z::Beve>(arr);
 
     PG_RETURN_BYTEA_P(result);
 }

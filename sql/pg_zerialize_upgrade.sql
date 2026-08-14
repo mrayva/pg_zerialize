@@ -102,4 +102,13 @@ SELECT ion_to_jsonb(ion_from_jsonb('{"upgrade":true}'::jsonb)) =
 SELECT bson_to_jsonb(bson_from_jsonb('{"upgrade":true}'::jsonb)) =
        '{"upgrade":true}'::jsonb AS bson_builder_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.11';
+SELECT extversion = '1.11' AS upgraded_to_1_11
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('beve_to_jsonb(bytea)') IS NOT NULL AS beve_decoder_present,
+       to_regprocedure('beve_populate_recordset(anyelement,bytea)') IS NOT NULL AS beve_populate_recordset_present;
+SELECT beve_to_jsonb(beve_from_jsonb('{"upgrade":true}'::jsonb)) =
+       '{"upgrade":true}'::jsonb AS beve_builder_works;
+
 DROP EXTENSION pg_zerialize;

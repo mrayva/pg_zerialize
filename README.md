@@ -1,14 +1,14 @@
 # pg_zerialize
 
 PostgreSQL extension for serializing rows and batches of rows to MessagePack,
-CBOR, ZERA, FlexBuffers, Ion, and BSON. Each protocol also includes SQL
+CBOR, ZERA, FlexBuffers, Ion, BSON, and BEVE. Each protocol also includes SQL
 builders and aggregates for constructing nested binary values from scratch
 (BSON's builder API is a reduced subset -- see Current Limitations).
 
 ## Support
 
 - PostgreSQL 16, 17, and 18
-- C++20 compiler
+- C++23 compiler
 - Linux/PGXS build environment
 
 CI builds and tests every supported PostgreSQL major version. Local development
@@ -17,16 +17,19 @@ and performance work use PostgreSQL 18.
 ## Requirements
 
 - PostgreSQL server development package (`postgresql-server-dev-<major>`)
-- C++20 compiler (GCC 10+ or Clang 10+)
+- C++23 compiler (GCC 13+ or Clang 18+ -- glaze's own minimum for BEVE; the
+  rest of this extension only needs C++20)
 - FlatBuffers development package (`libflatbuffers-dev`)
 - fast_float development package (`libfast-float-dev`)
 - MessagePack C development package (`libmsgpack-dev`)
 - jsoncons development package (`libjsoncons-dev`) -- used by BSON's writer
 - Python `msgpack` package for independent MessagePack semantic tests
 
-The zerialize headers are vendored under `vendor/`. See
+The zerialize headers are vendored under `vendor/zerialize/`. See
 [`vendor/zerialize/UPSTREAM.md`](vendor/zerialize/UPSTREAM.md) for provenance
-and local changes.
+and local changes. BEVE additionally needs glaze (for its zero-copy reader),
+vendored as a pruned subset under `vendor/glaze/` rather than via apt -- see
+[`vendor/glaze/UPSTREAM.md`](vendor/glaze/UPSTREAM.md) for why.
 
 ## Build And Test
 
@@ -200,14 +203,17 @@ arrays of any directly-writable element type, recursing through the same
 cached writer plans at every level; schemas with a descendant column that has
 no direct writer (recursively) fall back to the generic dynamic tree.
 
-Ion and BSON don't have a direct writer yet -- every `row_to_ion`/
-`row_to_bson`/`rows_to_ion` call goes through the same generic dynamic-tree
-path those other four fall back to. Their `X_to_jsonb`/`X_populate_record(set)`
-read side is likewise generic: rather than a hand-rolled wire-byte parser per
-format (what MessagePack/CBOR/ZERA/FlexBuffers each have), they decode
-through zerialize's own `Reader`/`Deserializer` interface via one shared
-walker. Both are correct and fully tested, just not yet performance-tuned to
-the same degree as the original four.
+Ion, BSON, and BEVE don't have a direct writer yet -- every `row_to_ion`/
+`row_to_bson`/`row_to_beve`/`rows_to_ion`/`rows_to_beve` call goes through
+the same generic dynamic-tree path those other four fall back to. Their
+`X_to_jsonb`/`X_populate_record(set)` read side is likewise generic: rather
+than a hand-rolled wire-byte parser per format (what MessagePack/CBOR/ZERA/
+FlexBuffers each have), they decode through zerialize's own
+`Reader`/`Deserializer` interface via one shared walker -- for BEVE, that
+walker sits on top of glaze's zero-copy lazy BEVE reader (`vendor/glaze`)
+rather than a zerialize-native parser. All three are correct and fully
+tested, just not yet performance-tuned to the same degree as the original
+four.
 
 The following test helpers force MessagePack's generic path for byte-parity
 checks:
@@ -230,8 +236,8 @@ result format. Benchmark output under `results/` is intentionally untracked.
 
 - Deserialization targets JSONB (`X_to_jsonb`) and typed composites, single
   (`X_populate_record`) or batch (`X_populate_recordset`), for MessagePack,
-  CBOR, ZERA, FlexBuffers, and Ion. BSON has `X_to_jsonb`/`X_populate_record`
-  but not `X_populate_recordset` -- see below.
+  CBOR, ZERA, FlexBuffers, Ion, and BEVE. BSON has `X_to_jsonb`/
+  `X_populate_record` but not `X_populate_recordset` -- see below.
 - Exact decimals use an opt-in tagged-array convention rather than a native
   protocol scalar, so non-pg_zerialize consumers must interpret that tag.
 - JSON text is not recursively parsed; use JSONB builders when nested JSON
@@ -249,11 +255,18 @@ result format. Benchmark output under `results/` is intentionally untracked.
   `bson_build_object`/`bson_object_agg`/`row_to_bson`/`bson_populate_record`
   instead. See [`vendor/zerialize/include/zerialize/protocols/BSON.md`](vendor/zerialize/include/zerialize/protocols/BSON.md).
 - **Ion decodes only the first top-level value in a stream.** Unlike the
-  other five protocols here (one value per `bytea`, trailing bytes rejected
-  as corruption), Ion's own wire format legitimately allows multiple
-  top-level values back to back; `ion_to_jsonb`/`ion_populate_record(set)`
-  take the first one and don't treat what follows as an error, matching
-  standard Ion reader semantics.
+  other protocols here (one value per `bytea`, trailing bytes rejected as
+  corruption), Ion's own wire format legitimately allows multiple top-level
+  values back to back; `ion_to_jsonb`/`ion_populate_record(set)` take the
+  first one and don't treat what follows as an error, matching standard Ion
+  reader semantics.
+- **BEVE does not reject trailing bytes after a complete document.**
+  glaze's lazy BEVE reader (`vendor/glaze`) parses however much of the
+  buffer the declared structure needs and never checks that the buffer ends
+  there; zerialize's `beve.hpp` wraps that reader as-is. Confirmed
+  empirically, not a deliberate stream-semantics choice the way Ion's is --
+  `beve_to_jsonb`/`beve_populate_record(set)` simply decode the leading
+  document and silently ignore anything appended after it.
 
 ## Maintained Documentation
 

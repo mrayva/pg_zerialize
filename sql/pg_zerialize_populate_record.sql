@@ -77,7 +77,9 @@ SELECT (msgpack_to_jsonb(row_to_msgpack(msgpack_populate_record(NULL::pg_temp.pr
        (msgpack_to_jsonb(row_to_msgpack(ion_populate_record(NULL::pg_temp.pr_wide, row_to_ion(value)))) =
         msgpack_to_jsonb(row_to_msgpack(value))) AS ion_roundtrip,
        (msgpack_to_jsonb(row_to_msgpack(bson_populate_record(NULL::pg_temp.pr_wide, row_to_bson(value)))) =
-        msgpack_to_jsonb(row_to_msgpack(value))) AS bson_roundtrip
+        msgpack_to_jsonb(row_to_msgpack(value))) AS bson_roundtrip,
+       (msgpack_to_jsonb(row_to_msgpack(beve_populate_record(NULL::pg_temp.pr_wide, row_to_beve(value)))) =
+        msgpack_to_jsonb(row_to_msgpack(value))) AS beve_roundtrip
 FROM pr_values;
 
 -- base = NULL, data supplied via a plain JSON bridge (msgpack_from_jsonb),
@@ -182,7 +184,8 @@ SELECT (msgpack_populate_record(NULL::pg_temp.pr_binary, row_to_msgpack(value)) 
        (zera_populate_record(NULL::pg_temp.pr_binary, row_to_zera(value)) = value) AS zera_binary_ok,
        (flexbuffers_populate_record(NULL::pg_temp.pr_binary, row_to_flexbuffers(value)) = value) AS flex_binary_ok,
        (ion_populate_record(NULL::pg_temp.pr_binary, row_to_ion(value)) = value) AS ion_binary_ok,
-       (bson_populate_record(NULL::pg_temp.pr_binary, row_to_bson(value)) = value) AS bson_binary_ok
+       (bson_populate_record(NULL::pg_temp.pr_binary, row_to_bson(value)) = value) AS bson_binary_ok,
+       (beve_populate_record(NULL::pg_temp.pr_binary, row_to_beve(value)) = value) AS beve_binary_ok
 FROM pr_binary_values;
 
 -- A malformed document (wrong shape for a scalar column) is rejected cleanly.

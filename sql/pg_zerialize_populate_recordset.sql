@@ -29,7 +29,9 @@ SELECT (SELECT array_agg(r) FROM msgpack_populate_recordset(NULL::pg_temp.prs_ro
        (SELECT array_agg(r) FROM flexbuffers_populate_recordset(NULL::pg_temp.prs_row, rows_to_flexbuffers(rows)) r) = rows
        AS flex_roundtrip,
        (SELECT array_agg(r) FROM ion_populate_recordset(NULL::pg_temp.prs_row, rows_to_ion(rows)) r) = rows
-       AS ion_roundtrip
+       AS ion_roundtrip,
+       (SELECT array_agg(r) FROM beve_populate_recordset(NULL::pg_temp.prs_row, rows_to_beve(rows)) r) = rows
+       AS beve_roundtrip
 FROM prs_values;
 
 -- Row count and field access work through a normal FROM clause too.
