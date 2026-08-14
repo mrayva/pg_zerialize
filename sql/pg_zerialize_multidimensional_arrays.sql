@@ -33,20 +33,26 @@ FROM pgz_array_values;
 SELECT octet_length(row_to_msgpack(value)) > 0 AS msgpack_nested_arrays,
        octet_length(row_to_flexbuffers(value)) > 0 AS flex_nested_arrays,
        octet_length(row_to_cbor(value)) > 0 AS cbor_nested_arrays,
-       octet_length(row_to_zera(value)) > 0 AS zera_nested_arrays
+       octet_length(row_to_zera(value)) > 0 AS zera_nested_arrays,
+       octet_length(row_to_ion(value)) > 0 AS ion_nested_arrays,
+       octet_length(row_to_bson(value)) > 0 AS bson_nested_arrays,
+       octet_length(row_to_beve(value)) > 0 AS beve_nested_arrays
 FROM pgz_array_values;
 
--- CBOR/ZERA/Flex now also have a direct multidimensional-array fast writer
--- (previously only MessagePack's fast path handled ndim > 1; the others fell
--- back to the generic dynamic tree for any multidimensional array column).
--- There's no _slow() helper for these three, so cross-check their fast-path
--- output against MessagePack's, decoded through each protocol's own JSONB
--- decoder. Covers a 2-D int array with nulls, a 3-D text cube with nulls, a
--- 2-D array of composites with nulls (multidim + recursive-composite
--- together), and a non-default-lower-bound 2-D array.
+-- CBOR/ZERA/Flex/Ion/BSON/BEVE now also have a direct multidimensional-array
+-- fast writer (previously only MessagePack's fast path handled ndim > 1; the
+-- others fell back to the generic dynamic tree for any multidimensional
+-- array column). There's no _slow() helper for these, so cross-check their
+-- fast-path output against MessagePack's, decoded through each protocol's
+-- own JSONB decoder. Covers a 2-D int array with nulls, a 3-D text cube with
+-- nulls, a 2-D array of composites with nulls (multidim + recursive-
+-- composite together), and a non-default-lower-bound 2-D array.
 SELECT (cbor_to_jsonb(row_to_cbor(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS cbor_matches_msgpack,
        (zera_to_jsonb(row_to_zera(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS zera_matches_msgpack,
-       (flexbuffers_to_jsonb(row_to_flexbuffers(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS flex_matches_msgpack
+       (flexbuffers_to_jsonb(row_to_flexbuffers(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS flex_matches_msgpack,
+       (ion_to_jsonb(row_to_ion(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS ion_matches_msgpack,
+       (bson_to_jsonb(row_to_bson(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS bson_matches_msgpack,
+       (beve_to_jsonb(row_to_beve(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS beve_matches_msgpack
 FROM pgz_array_values;
 
 -- The batch API's outer array remains a one-dimensional row collection.

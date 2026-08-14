@@ -68,11 +68,15 @@ SELECT ROW(
 SELECT row_to_msgpack(value) = row_to_msgpack_slow(value) AS msgpack_parity
 FROM pgz_nn_values;
 
--- No _slow() helper exists for CBOR/ZERA/Flex, so cross-check their output
--- against MessagePack's, decoded through each protocol's own JSONB decoder.
+-- No _slow() helper exists for CBOR/ZERA/Flex/Ion/BSON/BEVE, so cross-check
+-- their output against MessagePack's, decoded through each protocol's own
+-- JSONB decoder.
 SELECT (cbor_to_jsonb(row_to_cbor(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS cbor_matches_msgpack,
        (zera_to_jsonb(row_to_zera(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS zera_matches_msgpack,
-       (flexbuffers_to_jsonb(row_to_flexbuffers(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS flex_matches_msgpack
+       (flexbuffers_to_jsonb(row_to_flexbuffers(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS flex_matches_msgpack,
+       (ion_to_jsonb(row_to_ion(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS ion_matches_msgpack,
+       (bson_to_jsonb(row_to_bson(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS bson_matches_msgpack,
+       (beve_to_jsonb(row_to_beve(value)) = msgpack_to_jsonb(row_to_msgpack(value))) AS beve_matches_msgpack
 FROM pgz_nn_values;
 
 ROLLBACK;

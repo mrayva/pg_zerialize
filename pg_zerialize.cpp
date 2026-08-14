@@ -654,6 +654,11 @@ static bytea* try_serialize_zera_row_fast(HeapTupleHeader rec);
 static bytea* try_serialize_zera_array_fast(Datum* elements, bool* nulls, int nitems);
 static bytea* try_serialize_flex_row_fast(HeapTupleHeader rec);
 static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int nitems);
+static bytea* try_serialize_ion_row_fast(HeapTupleHeader rec);
+static bytea* try_serialize_ion_array_fast(Datum* elements, bool* nulls, int nitems);
+static bytea* try_serialize_bson_row_fast(HeapTupleHeader rec);
+static bytea* try_serialize_beve_row_fast(HeapTupleHeader rec);
+static bytea* try_serialize_beve_array_fast(Datum* elements, bool* nulls, int nitems);
 
 static z::dyn::Value array_level_to_dynamic(
     Datum* elements,
@@ -3925,6 +3930,290 @@ static bytea* try_serialize_cbor_array_fast(Datum* elements, bool* nulls, int ni
     return nullptr;
 }
 
+// ===== Ion / BSON / BEVE fast-path entry points ===============================
+//
+// All three Serializers (z::Ion::Serializer, z::Bson::Serializer,
+// z::Beve::Serializer) already implement the full Writer concept used by
+// write_record_map_generic/write_scalar_generic/write_array_generic above
+// (see each header's own Serializer class), so unlike msgpack/zera these
+// need no new vendored-header primitives -- just the same thin entry-point
+// shape cbor/flex already have. BSON has no row-batch entry point: BSON's
+// wire format can't distinguish a root array from a root document (see
+// BSON.md and the comment above rows_to_bson's absence further down), so
+// there is no rows_to_bson to back and array_to_binary<z::Bson> is never
+// instantiated.
+
+static bytea* try_serialize_ion_row_fast(HeapTupleHeader rec)
+{
+    Oid tupType = HeapTupleHeaderGetTypeId(rec);
+    int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+    if (!schema.fast_supported) {
+        return nullptr;
+    }
+    if (schema.has_recursive_columns) {
+        std::unordered_set<Oid> active_types{tupType};
+        if (!schema_recursive_supported(schema, active_types)) {
+            return nullptr;
+        }
+    }
+
+    try {
+        z::Ion::RootSerializer rs;
+        z::Ion::Serializer writer(rs);
+        if (!schema.use_deform_access) {
+            write_record_map_generic(writer, rec, schema, nullptr);
+        } else {
+            TupleDeformScratch scratch;
+            write_record_map_generic(writer, rec, schema, &scratch);
+        }
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast Ion row serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast Ion row serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
+static bytea* try_serialize_ion_array_fast(Datum* elements, bool* nulls, int nitems)
+{
+    std::vector<const CachedSchema*> schemas;
+    schemas.reserve(nitems);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            schemas.push_back(nullptr);
+            continue;
+        }
+
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        Oid tupType = HeapTupleHeaderGetTypeId(rec);
+        int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+        const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+        if (!schema.fast_supported) {
+            return nullptr;
+        }
+        if (schema.has_recursive_columns) {
+            std::unordered_set<Oid> active_types{tupType};
+            if (!schema_recursive_supported(schema, active_types)) {
+                return nullptr;
+            }
+        }
+        schemas.push_back(&schema);
+    }
+
+    try {
+        z::Ion::RootSerializer rs;
+        z::Ion::Serializer writer(rs);
+        TupleDeformScratch scratch;
+
+        writer.begin_array(static_cast<size_t>(nitems));
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+                write_record_map_generic(writer, rec, *schemas[i], &scratch);
+            }
+        }
+        writer.end_array();
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast Ion batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast Ion batch serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
+static bytea* try_serialize_bson_row_fast(HeapTupleHeader rec)
+{
+    Oid tupType = HeapTupleHeaderGetTypeId(rec);
+    int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+    if (!schema.fast_supported) {
+        return nullptr;
+    }
+    if (schema.has_recursive_columns) {
+        std::unordered_set<Oid> active_types{tupType};
+        if (!schema_recursive_supported(schema, active_types)) {
+            return nullptr;
+        }
+    }
+
+    try {
+        z::Bson::RootSerializer rs;
+        z::Bson::Serializer writer(rs);
+        if (!schema.use_deform_access) {
+            write_record_map_generic(writer, rec, schema, nullptr);
+        } else {
+            TupleDeformScratch scratch;
+            write_record_map_generic(writer, rec, schema, &scratch);
+        }
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast BSON row serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast BSON row serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
+static bytea* try_serialize_beve_row_fast(HeapTupleHeader rec)
+{
+    Oid tupType = HeapTupleHeaderGetTypeId(rec);
+    int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+    const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+    if (!schema.fast_supported) {
+        return nullptr;
+    }
+    if (schema.has_recursive_columns) {
+        std::unordered_set<Oid> active_types{tupType};
+        if (!schema_recursive_supported(schema, active_types)) {
+            return nullptr;
+        }
+    }
+
+    try {
+        z::Beve::RootSerializer rs;
+        z::Beve::Serializer writer(rs);
+        if (!schema.use_deform_access) {
+            write_record_map_generic(writer, rec, schema, nullptr);
+        } else {
+            TupleDeformScratch scratch;
+            write_record_map_generic(writer, rec, schema, &scratch);
+        }
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast BEVE row serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast BEVE row serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
+static bytea* try_serialize_beve_array_fast(Datum* elements, bool* nulls, int nitems)
+{
+    std::vector<const CachedSchema*> schemas;
+    schemas.reserve(nitems);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            schemas.push_back(nullptr);
+            continue;
+        }
+
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        Oid tupType = HeapTupleHeaderGetTypeId(rec);
+        int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+        const CachedSchema& schema = get_cached_schema(tupType, tupTypmod);
+
+        if (!schema.fast_supported) {
+            return nullptr;
+        }
+        if (schema.has_recursive_columns) {
+            std::unordered_set<Oid> active_types{tupType};
+            if (!schema_recursive_supported(schema, active_types)) {
+                return nullptr;
+            }
+        }
+        schemas.push_back(&schema);
+    }
+
+    try {
+        z::Beve::RootSerializer rs;
+        z::Beve::Serializer writer(rs);
+        TupleDeformScratch scratch;
+
+        writer.begin_array(static_cast<size_t>(nitems));
+        for (int i = 0; i < nitems; i++) {
+            if (nulls[i]) {
+                writer.null();
+            } else {
+                HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+                write_record_map_generic(writer, rec, *schemas[i], &scratch);
+            }
+        }
+        writer.end_array();
+
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast BEVE batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("fast BEVE batch serialization failed with unknown exception")));
+    }
+
+    return nullptr;
+}
+
 static inline void zera_write_text(z::zera::Serializer& writer, Datum value)
 {
     text* txt = DatumGetTextPP(value);
@@ -4371,6 +4660,18 @@ static bytea* tuple_to_binary(HeapTupleHeader rec)
             if (bytea* fast = try_serialize_flex_row_fast(rec)) {
                 return fast;
             }
+        } else if constexpr (std::is_same_v<Protocol, z::Ion>) {
+            if (bytea* fast = try_serialize_ion_row_fast(rec)) {
+                return fast;
+            }
+        } else if constexpr (std::is_same_v<Protocol, z::Bson>) {
+            if (bytea* fast = try_serialize_bson_row_fast(rec)) {
+                return fast;
+            }
+        } else if constexpr (std::is_same_v<Protocol, z::Beve>) {
+            if (bytea* fast = try_serialize_beve_row_fast(rec)) {
+                return fast;
+            }
         }
 
         // Convert record to dynamic map
@@ -4548,7 +4849,23 @@ static bytea* array_to_binary(ArrayType* arr)
             pfree(nulls);
             return fast;
         }
+    } else if constexpr (std::is_same_v<Protocol, z::Ion>) {
+        if (bytea* fast = try_serialize_ion_array_fast(elements, nulls, nitems)) {
+            pfree(elements);
+            pfree(nulls);
+            return fast;
+        }
+    } else if constexpr (std::is_same_v<Protocol, z::Beve>) {
+        if (bytea* fast = try_serialize_beve_array_fast(elements, nulls, nitems)) {
+            pfree(elements);
+            pfree(nulls);
+            return fast;
+        }
     }
+    // No z::Bson branch: array_to_binary<z::Bson> is never instantiated --
+    // there is no rows_to_bson (BSON's wire format can't distinguish a bare
+    // root array from a root document, see BSON.md and try_serialize_bson_
+    // row_fast's comment above).
 
     // Build array of record maps with pre-allocated capacity
     z::dyn::Value::Array result_array;
