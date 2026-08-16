@@ -197,6 +197,17 @@ extern "C" {
     Datum rows_to_cbor(PG_FUNCTION_ARGS);
     Datum rows_to_zera(PG_FUNCTION_ARGS);
 
+    // Columnar batch processing functions (opt-in throughput path for
+    // --batch-size-style row batching - see the "Columnar batch
+    // serialization" comment above array_to_binary_columnar<>)
+    Datum rows_to_msgpack_columnar(PG_FUNCTION_ARGS);
+    Datum rows_to_cbor_columnar(PG_FUNCTION_ARGS);
+    Datum rows_to_zera_columnar(PG_FUNCTION_ARGS);
+    Datum rows_to_flexbuffers_columnar(PG_FUNCTION_ARGS);
+    Datum rows_to_ion_columnar(PG_FUNCTION_ARGS);
+    Datum rows_to_bson_columnar(PG_FUNCTION_ARGS);
+    Datum rows_to_beve_columnar(PG_FUNCTION_ARGS);
+
     PG_FUNCTION_INFO_V1(row_to_flexbuffers);
     PG_FUNCTION_INFO_V1(row_to_msgpack);
     PG_FUNCTION_INFO_V1(row_to_msgpack_slow);
@@ -269,6 +280,14 @@ extern "C" {
     PG_FUNCTION_INFO_V1(rows_to_msgpack_slow);
     PG_FUNCTION_INFO_V1(rows_to_cbor);
     PG_FUNCTION_INFO_V1(rows_to_zera);
+
+    PG_FUNCTION_INFO_V1(rows_to_msgpack_columnar);
+    PG_FUNCTION_INFO_V1(rows_to_cbor_columnar);
+    PG_FUNCTION_INFO_V1(rows_to_zera_columnar);
+    PG_FUNCTION_INFO_V1(rows_to_flexbuffers_columnar);
+    PG_FUNCTION_INFO_V1(rows_to_ion_columnar);
+    PG_FUNCTION_INFO_V1(rows_to_bson_columnar);
+    PG_FUNCTION_INFO_V1(rows_to_beve_columnar);
 }
 
 /*
@@ -4947,6 +4966,350 @@ static bytea* try_serialize_flex_array_fast(Datum* elements, bool* nulls, int ni
     return nullptr;
 }
 
+// ===== Columnar batch serialization =========================================
+//
+// rows_to_<fmt>(anyarray) above produces an array of row objects -
+// [{col1:v,col2:v,...}, {col1:v,col2:v,...}, ...] - which pays every
+// format's fixed per-document cost (Ion's mandatory local symbol table,
+// FlexBuffers' key/value deduplication + EndMap() sort, zera's per-field
+// deliver_vr()+key() dispatch) once *per row*, since each row is its own
+// nested document. rows_to_<fmt>_columnar(anyarray) instead produces one
+// object with column-arrays as values -
+// {col1:[v,v,...], col2:[v,v,...], ...} - so those fixed costs are paid
+// once *per column* regardless of row count: a batch of N rows calls
+// key() (and, for Ion, its symbol table's hash lookup) M times (once per
+// column), not N*M times.
+//
+// Unlike rows_to_<fmt>, this works for BSON too: BSON's row-batch function
+// doesn't exist because BSON's wire format can't distinguish a bare root
+// array from a root document (see the comment above try_serialize_ion_
+// row_fast) - but a columnar batch's root is always an object, the exact
+// shape row_to_bson already produces for a single row, just with
+// array-valued fields instead of scalar-valued ones. No such restriction
+// applies here.
+//
+// Scope, deliberately: fast-path only, homogeneous non-null rows (all the
+// same composite type - checked, not assumed), no recursive columns
+// (composite/array-of-composite) - the same real table shapes rows_to_<fmt>
+// already targets. Rather than silently falling back to a slow generic
+// path for anything more exotic (the whole point of this feature is a
+// throughput win for the common case; a slow columnar path would double
+// this feature's engineering/testing surface for a case nothing here has
+// actually needed), an ineligible schema is a clear ERROR instead.
+//
+// Column alignment is inherent to this design, not something that needs
+// separate enforcement the way the jsonb_agg()-based approach in
+// nats_publish_from_sql.py needed an explicit shared ORDER BY: every
+// column array here is built from the *same* pre-deformed per-row Datum/
+// null buffer, walked in the same row order, so column[i] for every
+// column always belongs to the same source row i by construction.
+
+template<typename Serializer>
+static inline void write_columnar_generic(
+    Serializer& writer,
+    Datum* elements, bool* nulls, int nitems,
+    const CachedSchema& schema)
+{
+    const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
+    const size_t total = static_cast<size_t>(nitems) * nattrs;
+    std::vector<Datum> all_values(total);
+    std::unique_ptr<bool[]> all_nulls = std::make_unique<bool[]>(total);
+    std::fill(all_nulls.get(), all_nulls.get() + total, true);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            continue; // leaves this row's slice all-null (the null-row case)
+        }
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        HeapTupleData tuple;
+        tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+        tuple.t_data = rec;
+        heap_deform_tuple(&tuple, schema.tupdesc,
+                          &all_values[static_cast<size_t>(i) * nattrs],
+                          &all_nulls[static_cast<size_t>(i) * nattrs]);
+    }
+
+    writer.begin_map(schema.columns.size());
+    for (const CachedColumn& col : schema.columns) {
+        const int idx = col.attnum - 1;
+        writer.key(col.name);
+        writer.begin_array(static_cast<size_t>(nitems));
+        for (int i = 0; i < nitems; i++) {
+            const size_t off = static_cast<size_t>(i) * nattrs + static_cast<size_t>(idx);
+            write_scalar_generic(writer, col, all_values[off], all_nulls[off]);
+        }
+        writer.end_array();
+    }
+    writer.end_map();
+}
+
+static inline void msgpack_write_columnar(
+    z::MsgPackSerializer& writer,
+    Datum* elements, bool* nulls, int nitems,
+    const CachedSchema& schema)
+{
+    const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
+    const size_t total = static_cast<size_t>(nitems) * nattrs;
+    std::vector<Datum> all_values(total);
+    std::unique_ptr<bool[]> all_nulls = std::make_unique<bool[]>(total);
+    std::fill(all_nulls.get(), all_nulls.get() + total, true);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            continue;
+        }
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        HeapTupleData tuple;
+        tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+        tuple.t_data = rec;
+        heap_deform_tuple(&tuple, schema.tupdesc,
+                          &all_values[static_cast<size_t>(i) * nattrs],
+                          &all_nulls[static_cast<size_t>(i) * nattrs]);
+    }
+
+    if (schema.columns.size() > 15) {
+        writer.begin_map_preencoded(schema.msgpack_map_header_ptr, schema.msgpack_map_header_len);
+    } else {
+        writer.begin_map(schema.columns.size());
+    }
+    for (const CachedColumn& col : schema.columns) {
+        const int idx = col.attnum - 1;
+        writer.key_preencoded(col.msgpack_key_ptr, col.msgpack_key_len);
+        writer.begin_array(static_cast<size_t>(nitems));
+        for (int i = 0; i < nitems; i++) {
+            const size_t off = static_cast<size_t>(i) * nattrs + static_cast<size_t>(idx);
+            col.msgpack_scalar_writer(writer, col, all_values[off], all_nulls[off]);
+        }
+        writer.end_array();
+    }
+    writer.end_map();
+}
+
+static inline void zera_write_columnar(
+    z::zera::Serializer& writer,
+    Datum* elements, bool* nulls, int nitems,
+    const CachedSchema& schema)
+{
+    const size_t nattrs = static_cast<size_t>(schema.tupdesc->natts);
+    const size_t total = static_cast<size_t>(nitems) * nattrs;
+    std::vector<Datum> all_values(total);
+    std::unique_ptr<bool[]> all_nulls = std::make_unique<bool[]>(total);
+    std::fill(all_nulls.get(), all_nulls.get() + total, true);
+
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            continue;
+        }
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        HeapTupleData tuple;
+        tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+        tuple.t_data = rec;
+        heap_deform_tuple(&tuple, schema.tupdesc,
+                          &all_values[static_cast<size_t>(i) * nattrs],
+                          &all_nulls[static_cast<size_t>(i) * nattrs]);
+    }
+
+    writer.begin_map(schema.columns.size());
+    for (const CachedColumn& col : schema.columns) {
+        const int idx = col.attnum - 1;
+        writer.key_preencoded(col.zera_key_encoded);
+        writer.begin_array(static_cast<size_t>(nitems));
+        for (int i = 0; i < nitems; i++) {
+            const size_t off = static_cast<size_t>(i) * nattrs + static_cast<size_t>(idx);
+            zera_write_scalar(writer, col, all_values[off], all_nulls[off]);
+        }
+        writer.end_array();
+    }
+    writer.end_map();
+}
+
+// Finds the schema shared by every non-null element of a columnar batch
+// input, or raises a clear error - unlike rows_to_<fmt>'s per-row schema
+// list (supporting heterogeneous element types), a columnar batch has one
+// fixed column set for the whole message, so every non-null row must
+// share the same composite type.
+static const CachedSchema* columnar_batch_schema(Datum* elements, bool* nulls, int nitems)
+{
+    const CachedSchema* schema = nullptr;
+    Oid schema_type = InvalidOid;
+    for (int i = 0; i < nitems; i++) {
+        if (nulls[i]) {
+            continue;
+        }
+        HeapTupleHeader rec = DatumGetHeapTupleHeader(elements[i]);
+        Oid tupType = HeapTupleHeaderGetTypeId(rec);
+        if (!schema) {
+            int32 tupTypmod = HeapTupleHeaderGetTypMod(rec);
+            schema = &get_cached_schema(tupType, tupTypmod);
+            schema_type = tupType;
+        } else if (tupType != schema_type) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                     errmsg("columnar batch serialization requires all rows to share the same composite type"),
+                     errdetail("Row %d has a different type OID than earlier rows.", i)));
+        }
+    }
+    if (!schema) {
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("columnar batch serialization requires at least one non-null row "
+                        "to determine the column schema")));
+    }
+    if (!schema->fast_supported || schema->has_recursive_columns) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("columnar batch serialization does not support this row's column types"),
+                 errdetail("Contains a column type outside the fast columnar path's scope "
+                          "(e.g. a nested composite or array-of-composite column).")));
+    }
+    return schema;
+}
+
+static bytea* try_serialize_msgpack_columnar_fast(Datum* elements, bool* nulls, int nitems)
+{
+    const CachedSchema& schema = *columnar_batch_schema(elements, nulls, nitems);
+    try {
+        z::MsgPackRootSerializer rs;
+        z::MsgPackSerializer writer(rs);
+        msgpack_write_columnar(writer, elements, nulls, nitems, schema);
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("columnar MessagePack batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("columnar MessagePack batch serialization failed with unknown exception")));
+    }
+    return nullptr;
+}
+
+static bytea* try_serialize_zera_columnar_fast(Datum* elements, bool* nulls, int nitems)
+{
+    const CachedSchema& schema = *columnar_batch_schema(elements, nulls, nitems);
+    try {
+        z::zera::RootSerializer rs;
+        z::zera::Serializer writer(rs);
+        zera_write_columnar(writer, elements, nulls, nitems, schema);
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("columnar ZERA batch serialization failed"),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("columnar ZERA batch serialization failed with unknown exception")));
+    }
+    return nullptr;
+}
+
+// Shared entry point for the five formats using write_columnar_generic<>
+// (cbor/flex/ion/bson/beve) - only the concrete RootSerializer/Serializer
+// types and the error message's format name differ per format.
+template<typename Protocol>
+static bytea* try_serialize_columnar_generic_fast(
+    Datum* elements, bool* nulls, int nitems, const char* format_name)
+{
+    const CachedSchema& schema = *columnar_batch_schema(elements, nulls, nitems);
+    try {
+        typename Protocol::RootSerializer rs;
+        typename Protocol::Serializer writer(rs);
+        write_columnar_generic(writer, elements, nulls, nitems, schema);
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    } catch (const std::exception& ex) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("columnar %s batch serialization failed", format_name),
+                 errdetail("%s", ex.what())));
+    } catch (...) {
+        ereport(ERROR,
+                (errcode(ERRCODE_INTERNAL_ERROR),
+                 errmsg("columnar %s batch serialization failed with unknown exception", format_name)));
+    }
+    return nullptr;
+}
+
+template<typename Protocol>
+static bytea* array_to_binary_columnar(ArrayType* arr, const char* format_name)
+{
+    Oid element_type = ARR_ELEMTYPE(arr);
+    int ndim = ARR_NDIM(arr);
+
+    if (ndim == 0 || ArrayGetNItems(ndim, ARR_DIMS(arr)) == 0) {
+        // Empty input -> an empty object (zero columns, zero rows) - the
+        // columnar counterpart of array_to_binary's empty-array handling.
+        typename Protocol::RootSerializer rs;
+        typename Protocol::Serializer writer(rs);
+        writer.begin_map(0);
+        writer.end_map();
+        z::ZBuffer buffer = rs.finish();
+        std::span<const uint8_t> data = buffer.buf();
+        size_t len = data.size();
+        bytea* result = (bytea*) palloc(len + VARHDRSZ);
+        SET_VARSIZE(result, len + VARHDRSZ);
+        memcpy(VARDATA(result), data.data(), len);
+        return result;
+    }
+
+    if (ndim > 1) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("multidimensional arrays not supported for columnar batch serialization")));
+    }
+
+    if (element_type != RECORDOID && get_typtype(element_type) != TYPTYPE_COMPOSITE) {
+        ereport(ERROR,
+                (errcode(ERRCODE_DATATYPE_MISMATCH),
+                 errmsg("columnar batch serialization requires an array of composite records"),
+                 errdetail("Got array element type OID %u.", element_type)));
+    }
+
+    int16 typlen;
+    bool typbyval;
+    char typalign;
+    get_typlenbyvalalign(element_type, &typlen, &typbyval, &typalign);
+
+    Datum* elements;
+    bool* nulls;
+    int nitems;
+    deconstruct_array(arr, element_type, typlen, typbyval, typalign, &elements, &nulls, &nitems);
+
+    bytea* result;
+    if constexpr (std::is_same_v<Protocol, z::MsgPack>) {
+        result = try_serialize_msgpack_columnar_fast(elements, nulls, nitems);
+    } else if constexpr (std::is_same_v<Protocol, z::Zera>) {
+        result = try_serialize_zera_columnar_fast(elements, nulls, nitems);
+    } else {
+        result = try_serialize_columnar_generic_fast<Protocol>(elements, nulls, nitems, format_name);
+    }
+
+    pfree(elements);
+    pfree(nulls);
+    return result;
+}
+
 /*
  * Convert a PostgreSQL record (HeapTupleHeader) to a zerialize dynamic map
  * This is used by both single-record and batch processing functions
@@ -7743,5 +8106,71 @@ rows_to_beve(PG_FUNCTION_ARGS)
     // Convert to BEVE array
     result = array_to_binary<z::Beve>(arr);
 
+    PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * rows_to_<fmt>_columnar - Convert array of PostgreSQL records to a single
+ * columnar (object-of-column-arrays) binary document instead of an array
+ * of per-row documents. Opt-in throughput path for batch publishing: see
+ * the "Columnar batch serialization" section above array_to_binary_columnar<>.
+ *
+ * Unlike rows_to_<fmt>, this is available for BSON too: a columnar
+ * document's root is always an object (never a bare array), so the
+ * root-array limitation that rules out rows_to_bson doesn't apply here.
+ */
+extern "C" Datum
+rows_to_msgpack_columnar(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr = PG_GETARG_ARRAYTYPE_P(0);
+    bytea* result = array_to_binary_columnar<z::MsgPack>(arr, "MessagePack");
+    PG_RETURN_BYTEA_P(result);
+}
+
+extern "C" Datum
+rows_to_cbor_columnar(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr = PG_GETARG_ARRAYTYPE_P(0);
+    bytea* result = array_to_binary_columnar<z::CBOR>(arr, "CBOR");
+    PG_RETURN_BYTEA_P(result);
+}
+
+extern "C" Datum
+rows_to_zera_columnar(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr = PG_GETARG_ARRAYTYPE_P(0);
+    bytea* result = array_to_binary_columnar<z::Zera>(arr, "ZERA");
+    PG_RETURN_BYTEA_P(result);
+}
+
+extern "C" Datum
+rows_to_flexbuffers_columnar(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr = PG_GETARG_ARRAYTYPE_P(0);
+    bytea* result = array_to_binary_columnar<z::Flex>(arr, "FlexBuffers");
+    PG_RETURN_BYTEA_P(result);
+}
+
+extern "C" Datum
+rows_to_ion_columnar(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr = PG_GETARG_ARRAYTYPE_P(0);
+    bytea* result = array_to_binary_columnar<z::Ion>(arr, "Ion");
+    PG_RETURN_BYTEA_P(result);
+}
+
+extern "C" Datum
+rows_to_bson_columnar(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr = PG_GETARG_ARRAYTYPE_P(0);
+    bytea* result = array_to_binary_columnar<z::Bson>(arr, "BSON");
+    PG_RETURN_BYTEA_P(result);
+}
+
+extern "C" Datum
+rows_to_beve_columnar(PG_FUNCTION_ARGS)
+{
+    ArrayType* arr = PG_GETARG_ARRAYTYPE_P(0);
+    bytea* result = array_to_binary_columnar<z::Beve>(arr, "BEVE");
     PG_RETURN_BYTEA_P(result);
 }

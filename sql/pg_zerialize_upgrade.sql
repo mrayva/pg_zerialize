@@ -111,4 +111,21 @@ SELECT to_regprocedure('beve_to_jsonb(bytea)') IS NOT NULL AS beve_decoder_prese
 SELECT beve_to_jsonb(beve_from_jsonb('{"upgrade":true}'::jsonb)) =
        '{"upgrade":true}'::jsonb AS beve_builder_works;
 
+ALTER EXTENSION pg_zerialize UPDATE TO '1.12';
+SELECT extversion = '1.12' AS upgraded_to_1_12
+FROM pg_extension
+WHERE extname = 'pg_zerialize';
+SELECT to_regprocedure('rows_to_msgpack_columnar(anyarray)') IS NOT NULL AS msgpack_columnar_present,
+       to_regprocedure('rows_to_cbor_columnar(anyarray)') IS NOT NULL AS cbor_columnar_present,
+       to_regprocedure('rows_to_zera_columnar(anyarray)') IS NOT NULL AS zera_columnar_present,
+       to_regprocedure('rows_to_flexbuffers_columnar(anyarray)') IS NOT NULL AS flex_columnar_present,
+       to_regprocedure('rows_to_ion_columnar(anyarray)') IS NOT NULL AS ion_columnar_present,
+       to_regprocedure('rows_to_bson_columnar(anyarray)') IS NOT NULL AS bson_columnar_present,
+       to_regprocedure('rows_to_beve_columnar(anyarray)') IS NOT NULL AS beve_columnar_present;
+CREATE TYPE pg_temp.upgrade_row AS (f1 int, f2 text);
+SELECT msgpack_to_jsonb(rows_to_msgpack_columnar(
+    ARRAY[ROW(1, 'a')::pg_temp.upgrade_row, ROW(2, 'b')::pg_temp.upgrade_row]
+)) = '{"f1":[1,2],"f2":["a","b"]}'::jsonb AS msgpack_columnar_works;
+DROP TYPE pg_temp.upgrade_row;
+
 DROP EXTENSION pg_zerialize;

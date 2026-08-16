@@ -1,0 +1,136 @@
+SET client_min_messages TO warning;
+DROP EXTENSION IF EXISTS pg_zerialize CASCADE;
+CREATE EXTENSION pg_zerialize;
+CREATE TYPE pgz_col_row AS (
+    id int,
+    name text,
+    active bool,
+    price double precision,
+    tag text
+);
+CREATE TYPE pgz_col_nested AS (
+    id int,
+    detail pgz_col_row
+);
+-- Basic correctness, one composite row per format, including a NULL
+-- field within a row and a wholly-NULL row.
+SELECT msgpack_to_jsonb(rows_to_msgpack_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row,
+           NULL::pgz_col_row
+       ])) = '{"id":[1,2,null],"name":["a","b",null],"active":[true,false,null],"price":[1.5,2.5,null],"tag":["x",null,null]}'::jsonb
+       AS msgpack_columnar_ok;
+ msgpack_columnar_ok 
+---------------------
+ t
+(1 row)
+
+SELECT cbor_to_jsonb(rows_to_cbor_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row,
+           NULL::pgz_col_row
+       ])) = '{"id":[1,2,null],"name":["a","b",null],"active":[true,false,null],"price":[1.5,2.5,null],"tag":["x",null,null]}'::jsonb
+       AS cbor_columnar_ok;
+ cbor_columnar_ok 
+------------------
+ t
+(1 row)
+
+SELECT zera_to_jsonb(rows_to_zera_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row,
+           NULL::pgz_col_row
+       ])) = '{"id":[1,2,null],"name":["a","b",null],"active":[true,false,null],"price":[1.5,2.5,null],"tag":["x",null,null]}'::jsonb
+       AS zera_columnar_ok;
+ zera_columnar_ok 
+------------------
+ t
+(1 row)
+
+SELECT flexbuffers_to_jsonb(rows_to_flexbuffers_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row,
+           NULL::pgz_col_row
+       ])) = '{"id":[1,2,null],"name":["a","b",null],"active":[true,false,null],"price":[1.5,2.5,null],"tag":["x",null,null]}'::jsonb
+       AS flexbuffers_columnar_ok;
+ flexbuffers_columnar_ok 
+-------------------------
+ t
+(1 row)
+
+SELECT ion_to_jsonb(rows_to_ion_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row,
+           NULL::pgz_col_row
+       ])) = '{"id":[1,2,null],"name":["a","b",null],"active":[true,false,null],"price":[1.5,2.5,null],"tag":["x",null,null]}'::jsonb
+       AS ion_columnar_ok;
+ ion_columnar_ok 
+-----------------
+ t
+(1 row)
+
+SELECT bson_to_jsonb(rows_to_bson_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row,
+           NULL::pgz_col_row
+       ])) = '{"id":[1,2,null],"name":["a","b",null],"active":[true,false,null],"price":[1.5,2.5,null],"tag":["x",null,null]}'::jsonb
+       AS bson_columnar_ok;
+ bson_columnar_ok 
+------------------
+ t
+(1 row)
+
+SELECT beve_to_jsonb(rows_to_beve_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row,
+           NULL::pgz_col_row
+       ])) = '{"id":[1,2,null],"name":["a","b",null],"active":[true,false,null],"price":[1.5,2.5,null],"tag":["x",null,null]}'::jsonb
+       AS beve_columnar_ok;
+ beve_columnar_ok 
+------------------
+ t
+(1 row)
+
+-- Structural comparison against the jsonb-based columnar construction
+-- (jsonb_build_object/jsonb_agg), the approach nats_publish_from_sql.py's
+-- --batch-size uses, to prove the native C++ path agrees with it.
+SELECT msgpack_to_jsonb(rows_to_msgpack_columnar(ARRAY[
+           ROW(1, 'a', true, 1.5, 'x')::pgz_col_row,
+           ROW(2, 'b', false, 2.5, NULL)::pgz_col_row
+       ])) = jsonb_build_object(
+           'id', jsonb_build_array(1, 2),
+           'name', jsonb_build_array('a', 'b'),
+           'active', jsonb_build_array(true, false),
+           'price', jsonb_build_array(1.5, 2.5),
+           'tag', jsonb_build_array('x', NULL)
+       ) AS msgpack_columnar_matches_jsonb_construction;
+ msgpack_columnar_matches_jsonb_construction 
+---------------------------------------------
+ t
+(1 row)
+
+-- Empty array input -> empty object.
+SELECT msgpack_to_jsonb(rows_to_msgpack_columnar(ARRAY[]::pgz_col_row[])) = '{}'::jsonb AS msgpack_columnar_empty;
+ msgpack_columnar_empty 
+------------------------
+ t
+(1 row)
+
+SELECT bson_to_jsonb(rows_to_bson_columnar(ARRAY[]::pgz_col_row[])) = '{}'::jsonb AS bson_columnar_empty;
+ bson_columnar_empty 
+---------------------
+ t
+(1 row)
+
+-- All-NULL-rows input: schema can't be determined -> error.
+SELECT rows_to_msgpack_columnar(ARRAY[NULL::pgz_col_row, NULL::pgz_col_row]);
+ERROR:  columnar batch serialization requires at least one non-null row to determine the column schema
+-- Nested composite column -> rejected (out of scope for the fast columnar path).
+SELECT rows_to_msgpack_columnar(ARRAY[
+    ROW(1, ROW(1,'a',true,1.5,'x')::pgz_col_row)::pgz_col_nested
+]);
+ERROR:  columnar batch serialization does not support this row's column types
+DETAIL:  Contains a column type outside the fast columnar path's scope (e.g. a nested composite or array-of-composite column).
+DROP TYPE pgz_col_nested;
+DROP TYPE pgz_col_row;
+DROP EXTENSION pg_zerialize;
