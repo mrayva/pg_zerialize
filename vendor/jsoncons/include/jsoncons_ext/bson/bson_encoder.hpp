@@ -184,10 +184,7 @@ private:
         stack_.pop_back();
         if (stack_.empty())
         {
-            for (auto c : buffer_)
-            {
-                sink_.push_back(c);
-            }
+            sink_.append(buffer_.data(), buffer_.size());
         }
         JSONCONS_VISITOR_RETURN;
     }
@@ -226,10 +223,7 @@ private:
         stack_.pop_back();
         if (stack_.empty())
         {
-            for (auto c : buffer_)
-            {
-                sink_.push_back(c);
-            }
+            sink_.append(buffer_.data(), buffer_.size());
         }
         JSONCONS_VISITOR_RETURN;
     }
@@ -238,10 +232,7 @@ private:
     {
         stack_.back().member_offset(buffer_.size());
         buffer_.push_back(0x00); // reserve space for code
-        for (auto c : name)
-        {
-            buffer_.push_back(c);
-        }
+        buffer_.insert(buffer_.end(), name.begin(), name.end());
         buffer_.push_back(0x00);
         JSONCONS_VISITOR_RETURN;
     }
@@ -313,10 +304,7 @@ private:
             {
                 before_value(jsoncons::bson::bson_type::object_id_type);
                 oid_t oid(sv);
-                for (auto b : oid)
-                {
-                    buffer_.push_back(b);
-                }
+                buffer_.insert(buffer_.end(), oid.begin(), oid.end());
                 break;
             }
             case semantic_tag::regex:
@@ -330,16 +318,10 @@ private:
                     JSONCONS_VISITOR_RETURN;
                 }
                 string_view regex = sv.substr(first+1,last-1);
-                for (auto c : regex)
-                {
-                    buffer_.push_back(c);
-                }
+                buffer_.insert(buffer_.end(), regex.begin(), regex.end());
                 buffer_.push_back(0x00);
                 string_view options = sv.substr(last+1);
-                for (auto c : options)
-                {
-                    buffer_.push_back(c);
-                }
+                buffer_.insert(buffer_.end(), options.begin(), options.end());
                 buffer_.push_back(0x00);
                 break;
             }
@@ -362,10 +344,7 @@ private:
                     ec = bson_errc::invalid_utf8_text_string;
                     JSONCONS_VISITOR_RETURN;
                 }
-                for (auto c : sv)
-                {
-                    buffer_.push_back(c);
-                }
+                buffer_.insert(buffer_.end(), sv.begin(), sv.end());
                 buffer_.push_back(0x00);
                 std::size_t length = buffer_.size() - string_offset;
                 binary::native_to_little(static_cast<uint32_t>(length), buffer_.begin()+offset);
@@ -393,10 +372,7 @@ private:
 
         buffer_.push_back(0x80); // default subtype
 
-        for (auto c : b)
-        {
-            buffer_.push_back(c);
-        }
+        buffer_.insert(buffer_.end(), b.begin(), b.end());
         std::size_t length = buffer_.size() - string_offset - 1;
         binary::native_to_little(static_cast<uint32_t>(length), buffer_.begin()+offset);
 
@@ -421,10 +397,7 @@ private:
 
         buffer_.push_back(static_cast<uint8_t>(ext_tag)); // default subtype
 
-        for (auto c : b)
-        {
-            buffer_.push_back(c);
-        }
+        buffer_.insert(buffer_.end(), b.begin(), b.end());
         std::size_t length = buffer_.size() - string_offset - 1;
         binary::native_to_little(static_cast<uint32_t>(length), buffer_.begin()+offset);
 

@@ -288,6 +288,18 @@ namespace jsoncons {
         {
             buf_ptr->push_back(static_cast<value_type>(ch));
         }
+
+        // Bulk counterpart to push_back() above - callers copying a
+        // contiguous range (e.g. bson_encoder's final buffer_-to-sink_
+        // copy) had no choice but a push_back()-per-byte loop without
+        // this, which is real, measured overhead at scale (confirmed via
+        // profiling zerialize's BSON writer, which uses this sink):
+        // std::vector<uint8_t>::emplace_back() alone was 56% of total
+        // BSON encode time.
+        void append(const uint8_t* s, std::size_t length)
+        {
+            buf_ptr->insert(buf_ptr->end(), s, s + length);
+        }
     };
 
 } // namespace jsoncons
