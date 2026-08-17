@@ -5,6 +5,17 @@ CBOR, ZERA, FlexBuffers, Ion, BSON, and BEVE. Each protocol also includes SQL
 builders and aggregates for constructing nested binary values from scratch
 (BSON's builder API is a reduced subset -- see Current Limitations).
 
+For Apache Arrow, see the separate
+[`pg_arrow`](https://github.com/mrayva/pg_arrow) extension instead of a
+format here: Arrow's physical layout (validity bitmaps, typed column
+buffers, FlatBuffers-encoded IPC framing) doesn't fit zerialize's per-value
+Writer interface, so `pg_arrow` links `libarrow` directly rather than
+adding an eighth zerialize protocol. It's also columnar-batch-only (no
+`row_to_arrow` -- see its README for why) and covers a narrower type/feature
+surface than the seven protocols here (flat scalar columns only, no
+`X_populate_record(set)`), but decodes noticeably faster and produces
+directly Arrow-ecosystem-consumable (pandas/polars/DuckDB) output.
+
 ## Support
 
 - PostgreSQL 16, 17, and 18
@@ -327,3 +338,5 @@ see those files for the exact functions/aggregates each version added.
   source provenance (BEVE only)
 - [`vendor/jsoncons/UPSTREAM.md`](vendor/jsoncons/UPSTREAM.md): vendored
   jsoncons source provenance (BSON writer only)
+- [`pg_arrow`](https://github.com/mrayva/pg_arrow): sister extension for
+  Apache Arrow, built on real `libarrow` rather than a zerialize protocol
